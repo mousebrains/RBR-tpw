@@ -1,0 +1,18 @@
+# Settings for rbr-offload:  rbr-offload OUTDIR --config settings.yaml [--configure]
+# Command-line options (--min-days, --period-ms, --start, --fresh-battery, ...) override these.
+
+thresholds:              # loud alarm at offload and after configure
+  min_battery_voltage: 3.3   # V; a Li-SOCl2 cell rests near 3.6-3.7 V until nearly exhausted
+  min_days: 90               # lesser of memory-limited and modelled energy-limited sampling time
+
+deploy:                  # used only with --configure; applied after the download is saved
+  set_clock: true        # set the logger clock to UTC (host clock + NTP offset)
+  fresh_battery: false   # true only when a new cell was installed: resets the energy counter
+  erase: true            # erase logger memory (only ever after a saved download)
+  enable: true           # start logging when done
+  schedule:
+    mode: continuous     # only continuous is supported so far
+    period_ms: 500       # 500 (2 Hz) or a whole number of seconds; or use rate_hz
+    # rate_hz: 2
+    start: now           # now | ISO-8601 UTC, e.g. 2026-10-01T00:00:00Z
+    end: never           # never | ISO-8601 UTC

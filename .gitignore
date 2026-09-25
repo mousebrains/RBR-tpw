@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+output/
+.pytest_cache/
+.ruff_cache/
+# RBR's command-reference PDFs are copyrighted; download links are in NOTES.md
+refs/*.pdf
+
+# Kept private (not in the public repository)
+NOTES.md
+tests/data/
+refs/

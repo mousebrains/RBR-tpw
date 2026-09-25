@@ -1,2 +1,145 @@
 # RBR-tpw
-CLI toolkit for setting up and offloading RBR devices.
+
+Command-line offload and setup of RBR oceanographic loggers, without the Ruskin GUI.
+
+Plug in a logger and `rbr-offload`:
+
+1. measures the logger's clock skew against UTC to a few milliseconds,
+2. downloads its memory, CRC-checked and resumable,
+3. writes a CF-1.13 NetCDF file, with the serial number, clock skew, and memory and battery state as global
+   attributes,
+4. optionally sets the clock, resets the battery counter, erases memory, and re-enables logging with a new
+   schedule,
+5. tells you to unplug it, then waits for the next logger.
+
+## Supported loggers
+
+| Logger | `id fwtype` | Offload | Configure |
+|---|---|---|---|
+| RBRsolo T (L2-era compact logger, firmware 1.000) | 9 | yes | yes |
+| Other RBR loggers | anything else | detected and skipped; nothing is changed | – |
+
+The fwtype-9 protocol is not in RBR's published command references. It was worked out on a real logger
+and checked against Ruskin's own output.
+
+## Install
+
+```sh
+pip install rbr-tpw          # or: uv tool install rbr-tpw
+```
+
+Requires Python ≥ 3.11. The logger appears as a USB serial port (`/dev/cu.usbmodem*` on macOS) and needs no
+driver. **Quit Ruskin first**: it polls every RBR port it sees, and `rbr-offload` refuses to start while it is
+running.
+
+## Offload
+
+```sh
+rbr-offload /path/to/data            # handle loggers one after another until Ctrl-C
+rbr-offload /path/to/data --once     # one logger, then exit
+```
+
+For each logger this writes:
+
+| File | Contents |
+|---|---|
+| `SN_YYYYMMDDTHHMMSSZ.nc` | CF-1.13 NetCDF: `time`, one variable per channel (e.g. `temperature`, degree_Celsius), the raw readings, quality flags, the logger's own timestamps (`logger_time`), and the event list |
+| `raw/SN_….bin` | the logger memory exactly as downloaded |
+| `raw/SN_….json` | logger settings, calibration, clock skew, NTP offset, memory and battery state |
+| `raw/SN_….log` | every command and reply, time-stamped |
+
+`rbr-offload DIR --rebuild DIR/raw/*.json` regenerates the NetCDF files from the raw files without the
+logger, e.g. after a decoder fix.
+
+Offloading never changes anything on the logger. A logger that was logging keeps logging.
+
+### Clock skew
+
+The logger reports whole seconds, so the tool polls its clock until the second ticks. It brackets the tick
+between the send and receive times and repeats this 3 times. The Mac's clock is referenced to UTC with
+`sntp` (`--ntp-server`, default `time.apple.com`). The reported uncertainty is typically about ±9 ms for the
+tick measurement plus the NTP uncertainty.
+
+If the logger lost power during a deployment, its clock restarts at 2000-01-01. Samples taken after the last
+such reset are re-timed with the skew measured at offload and flagged in `time_flag`. Samples between two
+resets have no recoverable time. They are left out of the NetCDF with a warning and kept in the raw file.
+
+## Alarms: battery and remaining sampling time
+
+At every offload, and again after `--configure`, the tool estimates how long the logger can keep
+sampling on its current schedule:
+
+- **Memory-limited days** are exact: free bytes ÷ bytes per day.
+- **Energy-limited days** come from a model: the logger's energy counter, minus the modelled energy for the
+  samples already in memory, minus a 10% derating, divided by the modelled use per day. The model uses
+  RBR Ruskin's constants for the solo T (0.69 mA while sampling, 5.5 µA asleep, 3.6 V).
+
+The lesser of the two is reported and stored in the NetCDF attributes. You get a loud alarm (a bell, a red
+banner, and a prompt to acknowledge unless `--yes` is given) when:
+
+- the battery reads below `--min-voltage` (default 3.3 V), or
+- fewer than `--min-days` days of sampling remain, or
+- a configured end time comes after the estimated run-out time.
+
+The battery voltage is only a coarse check. A lithium thionyl chloride (Li-SOCl2) cell stays near 3.6 V for
+most of its life, so a low reading means a dead cell, a bad contact, or a cell close to exhaustion. The
+energy estimate is the better measure of capacity, but it is a model: check it against Ruskin before relying
+on it.
+
+## Configure and enable
+
+```sh
+rbr-offload DIR --configure deploy.yaml             # settings from a file
+rbr-offload DIR --configure --period-ms 1000 \
+            --start 2026-10-01T00:00:00Z --end never --fresh-battery
+```
+
+`--configure` runs only after that logger's data has been downloaded and saved. It shows the plan and asks
+before changing each logger (`--yes` skips the question). It then:
+
+1. stops logging,
+2. sets the clock to UTC, aligned to the second and checked afterwards,
+3. optionally resets the battery energy counter (`--fresh-battery`, only when a new cell was installed),
+4. writes the schedule,
+5. erases memory,
+6. enables logging,
+7. reads everything back.
+
+Settings can live in a YAML file (`--config settings.yaml`, or `--configure settings.yaml`); command-line
+options override it. See [deploy.example.yaml](https://github.com/mousebrains/RBR-tpw/blob/main/deploy.example.yaml):
+
+```yaml
+thresholds:
+  min_battery_voltage: 3.3
+  min_days: 90
+deploy:                  # used only with --configure
+  set_clock: true
+  fresh_battery: false
+  erase: true
+  enable: true
+  schedule:
+    mode: continuous     # only continuous so far
+    period_ms: 500       # 500 (2 Hz) or whole seconds; or rate_hz
+    start: now           # now | ISO-8601 UTC
+    end: never           # never | ISO-8601 UTC
+```
+
+Other options: `--no-erase`, `--no-enable`, `--no-clock`, `--rate-hz`.
+
+## Development
+
+```sh
+uv sync
+uv run pytest          # decoder checked against Ruskin output; NetCDF checked with the IOOS compliance-checker
+```
+
+Tests that need recorded logger data (`tests/data/`, not in this repository) are skipped when it is absent.
+
+## Disclaimer
+
+Not affiliated with or endorsed by RBR Ltd. RBR, RBRsolo and Ruskin are RBR Ltd trademarks. Commands that
+write to a logger (`--configure`) erase its memory; keep the raw files.
+
+## License
+
+GPL-3.0-or-later
