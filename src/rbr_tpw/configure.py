@@ -13,6 +13,7 @@ import datetime as dt
 import math
 import struct
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -190,8 +191,10 @@ def set_clock(link: Link, ntp_offset_s: float, tolerance_s: float, attempts: int
             "history": history}
 
 
-def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, log=print) -> dict:
-    """Apply `cfg`. Caller must already have saved this session's download if cfg.erase."""
+def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, log=print, timing=nullcontext) -> dict:
+    """Apply `cfg`. Caller must already have saved this session's download if cfg.erase.
+
+    `timing(what)` wraps the host-timestamp-sensitive steps (see hostclock.timing_critical)."""
     report: dict = {"config": asdict(cfg), "steps": []}
 
     def step(name, **kw):
@@ -213,7 +216,8 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
             log(f"    stopped (was {status})")
 
         if cfg.set_clock:
-            clk = set_clock(link, ntp_offset_s, cfg.clock_tolerance_s, log=log)
+            with timing("clock set"):
+                clk = set_clock(link, ntp_offset_s, cfg.clock_tolerance_s, log=log)
             step("set_clock", **clk)
             if not clk["ok"]:
                 raise ConfigError(f"clock could not be set within {cfg.clock_tolerance_s * 1e3:.0f} ms: "
@@ -267,7 +271,8 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
     back["sampling"] = link.query("sampling")
     back["meminfo"] = memory(link)
     back["power"] = power(link)
-    back["clock"] = measure_clock_skew(link, reps=3)
+    with timing("clock check"):
+        back["clock"] = measure_clock_skew(link, reps=3)
     report["readback"] = back
     return report
 

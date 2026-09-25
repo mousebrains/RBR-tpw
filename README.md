@@ -12,6 +12,8 @@ Plug in a logger and `rbr-offload`:
    schedule,
 5. tells you to unplug it, then waits for the next logger.
 
+Several loggers can be plugged in at once; each is offloaded in parallel by its own worker.
+
 ## Supported loggers
 
 | Logger | `id fwtype` | Offload | Configure |
@@ -38,9 +40,21 @@ running.
 ## Offload
 
 ```sh
-rbr-offload /path/to/data            # handle loggers one after another until Ctrl-C
-rbr-offload /path/to/data --once     # one logger, then exit
+rbr-offload /path/to/data            # handle every logger plugged in, in parallel, until Ctrl-C
+rbr-offload /path/to/data --once     # the logger(s) connected now (or the first to appear), then exit
 ```
+
+Each logger gets its own worker, so four loggers on a hub download at the same time. Console lines are
+tagged with the logger, e.g. `[SN100689@usbmodem101]`. Progress is shown every 10%, and "done with …:
+disconnect the logger" tells you when a logger can be unplugged. Two steps depend on the computer's clock to
+the millisecond: the clock-skew measurement and `--configure`'s clock set. They run one logger at a time,
+which staggers the start of each download by about 4 s. Questions (`--configure`'s "configure SN…?" and
+alarm acknowledgements) are asked one at a time, naming the logger. Other output waits until you answer.
+
+Ctrl-C stops each download after its current block; reconnecting the logger resumes it. A logger that is
+being configured finishes its configuration first, so it is never left erased but not logging. A second
+Ctrl-C quits at once and names anything it interrupted. A port already opened by another copy of
+`rbr-offload` is skipped.
 
 For each logger this writes:
 
@@ -49,7 +63,12 @@ For each logger this writes:
 | `SN_YYYYMMDDTHHMMSSZ.nc` | CF-1.13 NetCDF: `time`, one variable per channel (e.g. `temperature`, degree_Celsius), the raw readings, quality flags, the logger's own timestamps (`logger_time`), and the event list |
 | `raw/SN_….bin` | the logger memory exactly as downloaded |
 | `raw/SN_….json` | logger settings, calibration, clock skew, NTP offset, memory and battery state |
-| `raw/SN_….log` | every command and reply, time-stamped |
+| `raw/SN_….log` | serial transcript: every command, reply, discarded byte, timeout and retry, with UTC ms timestamps. It is written as it happens, so it survives a failure, and it is named by port (`raw/<UTC>_usbmodem….log`) until the logger reports its serial number. |
+| `raw/SN_…_configure.json` | with `--configure`: each step and the values read back |
+
+Each run also writes `raw/rbr-offload_<UTC>.log`, the session log. It has every step of every logger, the
+serial traffic, prompts and answers, and full error tracebacks, with UTC ms timestamps and the thread and
+logger on each line. The console shows only the summary lines.
 
 `rbr-offload DIR --rebuild DIR/raw/*.json` regenerates the NetCDF files from the raw files without the
 logger, e.g. after a decoder fix.

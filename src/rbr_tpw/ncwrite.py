@@ -326,8 +326,11 @@ def _remaining_attrs(rem: dict | None) -> dict:
         "energy_days_remaining_modelled": float(rem["energy_days"]),
         "energy_per_day_modelled_J": float(rem["energy_per_day_J"]),
         "energy_used_this_deployment_modelled_J": float(rem["energy_used_this_deployment_J"]),
-        "energy_model_comment": "Energy-limited days = (energy counter x 0.9 derating - modelled use for the "
-                                "samples in memory) / modelled J per day, with 3.6 V x (0.69 mA while sampling for "
+        "energy_model_comment": "Energy-limited days = (" + (
+            "energy counter x 0.9 derating - modelled use for the samples in memory"
+            if rem.get("derating") == "proportional" else  # records written before 2026-09-25
+            "energy counter - modelled use for the samples in memory - 3,370 J derating"
+        ) + ") / modelled J per day, computed at offload, with 3.6 V x (0.69 mA while sampling for "
                                 "latency + read time, 0.0055 mA asleep) from Ruskin 2.26.1 constants. Not yet "
                                 "checked against Ruskin's own estimate.",
     }

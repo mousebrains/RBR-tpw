@@ -11,13 +11,19 @@ Protocol notes (RBRsolo fwtype 9, observed 2026-09-25 and in Ruskin 2.26.1 seria
 
 from __future__ import annotations
 
+import datetime as dt
+import logging
+import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import serial
 
 from .crc import check_appended
+
+serial_log = logging.getLogger("rbr_tpw.serial")  # every exchange, at DEBUG, into the session log
 
 PROMPT_RE = re.compile(rb"Ready: ?")
 LINE_RE = re.compile(rb"([^\r\n]*)\r\n")
@@ -39,23 +45,51 @@ class LoggerError(LinkError):
 @dataclass
 class TranscriptEntry:
     t_ns: int  # host time.time_ns()
-    direction: str  # "TX" | "RX" | "NOTE"
+    direction: str  # "TX" | "RX" | "NOTE" | "DROP" (bytes received and discarded)
     text: str
+
+    def line(self) -> str:
+        t = dt.datetime.fromtimestamp(self.t_ns / 1e9, dt.UTC).isoformat(timespec="milliseconds")
+        return f"{t.replace('+00:00', 'Z')}  {self.direction:4s}  {self.text}\n"
+
+
+def _show(data: bytes, limit: int = 120) -> str:
+    return f"{len(data)} bytes {data[:limit]!r}{'...' if len(data) > limit else ''}"
 
 
 class Link:
-    def __init__(self, port: str, baudrate: int = 115200):
+    """One logger's serial port. `transcript`, if given, gets every exchange as it happens (line-buffered),
+    so it survives a crash or a hung logger."""
+
+    def __init__(self, port: str, baudrate: int = 115200, transcript: Path | None = None):
         self.port = port
         # exclusive=True takes a flock on the tty, so a second copy of this tool cannot interleave.
         self.ser = serial.Serial(port, baudrate, timeout=0.02, exclusive=True)
         self.transcript: list[TranscriptEntry] = []
+        self.transcript_path = transcript
+        try:
+            self._tfile = open(transcript, "a", encoding="utf-8", buffering=1) if transcript else None
+        except OSError:
+            self.ser.close()
+            raise
         self._buf = b""
+        self.note(f"opened {port}, {baudrate} baud")
+
+    def rename_transcript(self, path: Path):
+        """Move the transcript file (e.g. from a port name to the serial number); writing continues."""
+        if self.transcript_path is not None and path != self.transcript_path:
+            os.replace(self.transcript_path, path)
+            self.transcript_path = path
 
     def close(self):
         try:
+            self.note("closing port")
             self.ser.close()
         except Exception:
             pass
+        if self._tfile is not None:
+            self._tfile.close()
+            self._tfile = None
 
     def __enter__(self):
         return self
@@ -63,25 +97,37 @@ class Link:
     def __exit__(self, *exc):
         self.close()
 
+    def _record(self, direction: str, text: str):
+        e = TranscriptEntry(time.time_ns(), direction, text)
+        self.transcript.append(e)
+        if self._tfile is not None:
+            self._tfile.write(e.line())
+        serial_log.debug("%-4s %s", direction, text)
+
     def note(self, text: str):
-        self.transcript.append(TranscriptEntry(time.time_ns(), "NOTE", text))
+        self._record("NOTE", text)
 
     def _send(self, cmd: str):
-        self.transcript.append(TranscriptEntry(time.time_ns(), "TX", cmd))
+        self._record("TX", cmd)
         self.ser.write(cmd.encode("ascii") + b"\r")
 
     def _drain(self, quiet: float = 0.05):
+        """Read until the line is quiet for `quiet` s and discard everything buffered (recorded as DROP)."""
+        got = self._buf
         t_last = time.monotonic()
         while time.monotonic() - t_last < quiet:
             b = self.ser.read(4096)
             if b:
-                self._buf += b
+                got += b
                 t_last = time.monotonic()
         self._buf = b""
+        if got:
+            self._record("DROP", _show(got))
 
     def wake(self):
         """RBR wake-up: a lone CR, a pause, then discard whatever comes back."""
         self.ser.reset_input_buffer()
+        self._record("TX", "<CR> (wake-up; input buffer reset first)")
         self.ser.write(b"\r")
         time.sleep(0.05)
         self._drain(0.1)
@@ -99,12 +145,13 @@ class Link:
             if m:
                 line = m.group(1).decode("ascii", errors="replace").strip()
                 self._buf = self._buf[m.end():]
-                self.transcript.append(TranscriptEntry(time.time_ns(), "RX", line))
+                self._record("RX", line)
                 e = ERROR_RE.match(line)
                 if e:
                     raise LoggerError(cmd, e.group(1), e.group(2))
                 return line
             if time.monotonic() > deadline:
+                self.note(f"timeout after {timeout:g} s waiting for a reply to {cmd!r}; unparsed {_show(self._buf)}")
                 raise LinkError(f"timeout waiting for reply to {cmd!r} (buffer {self._buf[:80]!r})")
             # Return as soon as anything arrives (read(n) would wait out the timeout for n bytes).
             self._buf += self.ser.read(max(1, self.ser.in_waiting))
@@ -122,12 +169,14 @@ class Link:
             if m:
                 text = self._buf[:m.start()].decode("ascii", errors="replace").strip()
                 self._buf = self._buf[m.end():]
-                self.transcript.append(TranscriptEntry(time.time_ns(), "RX", f"{text} <Ready>".strip()))
+                self._record("RX", f"{text} <Ready>".strip())
                 e = ERROR_RE.match(text)
                 if e:
                     raise LoggerError(cmd, e.group(1), e.group(2))
                 return text
             if time.monotonic() > deadline:
+                self.note(f"timeout after {timeout:g} s waiting for the prompt after {cmd!r}; "
+                          f"unparsed {_show(self._buf)}")
                 raise LinkError(f"timeout waiting for prompt after {cmd!r}")
             self._buf += self.ser.read(max(1, self.ser.in_waiting))
 
@@ -149,6 +198,9 @@ class Link:
         raise LinkError(f"read data {dataset} {size} {offset} failed after {retries} attempts: {last}")
 
     def _read_data_once(self, dataset: int, size: int, offset: int, timeout: float) -> bytes:
+        leftover = PROMPT_RE.sub(b"", self._buf)
+        if leftover.strip():
+            self._record("DROP", _show(leftover))
         self._buf = b""
         cmd = f"read data {dataset} {size} {offset}"
         self._send(cmd)
@@ -167,14 +219,14 @@ class Link:
                     e = DATA_ERR_RE.search(self._buf)
                     if e:
                         text = e.group(1).decode("ascii", errors="replace")
-                        self.transcript.append(TranscriptEntry(time.time_ns(), "RX", text))
+                        self._record("RX", text)
                         em = ERROR_RE.match(text)
                         raise LoggerError(cmd, em.group(1), em.group(2))
             if need is not None and len(self._buf) >= need:
                 block, self._buf = self._buf[:need], self._buf[need:]
                 ok = check_appended(block)
                 note = f"<{need - 2} data bytes + CRC {block[-2:].hex()} {'OK' if ok else 'BAD'}>"
-                self.transcript.append(TranscriptEntry(time.time_ns(), "RX", note))
+                self._record("RX", note)
                 if not ok:
                     raise LinkError(f"CRC mismatch on {cmd!r}")
                 return block[:-2]

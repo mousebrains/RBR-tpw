@@ -66,4 +66,5 @@ def remaining(counter_J: float, used_bytes: int, remaining_bytes: int, period_ms
         "memory_days": m_days,
         "days": min(e_days, m_days),
         "limited_by": limit,
+        "derating": "proportional",  # records from before 2026-09-25 lack this key: fixed 3,370 J then
     }
