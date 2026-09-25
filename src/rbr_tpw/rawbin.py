@@ -73,9 +73,32 @@ EVENT_NAMES = {  # L3 command reference rev L, section 5.3.3
     0x0D: "start_of_recorded_burst",
     0x0E: "start_of_wave_burst",
     0x0F: "power_source_switched_to_usb",
+    0x10: "streaming_off_both_ports",
+    0x11: "streaming_on_usb_off_serial",
+    0x12: "streaming_off_usb_on_serial",
+    0x13: "streaming_on_both_ports",
+    0x14: "sampling_started_threshold_condition_satisfied",
+    0x15: "sampling_paused_threshold_condition_not_met",
     0x16: "power_source_switched_to_internal_battery",
     0x17: "power_source_switched_to_external_battery",
+    0x18: "twist_activation_started_sampling",
+    0x19: "twist_activation_paused_sampling",
+    0x1A: "wifi_module_activated",
+    0x1B: "wifi_module_deactivated",
+    0x1C: "regimes_enabled_not_yet_in_regime",
+    0x1D: "entered_regime_1",
+    0x1E: "entered_regime_2",
+    0x1F: "entered_regime_3",
+    0x20: "start_of_regime_bin",
+    0x21: "begin_profiling_up_cast",
+    0x22: "begin_profiling_down_cast",
+    0x23: "end_of_profiling_cast",
     0x24: "battery_failed_schedule_finished",
+    0x25: "directional_sampling_fast_mode",
+    0x26: "directional_sampling_slow_mode",
+    0x27: "energy_used_marker_internal_battery",
+    0x28: "energy_used_marker_external_power",
+    0x29: "device_control_action_result",
 }
 RTC_RESET_EVENTS = {0x06, 0x0A, 0x0B}
 RESTART_EVENTS = {0x0A, 0x0B}  # sampling restarted on a reset clock: the next sample set is re-anchored here
@@ -88,6 +111,13 @@ FLAG_OUT_OF_RANGE = 2  # raw value cannot be converted (R outside (0, 1))
 TFLAG_NO_ANCHOR = 1  # precedes any time anchor; time taken from the header start time
 TFLAG_RESET_CLOCK = 2  # anchored on a clock that had been reset (anchor earlier than the deployment's enable time)
 TFLAG_SKEW_CORRECTED = 4  # set by the NetCDF writer: reset-clock time shifted by the skew measured at offload
+
+
+def event_name(code: int) -> str:
+    """CF-safe name for an event type code; codes above 0xFF are Ruskin's own, not the logger's."""
+    if code in EVENT_NAMES:
+        return EVENT_NAMES[code]
+    return f"ruskin_event_{code}" if code > 0xFF else f"type_0x{code:02X}"
 
 
 @dataclass
@@ -113,7 +143,7 @@ class Event:
 
     @property
     def name(self) -> str:
-        return EVENT_NAMES.get(self.type, f"type_0x{self.type:02X}")
+        return event_name(self.type)
 
     @property
     def unix_ms(self) -> int:
@@ -269,15 +299,22 @@ def resolve_times(
 
     Returns (time_ms, time_flags, keep mask, notes).
     """
-    t = d.time_ms.copy()
-    tf = d.time_flags.copy()
+    return resolve_time_arrays(d.time_ms, d.time_flags, d.segment, skew_s, offload_unix_ms)
+
+
+def resolve_time_arrays(
+    time_ms: np.ndarray, time_flags: np.ndarray, segment: np.ndarray, skew_s: float | None, offload_unix_ms: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """resolve_times() on plain arrays: logger-clock times, TFLAG_* bits, and clock-segment numbers."""
+    t = time_ms.copy()
+    tf = time_flags.copy()
     keep = np.ones(t.size, bool)
     notes: list[str] = []
     reset = (tf & TFLAG_RESET_CLOCK) != 0
     if reset.any():
-        last = d.segment.max()
-        fix = reset & (d.segment == last)
-        drop = reset & (d.segment != last)
+        last = segment.max()
+        fix = reset & (segment == last)
+        drop = reset & (segment != last)
         if fix.any():
             i0 = int(np.flatnonzero(fix)[0])
             if skew_s is None or not math.isfinite(skew_s):
