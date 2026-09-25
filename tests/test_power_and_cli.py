@@ -9,7 +9,7 @@ import pytest
 
 from rbr_tpw import power
 from rbr_tpw.cli import Settings, Thresholds, _time_checks
-from rbr_tpw.configure import DeployConfig, configure, unlock_key
+from rbr_tpw.configure import ConfigError, DeployConfig, configure, unlock_key
 from rbr_tpw.link import LoggerError
 
 ROOT = Path(__file__).parent.parent
@@ -141,3 +141,39 @@ def test_configure_sequence_on_finished_logger():
     assert fake.locked  # re-locked at the end
     assert report["readback"]["status"] == "logging" and report["readback"]["power"]["energy_remaining_J"] == 33696
     assert time.monotonic() - t0 < 30
+
+
+def test_used_battery_gets_prorated_derated_capacity():
+    cfg = DeployConfig(battery_days_used=14, battery_life_days=50)
+    assert cfg.battery_fraction() == pytest.approx(0.72)
+    per_day = power.energy_per_day_J(500, 450)
+    rem = power.remaining(0.72 * power.NOMINAL_J, 512, 132_120_064, 500, 1, 450)
+    assert rem["energy_usable_J"] == pytest.approx(0.72 * power.DERATED_J)
+    assert rem["energy_days"] == pytest.approx(0.72 * power.DERATED_J / per_day)
+    assert DeployConfig(fresh_battery=True).battery_fraction() == 1.0
+    assert DeployConfig().battery_fraction() is None
+    for bad in (DeployConfig(battery_days_used=50, battery_life_days=50), DeployConfig(battery_days_used=14),
+                DeployConfig(fresh_battery=True, battery_days_used=1, battery_life_days=50)):
+        with pytest.raises(ConfigError):
+            bad.battery_fraction()
+
+
+def test_configure_writes_prorated_counter():
+    fake = FakeSolo(status="finished")
+    cfg = DeployConfig(set_clock=False, battery_days_used=14, battery_life_days=50, period_ms=500)
+    report = configure(fake, 100689, cfg, 0.0, log=lambda *a: None)
+    mj = round(33_696_000 * 0.72)
+    assert f"powerstatus remaining = {mj:X}" in fake.log
+    assert report["readback"]["power"]["energy_remaining_J"] == mj / 1000
+    step = next(s for s in report["steps"] if s["step"] == "battery_counter")
+    assert step["fraction_of_new_cell"] == pytest.approx(0.72)
+
+
+@pytest.mark.parametrize("argv", [["--used-battery", "14/50"],  # needs --configure
+                                  ["--configure", "--used-battery", "60/50"],
+                                  ["--configure", "--used-battery", "14"],
+                                  ["--configure", "--used-battery", "14/50", "--fresh-battery"]])
+def test_used_battery_option_errors(tmp_path, argv):
+    from rbr_tpw.cli import main
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), *argv])

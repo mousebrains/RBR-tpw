@@ -8,6 +8,8 @@ thresholds:              # loud alarm at offload and after configure
 deploy:                  # used only with --configure; applied after the download is saved
   set_clock: true        # set the logger clock to UTC (host clock + NTP offset)
   fresh_battery: false   # true only when a new cell was installed: resets the energy counter
+  # battery_days_used: 14  # a cell already used elsewhere (instead of fresh_battery): counter set to
+  # battery_life_days: 50  #   (life - used) / life of a new cell; days used and expected life there
   erase: true            # erase logger memory (only ever after a saved download)
   enable: true           # start logging when done
   schedule:

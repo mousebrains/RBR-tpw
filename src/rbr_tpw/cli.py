@@ -159,8 +159,12 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     plan = []
     if cfg.set_clock:
         plan.append("set clock to UTC" if ntp.get("offset_s") is not None else "set clock to host time (NTP failed)")
-    if cfg.fresh_battery:
+    battery = cfg.battery_fraction()
+    if battery == 1:
         plan.append("reset battery counter to a fresh cell")
+    elif battery is not None:
+        plan.append(f"set battery counter to {battery:.0%} of a fresh cell "
+                    f"({cfg.battery_days_used:g} of {cfg.battery_life_days:g} days used)")
     period = f"{cfg.period_ms} ms" if cfg.period_ms else "period unchanged"
     plan.append(f"schedule {cfg.mode}, {period}, start {cfg.start}, end {cfg.end}")
     if cfg.erase:
@@ -368,6 +372,9 @@ def main(argv=None):
     g.add_argument("--end", help="'never' or ISO-8601 UTC")
     g.add_argument("--fresh-battery", action="store_true", default=None,
                    help="reset the battery energy counter (a new cell was installed)")
+    g.add_argument("--used-battery", metavar="USED/LIFE",
+                   help="a used cell was installed: set the energy counter to (LIFE - USED) / LIFE of a new "
+                        "cell, both in days, e.g. 14/50 for 14 days used of an expected 50-day life")
     g.add_argument("--no-erase", dest="erase", action="store_false", default=None, help="do not erase memory")
     g.add_argument("--no-enable", dest="enable", action="store_false", default=None, help="configure only")
     g.add_argument("--no-clock", dest="set_clock", action="store_false", default=None, help="leave the clock alone")
@@ -390,9 +397,23 @@ def main(argv=None):
                                                "set_clock") if getattr(args, k) is not None}
     if args.rate_hz:
         overrides["period_ms"] = round(1000 / args.rate_hz)
+    if args.used_battery and args.fresh_battery:
+        ap.error("--used-battery and --fresh-battery are mutually exclusive")
+    if args.used_battery:
+        try:
+            used, life = (float(x) for x in args.used_battery.split("/"))
+        except ValueError:
+            ap.error(f"--used-battery {args.used_battery!r}: expected USED/LIFE in days, e.g. 14/50")
+        overrides.update(battery_days_used=used, battery_life_days=life, fresh_battery=False)
+    elif args.fresh_battery:  # the command line wins over a used battery in the YAML file
+        overrides.update(battery_days_used=None, battery_life_days=None)
     if deploy is not None:
         for k, v in overrides.items():
             setattr(deploy, k, v)
+        try:
+            deploy.battery_fraction()
+        except ConfigError as err:
+            ap.error(str(err))
     elif overrides:
         ap.error("configuration options need --configure")
 

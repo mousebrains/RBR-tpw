@@ -1,8 +1,6 @@
 """NetCDF writer: content round-trip and CF compliance (IOOS compliance-checker cf:1.11 grammar;
 the files declare CF-1.13, for which no checker exists yet)."""
 
-import io
-from contextlib import redirect_stdout
 from pathlib import Path
 
 import netCDF4
@@ -58,27 +56,8 @@ def test_contents(nc_path: Path):
         assert list(nc["event_type"][:]) == [1]
 
 
-# Known false positive: the checker only accepts the literal "CF-1.11".
-_CF_FALSE_POSITIVES = ('Conventions global attribute does not contain "CF-1.11"',)
-
-
-def test_cf_compliance(nc_path: Path):
-    cc = pytest.importorskip("compliance_checker.runner")
-    cc.CheckSuite.load_all_available_checkers()
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        cc.ComplianceChecker.run_checker(str(nc_path), checker_names=["cf:1.11"], verbose=0,
-                                         criteria="strict", output_filename="-", output_format="text")
-    problems = []
-    for line in buf.getvalue().splitlines():
-        s = line.strip()
-        if not s.startswith("*"):
-            continue
-        msg = s.lstrip("*").strip()
-        if not msg or "potential issues" in msg.lower() or any(fp in msg for fp in _CF_FALSE_POSITIVES):
-            continue
-        problems.append(msg)
-    assert not problems, "\n".join(problems) + "\n\n" + buf.getvalue()
+def test_cf_compliance(nc_path: Path, cf_problems):
+    assert not cf_problems(nc_path)
 
 
 def test_rtc_reset_segment_is_retimed(tmp_path: Path):

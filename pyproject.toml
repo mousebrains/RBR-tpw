@@ -1,7 +1,7 @@
 [project]
 name = "rbr-tpw"
 version = "0.1.0"
-description = "Command-line offload and setup of RBR loggers: CRC-checked download to CF NetCDF, clock skew, memory and battery state, configure and enable"
+description = "Command-line offload and setup of RBR loggers: CRC-checked download to CF NetCDF, clock skew, memory and battery state, configure and enable; Ruskin .rsk to NetCDF conversion"
 readme = "README.md"
 authors = [
     { name = "Pat Welch", email = "pat@mousebrains.com" }
@@ -37,6 +37,7 @@ Issues = "https://github.com/mousebrains/RBR-tpw/issues"
 
 [project.scripts]
 rbr-offload = "rbr_tpw.cli:main"
+rbr-rsk2nc = "rbr_tpw.rsk:main"
 
 [dependency-groups]
 dev = [

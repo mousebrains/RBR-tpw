@@ -34,6 +34,9 @@ class ConfigError(Exception):
 class DeployConfig:
     set_clock: bool = True
     fresh_battery: bool = False  # reset the energy counter to a new cell's nominal capacity
+    # A cell already used elsewhere: the counter is set to (life - used) / life of a new cell's capacity.
+    battery_days_used: float | None = None  # days the cell has already powered an instrument
+    battery_life_days: float | None = None  # that cell's expected life in that instrument, days
     erase: bool = True
     mode: str = "continuous"
     period_ms: int | None = None  # None = keep the logger's current period
@@ -56,6 +59,19 @@ class DeployConfig:
         if unknown:
             raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
         return cls(**flat)
+
+    def battery_fraction(self) -> float | None:
+        """Fraction of a new cell to write to the energy counter; None = leave the counter alone."""
+        used, life = self.battery_days_used, self.battery_life_days
+        if used is None and life is None:
+            return 1.0 if self.fresh_battery else None
+        if used is None or life is None:
+            raise ConfigError("a used battery needs both battery_days_used and battery_life_days")
+        if self.fresh_battery:
+            raise ConfigError("fresh_battery and a used battery (battery_days_used) are mutually exclusive")
+        if not (life > 0 and 0 <= used < life):
+            raise ConfigError(f"used battery: need 0 <= days used ({used:g}) < life ({life:g} days)")
+        return (life - used) / life
 
 
 def _logger_time(value: str, now_ok: bool) -> str:
@@ -183,6 +199,7 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
 
     cur = link.query("sampling")
     start, end, period = validate(cfg, int(cur.get("period", "0") or 0))
+    battery = cfg.battery_fraction()
 
     with Session(link, serial) as s:
         status = link.query("status")["status"]
@@ -202,12 +219,19 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
                 raise ConfigError(f"clock could not be set within {cfg.clock_tolerance_s * 1e3:.0f} ms: "
                                   f"{clk['skew_vs_utc_s']:+.3f} s")
 
-        if cfg.fresh_battery:
-            hex_mj = f"{round(NOMINAL_BATTERY_J * 1000):X}"  # 33,696,000 mJ -> 2022900, as Ruskin stores it
+        if battery is not None:
+            mj = round(NOMINAL_BATTERY_J * battery * 1000)  # new cell: 33,696,000 mJ -> 2022900, as Ruskin stores it
+            hex_mj = f"{mj:X}"
             s.write(f"powerstatus remaining = {hex_mj}", expect=f"remaining = {hex_mj}")
             got = power(link)
-            step("fresh_battery", remaining_raw=got["remaining_raw"], energy_remaining_J=got["energy_remaining_J"])
-            log(f"    battery counter reset to {got['energy_remaining_J']:.0f} J")
+            if round(got["energy_remaining_J"] * 1000) != mj:
+                raise ConfigError(f"battery counter reads {got['remaining_raw']} after writing {hex_mj}")
+            step("battery_counter", fraction_of_new_cell=battery, days_used=cfg.battery_days_used,
+                 life_days=cfg.battery_life_days, remaining_raw=got["remaining_raw"],
+                 energy_remaining_J=got["energy_remaining_J"])
+            what = "a new cell" if battery == 1 else (f"{battery:.0%} of a new cell ({cfg.battery_days_used:g} of "
+                                                      f"{cfg.battery_life_days:g} days used)")
+            log(f"    battery counter set to {got['energy_remaining_J']:.0f} J, {what}")
 
         s.write(f"starttime = {start}")
         s.write(f"endtime = {end}")

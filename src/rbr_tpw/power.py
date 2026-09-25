@@ -11,6 +11,10 @@ How Ruskin combines these is not verified. The formula below (active current x (
 read time) per sample, plus sleep current for the rest of the day) is our own and should be checked
 against Ruskin's "estimated end" for a few sampling periods.
 
+Derating is proportional: usable energy = counter x DERATED_J / NOMINAL_J (90%), so a cell whose
+counter was pro-rated to a fraction f of a new cell (configure.DeployConfig.battery_days_used) gets
+f of the derated capacity.
+
 Voltage says little about remaining capacity for Li-SOCl2. The discharge curve is flat near 3.6 V
 until close to exhaustion, so a voltage threshold only catches dead, disconnected or nearly exhausted
 cells.
@@ -50,7 +54,7 @@ def remaining(counter_J: float, used_bytes: int, remaining_bytes: int, period_ms
     per_day = energy_per_day_J(period_ms, active_ms)
     samples = max(0, used_bytes - HEADER_BYTES) / (BYTES_PER_READING * nchan)
     used_this_deployment = per_day * samples * period_ms / 86_400_000
-    usable = counter_J - used_this_deployment - (NOMINAL_J - DERATED_J)
+    usable = counter_J * DERATED_J / NOMINAL_J - used_this_deployment
     e_days = max(0.0, usable) / per_day if math.isfinite(usable) else math.nan
     m_days = memory_days(remaining_bytes, period_ms, nchan)
     limit = "energy" if e_days < m_days else "memory"

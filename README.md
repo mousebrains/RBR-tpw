@@ -19,6 +19,9 @@ Plug in a logger and `rbr-offload`:
 | RBRsolo T (L2-era compact logger, firmware 1.000) | 9 | yes | yes |
 | Other RBR loggers | anything else | detected and skipped; nothing is changed | – |
 
+Ruskin `.rsk` files from any RBR logger can be converted to the same NetCDF format; see
+[Convert Ruskin .rsk files](#convert-ruskin-rsk-files).
+
 The fwtype-9 protocol is not in RBR's published command references. It was worked out on a real logger
 and checked against Ruskin's own output.
 
@@ -51,6 +54,26 @@ For each logger this writes:
 `rbr-offload DIR --rebuild DIR/raw/*.json` regenerates the NetCDF files from the raw files without the
 logger, e.g. after a decoder fix.
 
+## Convert Ruskin .rsk files
+
+```sh
+rbr-rsk2nc OUTDIR file.rsk ...          # or directories: searched recursively, sub-folders kept under OUTDIR
+```
+
+`rbr-rsk2nc` writes each `.rsk` as a NetCDF file in the same format, named after the `.rsk`. It never
+modifies the `.rsk`. It skips files already converted, so an interrupted batch resumes (`--force`
+overwrites). Each file takes one of two routes, recorded in the `conversion_route` attribute:
+
+| Logger | Route | Contents |
+|---|---|---|
+| RBRsolo, fwtype 9 or 0 | `decode` | Ruskin keeps the logger's memory image in the `.rsk`. rbr-tpw decodes it exactly as `rbr-offload` does, raw readings included, and compares it with Ruskin's values (`ruskin_comparison`). |
+| RBRduet, RBRconcerto, RBRconcerto³, … | `values` | Ruskin's computed values, in the same layout without the `_raw` variables. Channels Ruskin hides are included, without a CF `standard_name`. Channels the file lists without values are named in `ruskin_channels_not_stored`. |
+
+The clock skew comes from Ruskin's `loggerTimeDrift`: logger minus the Ruskin computer's clock, whose offset
+from UTC is unknown. It is in `clock_skew_vs_host_s`, and `clock_skew_s` is NaN. Samples on a clock that had
+restarted at 2000-01-01 are re-timed with it, as `rbr-offload` does. EasyParse files (RBRconcerto³) have no
+drift recorded. `--ruskin-values` uses Ruskin's values for the solos too.
+
 Offloading never changes anything on the logger. A logger that was logging keeps logging.
 
 ### Clock skew
@@ -70,9 +93,9 @@ At every offload, and again after `--configure`, the tool estimates how long the
 sampling on its current schedule:
 
 - **Memory-limited days** are exact: free bytes ÷ bytes per day.
-- **Energy-limited days** come from a model: the logger's energy counter, minus the modelled energy for the
-  samples already in memory, minus a 10% derating, divided by the modelled use per day. The model uses
-  RBR Ruskin's constants for the solo T (0.69 mA while sampling, 5.5 µA asleep, 3.6 V).
+- **Energy-limited days** come from a model: the logger's energy counter derated to 90%, minus the modelled
+  energy for the samples already in memory, divided by the modelled use per day. The model uses RBR Ruskin's
+  constants for the solo T (0.69 mA while sampling, 5.5 µA asleep, 3.6 V).
 
 The lesser of the two is reported and stored in the NetCDF attributes. You get a loud alarm (a bell, a red
 banner, and a prompt to acknowledge unless `--yes` is given) when:
@@ -92,6 +115,7 @@ on it.
 rbr-offload DIR --configure deploy.yaml             # settings from a file
 rbr-offload DIR --configure --period-ms 1000 \
             --start 2026-10-01T00:00:00Z --end never --fresh-battery
+rbr-offload DIR --configure deploy.yaml --used-battery 14/50   # a cell with 14 of ~50 days used elsewhere
 ```
 
 `--configure` runs only after that logger's data has been downloaded and saved. It shows the plan and asks
@@ -99,7 +123,11 @@ before changing each logger (`--yes` skips the question). It then:
 
 1. stops logging,
 2. sets the clock to UTC, aligned to the second and checked afterwards,
-3. optionally resets the battery energy counter (`--fresh-battery`, only when a new cell was installed),
+3. optionally resets the battery energy counter: `--fresh-battery` when a new cell was installed, or
+   `--used-battery USED/LIFE` for a cell already used elsewhere, e.g. `14/50` for 14 days used of an expected
+   50-day life in that instrument. The counter is set to (LIFE − USED)/LIFE of a new cell, so the energy
+   estimate starts from that fraction of the derated capacity. This assumes the cell was drained at a steady
+   rate there; a Li-SOCl2 cell's voltage is too flat to tell how much it has left.
 4. writes the schedule,
 5. erases memory,
 6. enables logging,
@@ -115,6 +143,8 @@ thresholds:
 deploy:                  # used only with --configure
   set_clock: true
   fresh_battery: false
+  # battery_days_used: 14   # a used cell: 14 days used of an expected
+  # battery_life_days: 50   # 50-day life (instead of fresh_battery)
   erase: true
   enable: true
   schedule:
