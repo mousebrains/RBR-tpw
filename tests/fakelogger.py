@@ -381,3 +381,32 @@ def serve_pty(fake: FakePort):
         os.close(slave)
 
     return path, close
+
+
+def serve_com(fake: FakePort, device: str):
+    """Serve `fake` on one end of a virtual COM port pair (com0com on Windows); the code under test opens the
+    other end, through pyserial's Windows serial backend. Returns stop."""
+    import serial
+
+    ser = serial.Serial(device, 115200, timeout=0.002)
+    stop = threading.Event()
+
+    def run():
+        while not stop.is_set():
+            data = ser.read(4096)
+            if data:
+                fake.write(data)
+            out = fake.read(65536)
+            if out:
+                ser.write(out)
+
+    fake.timeout = 0.002  # keep the relay loop responsive
+    t = threading.Thread(target=run, name=f"fake-com-{device}", daemon=True)
+    t.start()
+
+    def close():
+        stop.set()
+        t.join(2)
+        ser.close()
+
+    return close

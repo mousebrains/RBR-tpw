@@ -1,23 +1,28 @@
-"""Offloads through real transports: the simulated loggers behind a TCP socket (every OS) or a pseudo-terminal
-(macOS/Linux), opened with real pyserial. This covers what the replaced-pyserial tests cannot: read timeouts,
-partial reads, termios setup, the exclusive lock, and `socket://` ports."""
+"""Offloads through real transports: the simulated loggers behind a TCP socket (every OS), a pseudo-terminal
+(macOS/Linux) or a com0com virtual COM port pair (Windows, when RBR_TPW_COM_PAIR names one, e.g. "COM20,COM21"),
+opened with real pyserial. This covers what the replaced-pyserial tests cannot: read timeouts, partial reads,
+termios setup, Windows' serial backend, the exclusive lock, and `socket://` ports."""
 
 import io
 import json
+import os
 import sys
 import threading
 
 import netCDF4
 import pytest
 import serial
-from fakelogger import FakeConcerto3, FakeDuet, FakeSolo, serve_pty, serve_socket
+from fakelogger import FakeConcerto3, FakeDuet, FakeSolo, serve_com, serve_pty, serve_socket
 
 from rbr_tpw import cli
 from rbr_tpw.console import Console, setup_logging
 from rbr_tpw.link import Link
 
+COM_PAIR = [c.strip() for c in os.environ.get("RBR_TPW_COM_PAIR", "").split(",") if c.strip()]
+needs_com = pytest.mark.skipif(len(COM_PAIR) != 2, reason="set RBR_TPW_COM_PAIR to a virtual COM port pair")
 TRANSPORTS = ["socket", pytest.param("pty", marks=pytest.mark.skipif(sys.platform == "win32",
-                                                                    reason="no pseudo-terminals on Windows"))]
+                                                                    reason="no pseudo-terminals on Windows")),
+              pytest.param("com", marks=needs_com)]
 
 
 @pytest.fixture
@@ -26,6 +31,9 @@ def served(request, tmp_path, monkeypatch):
     closers = []
 
     def serve(fake, transport):
+        if transport == "com":  # the logger on the pair's second port; the tool opens the first
+            closers.append(serve_com(fake, COM_PAIR[1]))
+            return COM_PAIR[0]
         port, close = (serve_socket if transport == "socket" else serve_pty)(fake)
         closers.append(close)
         return port
@@ -113,3 +121,26 @@ def test_stop_and_resume_over_a_socket(served, tmp_path, monkeypatch):
     (nc,) = tmp_path.glob("77_*.nc")
     with netCDF4.Dataset(nc) as ds:
         assert len(ds["time"]) == 150_000
+
+
+@needs_com
+def test_explicit_com_port(served, tmp_path, monkeypatch):
+    """--port COM20: checked against the ports Windows lists, then opened through its serial backend."""
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew)
+    port = served(FakeSolo("fake", n_samples=100), "com")
+    monkeypatch.setattr(cli, "rbr_ports", lambda: set())
+    cli.run(served.settings(), once=True, port=port)
+    assert list(tmp_path.glob("100689_*.nc"))
+
+
+@needs_com
+def test_com_port_in_use_is_skipped_quietly(served, tmp_path, monkeypatch):
+    """Windows opens COM ports exclusively: a second opener gets "Access is denied", reported as in use."""
+    port = served(FakeSolo("fake", n_samples=100), "com")
+    holder = Link(port)
+    try:
+        monkeypatch.setattr(cli, "rbr_ports", lambda: {port})
+        cli.run(served.settings(), once=True, port=None)
+        assert "is in use by another program" in served.console_text() and "ERROR" not in served.console_text()
+    finally:
+        holder.close()
