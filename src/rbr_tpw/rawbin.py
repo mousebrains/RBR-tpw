@@ -161,6 +161,7 @@ class Decoded:
     segment: np.ndarray  # (n,) int32 index of the time anchor each sample set hangs off; -1 = none
     events: list[Event] = field(default_factory=list)
     trailing_bytes: int = 0  # bytes after the last whole word or partial sample set
+    bad_event_words: int = 0  # event-marker words whose record failed its CRC
 
     @property
     def rtc_reset(self) -> bool:
@@ -227,7 +228,13 @@ def decode(image: bytes, nchan: int) -> Decoded:
             break
         rec = body[4 * i : 4 * i + 8]
         if not _event_crc_ok(rec):
-            bad_event_words.append(i)  # keep as a reading; it will be flagged out-of-range
+            # An RBRsolo reading is R * 2**30 with 0 < R < 1 (top byte <= 0x3F), so a 0xF7 word is an event
+            # whose record is corrupt. Drop both of its words: kept as readings they would add two false
+            # samples (the second, a timestamp, converts to a plausible temperature) and shift later times.
+            bad_event_words.append(i)
+            readings_before += int(is_reading[i_prev_end:i].sum())
+            is_reading[i : i + 2] = False
+            i_prev_end = i + 2
             continue
         readings_before += int(is_reading[i_prev_end:i].sum())
         is_reading[i : i + 2] = False
@@ -262,7 +269,7 @@ def decode(image: bytes, nchan: int) -> Decoded:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK
 
     return Decoded(header=hdr, nchan=nchan, raw=raw, flags=flags, time_ms=time_ms, time_flags=time_flags,
-                   segment=segment, events=events, trailing_bytes=trailing)
+                   segment=segment, events=events, trailing_bytes=trailing, bad_event_words=len(bad_event_words))
 
 
 def tmp_equation(raw: np.ndarray, c: tuple[float, float, float, float]) -> tuple[np.ndarray, np.ndarray]:
@@ -273,6 +280,7 @@ def tmp_equation(raw: np.ndarray, c: tuple[float, float, float, float]) -> tuple
         x = np.log(1.0 / np.where(bad, 0.5, r) - 1.0)
         y = c[0] + c[1] * x + c[2] * x**2 + c[3] * x**3
         t = 1.0 / y - 273.15
+    bad |= ~np.isfinite(t)  # e.g. the polynomial passing through zero near R -> 1
     t[bad] = math.nan
     return t, bad
 
