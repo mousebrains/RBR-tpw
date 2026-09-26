@@ -47,7 +47,10 @@ def l2_sectioned_image(n: int, channels: list[tuple[str, int, list[tuple[str, fl
     for ctype, status, coeffs in channels:
         words = b"".join(struct.pack("<i", int(v)) if name.startswith("n") else struct.pack("<f", v)
                          for name, v in coeffs)
-        blobs.append(ctype.encode().ljust(6, b"\0") + struct.pack("<HIB", status, 558_177_718, len(coeffs)) + words)
+        if ctype.startswith("pres"):  # one more word after n0 on pressure channels: 0x1111 on SN081500's pres21
+            words += struct.pack("<I", 0x1111)
+        blobs.append(ctype.encode().ljust(6, b"\0") + struct.pack("<HIB", status, 558_177_718, len(words) // 4)
+                     + words)
     head = 4 + 2 * len(blobs)
     starts, off = [], head
     for blob in blobs:

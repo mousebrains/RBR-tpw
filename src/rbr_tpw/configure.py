@@ -98,6 +98,13 @@ def validate(cfg: DeployConfig, current_period_ms: int) -> tuple[str, str, int]:
     if cfg.mode != "continuous":
         raise ConfigError(f"sampling mode {cfg.mode!r} is not supported yet (continuous only)")
     period = cfg.period_ms or current_period_ms
+    try:
+        whole = float(period).is_integer()
+    except (TypeError, ValueError):
+        whole = False
+    if not whole:
+        raise ConfigError(f"period {period!r} ms: not a whole number of milliseconds")
+    period = int(float(period))  # "500.0" from YAML must not reach the logger as "period = 500.0"
     # Ruskin offers 2 Hz or whole seconds for these loggers.
     if not (period == 500 or (period >= 1000 and period % 1000 == 0)):
         raise ConfigError(f"period {period} ms: use 500 ms (2 Hz) or a whole number of seconds")
@@ -159,13 +166,16 @@ class Session:
         return r
 
 
-def set_clock(link: Link, ntp_offset_s: float, tolerance_s: float, attempts: int = 4, log=print) -> dict:
+def set_clock(link: Link, ntp_offset_s: float | None, tolerance_s: float, attempts: int = 4, log=print) -> dict:
     """Write `now = <UTC>` so the logger's second boundary lines up with UTC.
 
     The command is sent `lat` seconds before the target second; the resulting
     skew is measured and `lat` adjusted. Assumes the logger zeroes its
     sub-second counter when the time is written (checked by the re-measurement).
+    With ntp_offset_s None (no NTP) the reference is the host clock, and the log says so.
     """
+    ref = "UTC" if ntp_offset_s is not None else "host"
+    ntp_offset_s = ntp_offset_s or 0.0
     lat = 0.003  # initial guess at host->logger latency (Ruskin sends ~6 ms early)
     history = []
     for attempt in range(1, attempts + 1):
@@ -188,24 +198,29 @@ def set_clock(link: Link, ntp_offset_s: float, tolerance_s: float, attempts: int
         s_utc = skew["skew_vs_host_s"] - ntp_offset_s
         history.append({"attempt": attempt, "lead_s": lat, "skew_vs_utc_s": s_utc,
                         "uncertainty_s": skew["uncertainty_s"]})
-        log(f"    clock set attempt {attempt}: logger - UTC = {s_utc * 1e3:+.1f} ms "
+        log(f"    clock set attempt {attempt}: logger - {ref} = {s_utc * 1e3:+.1f} ms "
             f"(+/- {skew['uncertainty_s'] * 1e3:.1f} ms)")
         if abs(s_utc) <= tolerance_s:
-            return {"ok": True, "skew_vs_utc_s": s_utc, "uncertainty_s": skew["uncertainty_s"], "history": history}
+            return {"ok": True, "skew_vs_utc_s": s_utc, "uncertainty_s": skew["uncertainty_s"], "reference": ref,
+                    "history": history}
         lat -= s_utc  # logger ahead (s > 0) -> we sent too early -> send later
         # lat may go negative (send just after the target second): the target is ~2 s ahead, so any lead in
         # (-0.5, 0.9) s is still in the future. Stopping at lat < 0 made any first skew above +3 ms fatal.
         if not -0.5 < lat < 0.9:
             break
-    return {"ok": False, "skew_vs_utc_s": history[-1]["skew_vs_utc_s"] if history else math.nan,
+    return {"ok": False, "skew_vs_utc_s": history[-1]["skew_vs_utc_s"] if history else math.nan, "reference": ref,
             "history": history}
 
 
-def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, log=print, timing=nullcontext) -> dict:
+def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float | None, log=print,
+              timing=nullcontext) -> dict:
     """Apply `cfg`. Caller must already have saved this session's download if cfg.erase.
 
+    `ntp_offset_s` is UTC minus host (None: no NTP, so the clock is set to the host clock).
     `timing(what)` wraps the host-timestamp-sensitive steps (see hostclock.timing_critical)."""
-    report: dict = {"config": asdict(cfg), "steps": []}
+    report: dict = {"config": asdict(cfg), "steps": [],
+                    "clock_reference": "UTC (host clock corrected by NTP)" if ntp_offset_s is not None else
+                    "host clock (no NTP)"}
 
     # "<name>_sent" is recorded before a command that changes the logger, "<name>" once it is confirmed: after
     # a lost reply, "sent" alone means it may or may not have happened

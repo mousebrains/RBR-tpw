@@ -608,10 +608,13 @@ def columns(datasets: dict[str, bytes], snap: dict | None = None, dataset: str |
     per_sample = s["bytecount"] / s["samplecount"] if s.get("samplecount") and ds == _pick(datasets, snap, None) \
         else None
     stored = [c for c in cols if c["stored"]]
-    for cand in ([stored, cols] if len(stored) != len(cols) else [cols]):
-        rec = 8 + width * len(cand)
-        if (per_sample is None and size % rec == 0) or per_sample == rec:
-            return ds, sch["label"], cand, meta, fmt[1]
+    cands = [stored, cols] if len(stored) != len(cols) else [cols]
+    # the logger's bytecount/samplecount first; else a whole number of records (an open dataset's counts may
+    # include a record still being written: the reference does not say)
+    for ok in ((lambda rec: per_sample == rec), (lambda rec: size % rec == 0)):
+        for cand in cands:
+            if ok(8 + width * len(cand)):
+                return ds, sch["label"], cand, meta, fmt[1]
     raise ValueError(f"{ds}/{sch['label']}: {size} bytes is not a whole number of samples for {len(stored)} "
                      f"stored or {len(cols)} listed channels of {fmt[0]}")
 

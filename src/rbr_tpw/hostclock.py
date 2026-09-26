@@ -68,6 +68,8 @@ NTP_TO_UNIX = 2_208_988_800  # seconds from 1900-01-01 (NTP era 0) to 1970-01-01
 
 def _from_ntp(b: bytes) -> float:
     sec, frac = struct.unpack("!II", b)
+    if not sec & 0x8000_0000:  # RFC 4330 section 3: MSB clear means era 1, from 2036-02-07
+        sec += 2**32
     return sec - NTP_TO_UNIX + frac / 2**32
 
 
@@ -75,10 +77,12 @@ def _to_ntp(t: float) -> bytes:
     return struct.pack("!II", (int(t) + NTP_TO_UNIX) & 0xFFFFFFFF, int((t % 1) * 2**32) & 0xFFFFFFFF)
 
 
-def ntp_query(server: str, timeout: float = 1.0, port: int = 123) -> dict:
-    """One SNTP exchange (RFC 4330). offset = ((T2 - T1) + (T3 - T4)) / 2 is server minus host, so
-    UTC ~= host + offset; delay = (T4 - T1) - (T3 - T2). Raises OSError or ValueError."""
-    family, _, _, _, addr = socket.getaddrinfo(server, port, type=socket.SOCK_DGRAM)[0]
+def ntp_query(server: str, timeout: float = 1.0, port: int = 123, which: int = 0) -> dict:
+    """One SNTP exchange (RFC 4330) with the `which`-th address `server` resolves to (modulo their number).
+    offset = ((T2 - T1) + (T3 - T4)) / 2 is server minus host, so UTC ~= host + offset;
+    delay = (T4 - T1) - (T3 - T2). Raises OSError or ValueError."""
+    infos = socket.getaddrinfo(server, port, type=socket.SOCK_DGRAM)
+    family, _, _, _, addr = infos[which % len(infos)]
     with socket.socket(family, socket.SOCK_DGRAM) as sock:
         sock.settimeout(timeout)
         request = bytearray(48)
@@ -106,17 +110,19 @@ def ntp_offset(server: str = "time.apple.com", timeout: float = 3.0, samples: in
     uncertainty = delay/2 + root delay/2 + root dispersion. Never sets the host clock."""
     results, errors = [], []
     deadline = time.monotonic() + timeout
+    which = 0  # after a failure the next address is tried (e.g. IPv4 after an unreachable IPv6 address)
     for _ in range(samples):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         try:
-            results.append(ntp_query(server, min(1.0, remaining), port))
+            results.append(ntp_query(server, min(1.0, remaining), port, which))
         except socket.gaierror as err:  # no DNS (e.g. offline at sea): more tries will not help
             errors.append(f"cannot resolve {server}: {err}")
             break
         except (OSError, ValueError) as err:
             errors.append(str(err) or type(err).__name__)
+            which += 1
     if not results:
         return {"server": server, "error": errors[-1] if errors else "no reply"}
     best = min(results, key=lambda r: r["delay_s"])

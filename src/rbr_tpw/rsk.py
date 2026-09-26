@@ -45,6 +45,7 @@ from .ncwrite import ChannelValues, write_netcdf, write_values_netcdf
 from .rawbin import (
     EQUATIONS,
     FLAG_ERROR_CODE,
+    RESET_CLOCK_BEFORE_MS,
     Decoded,
     decode,
     event_indices,
@@ -104,6 +105,7 @@ class Rsk:
     channels: list[RskChannel]
     parameters: dict[str, str]
     nrows: int
+    notes: list[str] = field(default_factory=list)  # warnings found while reading, for the NetCDF
 
     @property
     def serial_str(self) -> str:
@@ -209,11 +211,16 @@ def read_download(con: sqlite3.Connection) -> bytes | None:
 
 
 def read_values(con: sqlite3.Connection, rsk: Rsk) -> tuple[np.ndarray, np.ndarray]:
-    """Ruskin's data table: (logger-clock ms, values[n, stored channel]); NULL -> NaN."""
+    """Ruskin's data table: (logger-clock ms, values[n, stored channel]); NULL -> NaN.
+
+    Read in rowid order, which is acquisition order: time order would move samples after a mid-deployment clock
+    reset (dated 2000) to the front, where the reset handling cannot place them. On all 141 files checked
+    (2026-09-25) rowid and time order agree. If rowid order steps back other than into the reset clock, the rows
+    are sorted by time instead, with a note."""
     cols = [c.column for c in rsk.stored]
     t = np.empty(rsk.nrows, np.int64)
     v = np.empty((rsk.nrows, len(cols)))
-    cur = con.execute(f"select tstamp, {', '.join(cols)} from data order by tstamp")
+    cur = con.execute(f"select tstamp, {', '.join(cols)} from data order by rowid")
     i = 0
     while rows := cur.fetchmany(READ_BLOCK):
         a = np.array(rows, dtype=np.float64)  # tstamp < 2**53, so exact
@@ -222,6 +229,12 @@ def read_values(con: sqlite3.Connection, rsk: Rsk) -> tuple[np.ndarray, np.ndarr
         i += len(a)
     if i != rsk.nrows:
         raise RskError(f"data table changed while reading ({i} of {rsk.nrows} rows)")
+    back = np.flatnonzero(np.diff(t) <= 0)
+    if back.size and np.any(t[back + 1] >= RESET_CLOCK_BEFORE_MS):  # a step back that is not a clock reset
+        order = np.argsort(t, kind="stable")
+        t, v = t[order], v[order]
+        rsk.notes.append("the data table's row order is not time order apart from clock resets; rows were sorted "
+                         "by time, so samples after a clock reset may be dropped")
     return t, v
 
 
@@ -302,7 +315,7 @@ def make_record(rsk: Rsk, route: str, image: bytes | None) -> dict:
         },
         "raw": ({"file": f"{rsk.path.name} (downloads table)", "bytes": len(image),
                  "sha256": hashlib.sha256(image).hexdigest()} if image is not None else None),
-        "warnings": [],
+        "warnings": list(rsk.notes),
         "title": f"{rsk.model} SN{rsk.serial_str} data from Ruskin file {rsk.path.name}",
         "source": f"{rsk.model} SN{rsk.serial_str} downloaded by Ruskin {rsk.ruskin_version}; {how}",
         "history": f"converted from {rsk.path.name} by rbr-rsk2nc",
@@ -350,13 +363,13 @@ def _values_channels(rsk: Rsk, con: sqlite3.Connection, t: np.ndarray, v: np.nda
     flags = np.zeros(v.shape, np.uint8)
     flags[~np.isfinite(v)] |= FLAG_ERROR_CODE
     col_of = {c.order: k for k, c in enumerate(rsk.stored)}
+    order = np.argsort(t, kind="stable")  # t may step back at a clock reset: look times up in sorted order
     for e in _rows(con, "select tstamp, sampleIndex, channelOrder from errors"):
         k = col_of.get(e["channelOrder"])
-        i = int(np.searchsorted(t, e["tstamp"]))
         if k is None:
             continue
-        if not (i < t.size and t[i] == e["tstamp"]):
-            i = int(e["sampleIndex"]) - 1
+        j = int(np.searchsorted(t, e["tstamp"], sorter=order))
+        i = int(order[j]) if j < t.size and t[order[j]] == e["tstamp"] else int(e["sampleIndex"]) - 1
         if 0 <= i < t.size:
             flags[i, k] |= FLAG_ERROR_CODE
     out = []
@@ -374,7 +387,7 @@ def _values_channels(rsk: Rsk, con: sqlite3.Connection, t: np.ndarray, v: np.nda
 
 def _values_events(con: sqlite3.Connection, t: np.ndarray) -> list[tuple[int, int, int]]:
     rows = [(int(e["tstamp"]), int(e["type"]), int(e["sampleIndex"]))
-            for e in _rows(con, "select tstamp, type, sampleIndex from events order by tstamp, rowid")]
+            for e in _rows(con, "select tstamp, type, sampleIndex from events order by rowid")]  # acquisition order
     found = iter(event_indices(t, [ms for ms, _, si in rows if si < 1]))  # EasyParse files store -1
     return [(ms, typ, si - 1 if si >= 1 else next(found)) for ms, typ, si in rows]
 
