@@ -29,7 +29,9 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 Offload only reads from the logger. Whatever the decoder does, the raw memory, the settings record and the
 serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
 download later, e.g. after a decoder is added. `--configure` refuses any logger but fwtype 9: it erases memory,
-and the write sequence has only been checked on that model.
+and the write sequence has only been checked on that model. A Gen4 logger's download keeps every dataset
+and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning names any other
+dataset or schedule that holds data.
 
 The command sequences come from what RBR's Ruskin 2.26.1 sends each model (its serial logs), and from RBR's
 command references. Only the fwtype-9 solo has been run against real hardware so far. The fwtype-9 protocol is
@@ -74,7 +76,15 @@ being configured finishes its configuration first, so it is never left erased bu
 Ctrl-C quits at once and names anything it interrupted. A port already opened by another copy of
 `rbr-offload` is skipped.
 
-`rbr-offload` exits with status 2 if any logger ended NOT READY TO DEPLOY, e.g. after a failed `--configure`, so a script can tell.
+So that a script can tell, `rbr-offload` exits with status bits set:
+
+- 1 means an offload is incomplete: nothing was downloaded (an unsupported logger or an error), a download
+  failed or was stopped, or its NetCDF was not written. A logger without a decoder yet doesn't count, since
+  its saved download is all there is to get.
+- 2 means a logger ended NOT READY TO DEPLOY. That covers a `--configure` that failed, was skipped (a model it
+  doesn't support, or Ctrl-C) or was declined, and a logger that isn't logging afterwards.
+
+A run where both happen exits with 3.
 
 For each logger this writes:
 
@@ -91,7 +101,8 @@ serial traffic, prompts and answers, and full error tracebacks, with UTC ms time
 logger on each line. The console shows only the summary lines.
 
 `rbr-offload DIR --rebuild DIR/raw/*.json` regenerates the NetCDF files from the raw files without the
-logger, e.g. after a decoder fix.
+logger, e.g. after a decoder fix. Configure reports (`*_configure.json`) are skipped. A record that can't be
+converted is reported and the others are still done; the exit status is then 1.
 
 ## Convert Ruskin .rsk files
 
@@ -177,10 +188,11 @@ before changing each logger (`--yes` skips the question). It then:
 7. reads everything back.
 
 If any step fails, or the logger isn't logging (or pending) afterwards, you get a loud alarm saying whether
-memory was erased. The final line then reads "NOT READY TO DEPLOY" instead of just "disconnect".
+memory was erased. If the reply to the erase was lost, it says the memory may have been erased. The final line then reads "NOT READY TO DEPLOY" instead of just "disconnect".
 `--no-erase` is refused when memory holds data and logging would be enabled, because the logger itself
 refuses that; use it with `--no-enable` to change settings only. A logger is configured at most once per run,
-so unplugging and replugging it won't erase it again.
+so unplugging and replugging it won't erase it again. The exception is a logger whose configure failed:
+reconnecting it tries again. The offload that runs first saves whatever that logger holds.
 
 Settings can live in a YAML file (`--config settings.yaml`, or `--configure settings.yaml`); command-line
 options override it. See [deploy.example.yaml](https://github.com/mousebrains/RBR-tpw/blob/main/deploy.example.yaml):

@@ -47,6 +47,7 @@ from .rawbin import (
     FLAG_ERROR_CODE,
     Decoded,
     decode,
+    event_indices,
     reset_segments,
 )
 
@@ -372,12 +373,10 @@ def _values_channels(rsk: Rsk, con: sqlite3.Connection, t: np.ndarray, v: np.nda
 
 
 def _values_events(con: sqlite3.Connection, t: np.ndarray) -> list[tuple[int, int, int]]:
-    events = []
-    for e in _rows(con, "select tstamp, type, sampleIndex from events order by tstamp, rowid"):
-        si = int(e["sampleIndex"])
-        index = si - 1 if si >= 1 else int(np.searchsorted(t, e["tstamp"]))  # EasyParse files store -1
-        events.append((int(e["tstamp"]), int(e["type"]), index))
-    return events
+    rows = [(int(e["tstamp"]), int(e["type"]), int(e["sampleIndex"]))
+            for e in _rows(con, "select tstamp, type, sampleIndex from events order by tstamp, rowid")]
+    found = iter(event_indices(t, [ms for ms, _, si in rows if si < 1]))  # EasyParse files store -1
+    return [(ms, typ, si - 1 if si >= 1 else next(found)) for ms, typ, si in rows]
 
 
 @dataclass

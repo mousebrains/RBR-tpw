@@ -296,14 +296,50 @@ def hexfloat(s: str) -> float:
 RESET_CLOCK_BEFORE_MS = 978_307_200_000  # 2001-01-01T00:00:00Z: an RBR clock restarts at 2000-01-01 after a power loss
 
 
+def clock_runs(time_ms: np.ndarray) -> np.ndarray:
+    """Start index of each run of samples between backward steps of a per-sample logger clock (a restart)."""
+    return np.concatenate(([0], np.flatnonzero(np.diff(time_ms) < 0) + 1)).astype(np.int64)
+
+
+def event_indices(time_ms: np.ndarray, event_ms: list[int]) -> list[int]:
+    """Index of the sample each event precedes, for events listed in acquisition order (Gen3 dataset 0, Gen4
+    events). np.searchsorted over the whole record is wrong once the clock has gone back: each event is placed
+    within one run of increasing sample times, moving to a later run when event times step back (a restart)
+    or an event on the reset clock follows samples on a set clock."""
+    n = time_ms.size
+    if not n:
+        return [0] * len(event_ms)
+    starts = [int(i) for i in clock_runs(time_ms)] + [n]
+    last = len(starts) - 2
+    r, prev, out = 0, None, []
+    for e in event_ms:
+        if prev is not None and e < prev and r < last:
+            r += 1
+        while e < RESET_CLOCK_BEFORE_MS <= time_ms[starts[r]] and r < last:
+            r += 1
+        a, b = starts[r], starts[r + 1]
+        if time_ms[a] < RESET_CLOCK_BEFORE_MS <= e:
+            i = a  # a set-clock event before a run on the reset clock
+        elif e < RESET_CLOCK_BEFORE_MS <= time_ms[a]:
+            i = b  # the clock restarted after this run and no sample followed
+        else:
+            i = a + int(np.searchsorted(time_ms[a:b], e))
+        out.append(max(i, out[-1]) if out else i)
+        prev = e
+    return out
+
+
 def reset_segments(time_ms: np.ndarray, events: list[tuple[int, int, int]]) -> tuple[np.ndarray, np.ndarray]:
-    """For loggers that timestamp every sample (Ruskin values, Gen3 EasyParse): TFLAG_RESET_CLOCK on samples
-    dated before 2001, and a new clock segment after each restart event. `events` are (ms, type, sample index)."""
+    """For loggers that timestamp every sample (Ruskin values, Gen3 EasyParse, Gen4): TFLAG_RESET_CLOCK on
+    samples dated before 2001, and a new clock segment after each restart event or backward step of the clock
+    (so a missing or misplaced restart event cannot join two reset runs). `events` are (ms, type, sample
+    index)."""
     tflags = np.where(time_ms < RESET_CLOCK_BEFORE_MS, TFLAG_RESET_CLOCK, 0).astype(np.uint8)
+    starts = set(clock_runs(time_ms)[1:].tolist()) if time_ms.size else set()
+    starts |= {index for _, etype, index in events if etype in RESTART_EVENTS and 0 < index < time_ms.size}
     segment = np.zeros(time_ms.size, np.int32)
-    for _, etype, index in events:
-        if etype in RESTART_EVENTS and 0 <= index < time_ms.size:
-            segment[index:] += 1
+    for index in starts:
+        segment[index:] += 1
     return tflags, segment
 
 
@@ -329,11 +365,14 @@ def resolve_times(
 
 
 def clock_segments(d: Decoded) -> np.ndarray:
-    """Per sample set, how many clock restarts (RTC_RESET_EVENTS) precede it."""
+    """Per sample set, how many clock restarts (RTC_RESET_EVENTS, or a backward step of the sample times)
+    precede it."""
+    starts = {e.sample_index for e in d.events if e.type in RTC_RESET_EVENTS and 0 < e.sample_index < d.time_ms.size}
+    if d.time_ms.size:
+        starts |= set(clock_runs(d.time_ms)[1:].tolist())
     seg = np.zeros(d.time_ms.size, np.int32)
-    for e in d.events:
-        if e.type in RTC_RESET_EVENTS and 0 <= e.sample_index < seg.size:
-            seg[e.sample_index:] += 1
+    for index in starts:
+        seg[index:] += 1
     return seg
 
 
@@ -372,6 +411,10 @@ def resolve_time_arrays(
             notes.append(f"{int(drop.sum())} samples on a reset clock with no recoverable time are omitted "
                          "(still present in the raw file)")
     tk = t[keep]
-    if tk.size > 1 and not np.all(np.diff(tk) > 0):
-        notes.append("time is not strictly increasing; check the event list")
+    bad = np.flatnonzero(np.diff(tk) <= 0) if tk.size > 1 else []
+    if len(bad):  # a CF time coordinate must be strictly monotonic: do not publish duplicate or reversed times
+        i = int(bad[0])
+        raise ValueError(f"sample times are not strictly increasing after clock corrections ({len(bad)} step(s); "
+                         f"first after sample {i}: {int(tk[i])} -> {int(tk[i + 1])} ms); not writing a NetCDF "
+                         "(the raw data is unchanged)")
     return t, tf, keep, notes

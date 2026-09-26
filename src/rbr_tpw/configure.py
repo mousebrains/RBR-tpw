@@ -207,6 +207,8 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
     `timing(what)` wraps the host-timestamp-sensitive steps (see hostclock.timing_critical)."""
     report: dict = {"config": asdict(cfg), "steps": []}
 
+    # "<name>_sent" is recorded before a command that changes the logger, "<name>" once it is confirmed: after
+    # a lost reply, "sent" alone means it may or may not have happened
     def step(name, **kw):
         report["steps"].append({"step": name, **kw})
 
@@ -220,21 +222,18 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
                               "E0402). Allow the erase, or use --no-enable to change settings only.")
     try:
         _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery)
-    except (ConfigError, LinkError) as err:
-        if isinstance(err, ConfigError):
-            err.report = report
-        else:
-            report["link_error"] = str(err)
+        # Read back what the logger now holds.
+        back = {k: link.query(k)[k] for k in ("status", "starttime", "endtime")}
+        back["sampling"] = link.query("sampling")
+        back["meminfo"] = memory(link)
+        back["power"] = power(link)
+        with timing("clock check"):
+            back["clock"] = measure_clock_skew(link, reps=3)
+        report["readback"] = back
+    except (ConfigError, LinkError) as err:  # every failure carries what had been done (or sent) so far
+        report["error"] = str(err)
+        err.report = report
         raise
-
-    # Read back what the logger now holds.
-    back = {k: link.query(k)[k] for k in ("status", "starttime", "endtime")}
-    back["sampling"] = link.query("sampling")
-    back["meminfo"] = memory(link)
-    back["power"] = power(link)
-    with timing("clock check"):
-        back["clock"] = measure_clock_skew(link, reps=3)
-    report["readback"] = back
     if not cfg.enable:
         log(f"    keeping the port quiet for {IDLE_SAVE_S:.0f} s so the logger saves its settings")
         time.sleep(IDLE_SAVE_S)
@@ -245,6 +244,7 @@ def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, en
     with Session(link, serial) as s:
         status = link.query("status")["status"]
         if status in ("logging", "pending"):  # "stopped", "disabled", "finished" need no stop
+            step("stop_sent")
             try:
                 s.write("stop", expect="stopped")
             except LoggerError as err:
@@ -290,6 +290,7 @@ def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, en
         if cfg.erase:
             s.write("permit memclear", expect="memclear")
             t0 = time.monotonic()
+            step("erase_sent")
             link.command_until_prompt("memclear", timeout=300)
             mem = memory(link)
             step("erase", seconds=round(time.monotonic() - t0, 1), meminfo=mem)
@@ -304,6 +305,7 @@ def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, en
 
         if cfg.enable:
             s.unlock()
+            step("enable_sent")
             e_code, e_reply = _warn_ok(link, "enable")
             step("enable", reply=e_reply, warning=e_code)
             if e_code and e_code != "0401":

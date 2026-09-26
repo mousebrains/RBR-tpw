@@ -258,6 +258,6 @@ def test_failed_configure_after_erase_raises_a_do_not_deploy_alarm(capsys):
 
     fake2 = FakeSolo()  # a configured logger replugged in the same session is not configured again
     s.configured.add("100689")
-    assert cli._configure_step(fake2, s, {"channels": {}}, {}, "100689", "saved")["skipped"]
-    assert not any(c.startswith("lock") for c in fake2.log)
+    assert cli._configure_step(fake2, s, {"channels": {}, "status": "logging"}, {}, "100689", "saved")["skipped"]
+    assert not any(c.startswith("lock") for c in fake2.log) and fake2.port not in cli._not_ready
     setup_logging(Console(stream=io.StringIO()))

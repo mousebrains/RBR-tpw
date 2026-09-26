@@ -36,8 +36,10 @@ def _str(s: str, n: int, pad: bytes = b"\xff") -> bytes:
     return b + pad * (n - len(b))
 
 
-def build_meta(data_format: int = 1, dataset="dataset_01", schedule="sch_ctd", group="gr_ctd", fw_pad=True) -> bytes:
-    """Metadata laid out from L3.5 ref 4.3 (TAG, sections 1, 2, 4, 5, 6.1, 6.2.1, 7.1, 7.2.1, 9.1, 9.2.x)."""
+def build_meta(data_format: int = 1, dataset="dataset_01", schedule="sch_ctd", group="gr_ctd", fw_pad=True,
+               order=None) -> bytes:
+    """Metadata laid out from L3.5 ref 4.3 (TAG, sections 1, 2, 4, 5, 6.1, 6.2.1, 7.1, 7.2.1, 9.1, 9.2.x).
+    `order`: the group's channels as 0-based CHANNELS indices (default: CHANNELS order)."""
     secs = []
     pn = b"L3-M13-F15-BEC12-INT12-SCT16-SP11"
     secs.append(_section(0x02000000, struct.pack("<I", 120) + _str("2.1.0", 36, b"\x00") + struct.pack("<I", 210000)
@@ -57,7 +59,8 @@ def build_meta(data_format: int = 1, dataset="dataset_01", schedule="sch_ctd", g
     sched += struct.pack("<B", 0) + b"\xff" * 16 + struct.pack("<IB", 1000, 0)
     secs.append(_section(0x06020100, sched))
     secs.append(_section(0x07010000, struct.pack("<HH", 1, 1) + _str(group, 32) + struct.pack("<H", 0)))
-    pairs = b"".join(bytes([i + 1, 0b011 if st else 0b1100]) for i, (*_, st) in enumerate(CHANNELS))
+    pairs = b"".join(bytes([i + 1, 0b011 if CHANNELS[i][-1] else 0b1100])
+                     for i in (range(len(CHANNELS)) if order is None else order))
     secs.append(_section(0x07020100, struct.pack("<H", 1) + _str(group, 32) + struct.pack("<IIH", 1, 0, len(CHANNELS))
                          + pairs + b"\xff" * (64 - len(pairs))))
     cmap = struct.pack("<H", len(CHANNELS)) + b"".join(
