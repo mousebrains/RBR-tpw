@@ -6,19 +6,64 @@ on:
   pull_request:
     branches: [main]
 
+# One run per branch or PR: a new push to a PR cancels its superseded run. Runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20  # normally ~2 min; a hang fails here instead of at GitHub's 6-hour limit
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.14"]
+        os: [ubuntu-26.04, macos-latest, windows-latest]  # Ubuntu named: ubuntu-latest moves to 26.04 from 2026-10-19
+        python-version: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0  # immutable release; setup-uv publishes no major tags from v8 on
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Virtual COM port pair (com0com 2.2.2.0, signed build; Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "$env:RUNNER_TEMP\com0com.zip"
+          Invoke-WebRequest -UserAgent "Wget" -OutFile $zip `
+            -Uri "https://downloads.sourceforge.net/project/com0com/com0com/2.2.2.0/com0com-2.2.2.0-x64-fre-signed.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($hash -ne "3BC7313E8577774CE78CFF4D1C816FAF96CFA48C485BBCC5527D4569F7D5E373") { throw "com0com checksum: $hash" }
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\com0com"
+          $setup = "$env:RUNNER_TEMP\com0com\com0com-2.2.2.0-x64-fre-signed\setup.exe"
+          # Trust the driver's publisher first, so no "install this device software?" dialog waits on the runner.
+          7z e $setup "-o$env:RUNNER_TEMP\c0cfiles" com0com.cat -r -y | Out-Null
+          $cat = Get-ChildItem "$env:RUNNER_TEMP\c0cfiles" -Filter com0com.cat -Recurse | Select-Object -First 1
+          $signer = (Get-AuthenticodeSignature $cat.FullName).SignerCertificate
+          Write-Host "com0com.cat signed by: $($signer.Subject) (valid to $($signer.NotAfter))"
+          Export-Certificate -Cert $signer -FilePath "$env:RUNNER_TEMP\c0c.cer" | Out-Null
+          Import-Certificate -FilePath "$env:RUNNER_TEMP\c0c.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          Start-Process $setup -ArgumentList "/S", "/D=C:\com0com" -Wait
+          Push-Location C:\com0com
+          .\setupc.exe --silent install PortName=COM20 PortName=COM21
+          .\setupc.exe list
+          Pop-Location
+          # Windows finishes setting up each port's device in the background: wait for both to appear.
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Seconds 2
+            $ports = [System.IO.Ports.SerialPort]::GetPortNames()
+          } until (($ports -contains "COM20" -and $ports -contains "COM21") -or (Get-Date) -gt $deadline)
+          Write-Host "COM ports: $ports"
+          Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -like "*com0com*" } |
+            Format-Table Status, Problem, FriendlyName, InstanceId -AutoSize | Out-String -Width 200 | Write-Host
+          if (-not ($ports -contains "COM20" -and $ports -contains "COM21")) { throw "COM20/COM21 did not appear" }
+          "RBR_TPW_COM_PAIR=COM20,COM21" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - run: uv sync --dev
+      - name: Serial ports as pyserial lists them (Windows)
+        if: runner.os == 'Windows'
+        run: uv run python -m serial.tools.list_ports -v
       - run: uv run ruff check src tests
       - run: uv run pytest -v tests
       - run: uv build

@@ -8,17 +8,16 @@ authors = [
 ]
 license = "GPL-3.0-or-later"
 license-files = ["LICEN[CS]E*"]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 keywords = ["oceanography", "RBR", "RBRsolo", "data logger", "NetCDF", "CF conventions", "Ruskin"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Oceanography",
@@ -43,6 +42,7 @@ rbr-rsk2nc = "rbr_tpw.rsk:main"
 dev = [
     "compliance-checker>=5.4.2",
     "pytest>=8",
+    "pytest-timeout>=2.3",
     "ruff>=0.9",
 ]
 
@@ -61,4 +61,5 @@ line-length = 120
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
+timeout = 120  # a hung test (e.g. waiting on a port that never appears) fails instead of stalling CI
 filterwarnings = ["ignore:The ioos_sos checker is deprecated:DeprecationWarning"]

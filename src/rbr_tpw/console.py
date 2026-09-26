@@ -46,6 +46,22 @@ class UTCFormatter(logging.Formatter):
         return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)) + f".{int(record.msecs):03d}Z"
 
 
+def _enable_windows_ansi(stream) -> bool:
+    """Turn on ANSI escape processing for a Windows console (Windows 10+); False if it cannot, e.g. redirected."""
+    try:
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.windll.kernel32
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        return False
+
+
 @dataclass
 class _Question:
     text: str
@@ -72,6 +88,8 @@ class Console:
         self.input_fn = input_fn
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.color = (hasattr(self.stream, "isatty") and self.stream.isatty()) if color is None else color
+        if self.color and sys.platform == "win32":
+            self.color = _enable_windows_ansi(self.stream)
         self.stop = threading.Event()  # set on Ctrl-C: pending and later questions get "" (= no)
         self._lock = threading.Lock()
         self._held: list[str] | None = None

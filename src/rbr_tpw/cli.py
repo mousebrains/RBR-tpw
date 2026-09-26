@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -96,7 +97,9 @@ def _stage_summary() -> str:
 
 
 def _port_name(port: str) -> str:
-    return Path(port).name.removeprefix("cu.")
+    """A short name for a port that is safe in a file name on any OS: usbmodem101, ttyACM0, COM3, 127.0.0.1_5000."""
+    name = port.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].removeprefix("cu.")
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "port"
 
 
 _ntp_cache: dict[str, tuple[float, dict]] = {}
@@ -116,26 +119,81 @@ def _ntp(server: str) -> dict:
         return dict(result)
 
 
+# Ruskin 2.26.1 (SerialServer) treats a port as an RBR logger when its USB vendor ID is 0x0451 (Texas
+# Instruments) and its product ID is 0xBEF0-0xBEFF. The manufacturer string is kept as a second test; Windows'
+# own USB-serial driver reports "Microsoft" there, so on Windows only the IDs identify a logger.
+RBR_USB_VID = 0x0451
+RBR_USB_PIDS = range(0xBEF0, 0xBF00)
+
+
+def is_rbr(p) -> bool:
+    return ((p.vid == RBR_USB_VID and p.pid in RBR_USB_PIDS)
+            or "RBR" in (p.manufacturer or "") or "RBR" in (p.product or ""))
+
+
 def rbr_ports() -> set[str]:
     """RBR loggers' serial ports. macOS lists each twice (/dev/cu.* and /dev/tty.*): use cu.*, which does not
-    wait for carrier. Linux: /dev/ttyACM* (CDC ACM)."""
+    wait for carrier. Linux: /dev/ttyACM*. Windows: COM<n>."""
     darwin = platform.system() == "Darwin"
-    return {p.device for p in list_ports.comports()
-            if (p.device.startswith("/dev/cu.") or not darwin)
-            and ("RBR" in (p.manufacturer or "") or "RBR" in (p.product or ""))}
+    return {p.device for p in list_ports.comports() if is_rbr(p) and (p.device.startswith("/dev/cu.") or not darwin)}
+
+
+def port_info(port: str) -> dict:
+    """What the OS reports about a port (USB IDs, names), for the session log and the offload record."""
+    for p in list_ports.comports():
+        if p.device == port:
+            return {"vid": f"0x{p.vid:04X}" if p.vid is not None else None,
+                    "pid": f"0x{p.pid:04X}" if p.pid is not None else None,
+                    "serial_number": p.serial_number, "manufacturer": p.manufacturer, "product": p.product,
+                    "description": p.description, "location": p.location, "hwid": p.hwid}
+    return {}
 
 
 def _present(port: str | None) -> set[str]:
-    """Ports to handle now: every RBR port, or just --port (as given, whatever it reports) while it exists."""
-    if port:
-        return {port} if os.path.exists(port) else set()
-    return rbr_ports()
+    """Ports to handle now: every RBR port, or just --port (used as given, whatever it reports) while it exists.
+    --port may also be a pyserial URL such as socket://host:port."""
+    if not port:
+        return rbr_ports()
+    if "://" in port:
+        return {port}
+    if platform.system() == "Windows":  # COM ports are not file-system paths
+        return {port} if port.upper() in _windows_com_ports() else set()
+    return {port} if os.path.exists(port) else set()
+
+
+def _windows_com_ports() -> set[str]:
+    """Every COM port Windows knows, upper-case. pyserial lists only devices of the standard Ports class, so
+    it misses e.g. com0com's virtual ports; the registry's SERIALCOMM list (what .NET GetPortNames reads) has
+    them all."""
+    names = {p.device.upper() for p in list_ports.comports()}
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM") as key:
+            i = 0
+            while True:
+                try:
+                    names.add(str(winreg.EnumValue(key, i)[1]).upper())
+                except OSError:
+                    break
+                i += 1
+    except (ImportError, OSError):
+        pass
+    return names
 
 
 def ruskin_running() -> bool:
-    # exact process-name match; "-f" would also match any shell whose command line mentions Ruskin
-    r = subprocess.run(["pgrep", "-x", "Ruskin"], capture_output=True, check=False)
-    return r.returncode == 0
+    """Is Ruskin running? It polls every RBR port it sees. (On Windows it would also hold the port: opening
+    it then fails with "Access is denied", which the worker reports as in use.)"""
+    try:
+        if platform.system() == "Windows":
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Ruskin.exe", "/NH"], capture_output=True,
+                               text=True, check=False)
+            return "ruskin.exe" in r.stdout.lower()
+        # exact process-name match; "-f" would also match any shell whose command line mentions Ruskin
+        return subprocess.run(["pgrep", "-x", "Ruskin"], capture_output=True, check=False).returncode == 0
+    except FileNotFoundError:  # no pgrep/tasklist: cannot tell
+        return False
 
 
 def utcnow() -> dt.datetime:
@@ -316,14 +374,14 @@ def offload(port: str, s: Settings) -> Path | None:
     tag = started.strftime("%Y%m%dT%H%M%SZ")
     rawdir = s.outdir / "raw"
     rawdir.mkdir(parents=True, exist_ok=True)
-    # The transcript is named by port until the logger says who it is.
-    with Link(port, transcript=rawdir / f"{tag}_{_port_name(port)}.log") as link:
+    # The transcript is named by serial number once the logger reports it (by port if it never does).
+    with Link(port, fallback_transcript=rawdir / f"{tag}_{_port_name(port)}.log") as link:
         _stage(port, "identifying")
         ident = identify(link)
         sn = ident["serial"]
         DEVICE.set(f"SN{sn}@{_port_name(port)}")
         stem = f"{sn}_{tag}"
-        link.rename_transcript(rawdir / f"{stem}.log")
+        link.start_transcript(rawdir / f"{stem}.log")
         log.info("%s SN%s, firmware %s, fwtype %s on %s", ident["model"], sn, ident["version"], ident["fwtype"], port)
         log.debug("serial transcript: %s", link.transcript_path)
         driver = driver_for(ident["fwtype"])
@@ -386,6 +444,7 @@ def offload(port: str, s: Settings) -> Path | None:
         record = {
             "tool": {"name": "rbr-tpw", "version": __version__},
             "port": port,
+            "port_info": port_info(port),
             "offload_started": iso(started),
             "offload_finished": iso(utcnow()),
             "id": ident,
@@ -457,7 +516,7 @@ def _worker(port: str, s: Settings):
     except Stopped:
         log.warning("download stopped (Ctrl-C) after a complete block; reconnect the logger to resume it")
     except serial.SerialException as err:
-        if "exclusively lock" in str(err):
+        if "exclusively lock" in str(err) or "Access is denied" in str(err) or "PermissionError" in str(err):
             log.info("%s is in use by another program (another rbr-offload?); skipped", port)
         else:
             log.error("serial port error: %s", err)
@@ -503,6 +562,7 @@ def run(s: Settings, once: bool, port: str | None):
             elif new:
                 ruskin_warned = False
             for p in new:
+                log.debug("new port %s: %s", p, port_info(p))
                 t = threading.Thread(target=_worker, args=(p, s), name=f"offload-{_port_name(p)}", daemon=True)
                 workers[p] = t
                 t.start()

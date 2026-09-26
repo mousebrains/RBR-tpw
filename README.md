@@ -44,9 +44,15 @@ Ruskin `.rsk` files from any RBR logger can be converted to the same NetCDF form
 pip install rbr-tpw          # or: uv tool install rbr-tpw
 ```
 
-Requires Python ≥ 3.11. The logger appears as a USB serial port (`/dev/cu.usbmodem*` on macOS) and needs no
+Requires Python ≥ 3.13, on macOS, Linux or Windows. The logger appears as a USB serial port (`/dev/cu.usbmodem*` on macOS, `/dev/ttyACM*` on Linux, `COM<n>` on Windows) and needs no
 driver. **Quit Ruskin first**: it polls every RBR port it sees, and `rbr-offload` refuses to start while it is
 running.
+
+Loggers are recognized as Ruskin 2.26.1 recognizes them: USB vendor ID 0x0451, product ID 0xBEF0–0xBEFF. The
+manufacturer string "RBR" is a second test. On Windows the logger uses Windows' own USB serial driver, and
+Windows reports that driver's maker ("Microsoft") in place of the logger's, so the IDs are what identify it.
+The USB details of each port go into the session log and the offload record. Windows support is tested in CI
+with simulated loggers only so far.
 
 ## Offload
 
@@ -109,9 +115,11 @@ Offloading never changes anything on the logger. A logger that was logging keeps
 ### Clock skew
 
 The logger reports whole seconds, so the tool polls its clock until the second ticks. It brackets the tick
-between the send and receive times and repeats this 3 times. The Mac's clock is referenced to UTC with
-`sntp` (`--ntp-server`, default `time.apple.com`). The reported uncertainty is typically about ±9 ms for the
-tick measurement plus the NTP uncertainty.
+between the send and receive times and repeats this 3 times. The computer's clock is referenced to UTC by an
+SNTP query made from Python (`--ntp-server`, default `time.apple.com`; `--no-ntp` to skip). It uses the
+lowest-delay of 4 replies and is reused for 5 minutes. The reported uncertainty is typically about ±9 ms for
+the tick measurement plus the NTP uncertainty: half the round-trip delay plus the server's root delay/2 and
+root dispersion, about ±12 ms over the internet.
 
 If the logger lost power during a deployment, its clock restarts at 2000-01-01. Samples taken after the last
 such reset are re-timed with the skew measured at offload and flagged in `time_flag`. This includes a logger
@@ -201,7 +209,19 @@ uv sync
 uv run pytest          # decoder checked against Ruskin output; NetCDF checked with the IOOS compliance-checker
 ```
 
-Tests that need recorded logger data (`tests/data/`, not in this repository) are skipped when it is absent.
+Tests that need recorded logger data are skipped when it is absent: `tests/data/` and `RBR_TPW_RSK_DIR`, a
+folder of Ruskin `.rsk` files. Neither is in this repository.
+
+The tests run offloads against simulated loggers (`tests/fakelogger.py`): an RBRsolo (fwtype 9 or 0), an RBRduet
+and an RBRconcerto³. Their replies copy what real loggers sent, and their memory uses the real formats with
+real CRCs. They are reached three ways:
+
+- in-process, by replacing `rbr_tpw.link.open_serial`, for protocol, decoding, threading and Ctrl-C tests;
+- over a local TCP socket (`socket://127.0.0.1:<port>`, every OS), through real pyserial;
+- over a pseudo-terminal (macOS and Linux), which pyserial opens like a USB serial port, with port setup
+  and the exclusive lock.
+
+`rbr-offload --port socket://host:port` also works, e.g. to try the tool against a simulated logger.
 
 ## Disclaimer
 

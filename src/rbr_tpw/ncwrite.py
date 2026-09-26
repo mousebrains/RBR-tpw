@@ -116,7 +116,7 @@ def _atomic_dataset(path: Path) -> Iterator[netCDF4.Dataset]:
         tmp.unlink(missing_ok=True)
         raise
     nc.close()
-    with open(tmp, "rb") as f:
+    with open(tmp, "r+b") as f:  # fsync needs a writable handle on Windows
         os.fsync(f.fileno())
     os.replace(tmp, path)
 

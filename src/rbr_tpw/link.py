@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -61,29 +60,38 @@ def _show(data: bytes, limit: int = 120) -> str:
     return f"{len(data)} bytes {data[:limit]!r}{'...' if len(data) > limit else ''}"
 
 
-class Link:
-    """One logger's serial port. `transcript`, if given, gets every exchange as it happens (line-buffered),
-    so it survives a crash or a hung logger."""
+def open_serial(port: str, baudrate: int):
+    """The logger's port: a device name (/dev/cu.usbmodem101, /dev/ttyACM0, COM3) or a pyserial URL such as
+    socket://host:port (tests; a remote logger). exclusive=True takes a flock on POSIX ttys, so a second copy
+    of this tool cannot interleave; Windows COM ports are always exclusive."""
+    return serial.serial_for_url(port, baudrate=baudrate, timeout=0.02, exclusive=True)
 
-    def __init__(self, port: str, baudrate: int = 115200, transcript: Path | None = None):
+
+class Link:
+    """One logger's serial port.
+
+    The transcript file is written as it happens (line-buffered) once start_transcript() names it, normally
+    as soon as the logger reports its serial number; entries before that are buffered, and every entry also
+    goes to the session log. If the transcript was never started, close() writes the buffer to
+    `fallback_transcript` (e.g. named by port), so a failure before `id` still leaves one."""
+
+    def __init__(self, port: str, baudrate: int = 115200, fallback_transcript: Path | None = None):
         self.port = port
-        # exclusive=True takes a flock on the tty, so a second copy of this tool cannot interleave.
-        self.ser = serial.Serial(port, baudrate, timeout=0.02, exclusive=True)
+        self.ser = open_serial(port, baudrate)
         self.transcript: list[TranscriptEntry] = []
-        self.transcript_path = transcript
-        try:
-            self._tfile = open(transcript, "a", encoding="utf-8", buffering=1) if transcript else None
-        except OSError:
-            self.ser.close()
-            raise
+        self.transcript_path: Path | None = None
+        self.fallback_transcript = fallback_transcript
+        self._tfile = None
         self._buf = b""
         self.note(f"opened {port}, {baudrate} baud")
 
-    def rename_transcript(self, path: Path):
-        """Move the transcript file (e.g. from a port name to the serial number); writing continues."""
-        if self.transcript_path is not None and path != self.transcript_path:
-            os.replace(self.transcript_path, path)
-            self.transcript_path = path
+    def start_transcript(self, path: Path):
+        """Open the transcript file, write what has happened so far, and keep appending as it happens."""
+        if self._tfile is not None:
+            return
+        self._tfile = open(path, "a", encoding="utf-8", buffering=1)
+        self.transcript_path = path
+        self._tfile.writelines(e.line() for e in self.transcript)
 
     def close(self):
         try:
@@ -91,6 +99,11 @@ class Link:
             self.ser.close()
         except Exception:
             pass
+        if self._tfile is None and self.fallback_transcript is not None:
+            try:
+                self.start_transcript(self.fallback_transcript)
+            except OSError:
+                pass
         if self._tfile is not None:
             self._tfile.close()
             self._tfile = None
