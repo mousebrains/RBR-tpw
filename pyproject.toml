@@ -42,6 +42,7 @@ rbr-rsk2nc = "rbr_tpw.rsk:main"
 dev = [
     "compliance-checker>=5.4.2",
     "pytest>=8",
+    "pytest-timeout>=2.3",
     "ruff>=0.9",
 ]
 
@@ -60,4 +61,5 @@ line-length = 120
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
+timeout = 120  # a hung test (e.g. waiting on a port that never appears) fails instead of stalling CI
 filterwarnings = ["ignore:The ioos_sos checker is deprecated:DeprecationWarning"]

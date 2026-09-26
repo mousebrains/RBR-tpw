@@ -207,3 +207,24 @@ def test_host_clock_resolution_is_sub_millisecond():
             deltas.append(now - last)
             last = now
     assert min(deltas) < 1_000_000
+
+
+def test_windows_port_check_includes_ports_pyserial_does_not_list(monkeypatch):
+    """com0com's ports are in the registry's SERIALCOMM list but not in pyserial's list (Ports class only)."""
+    import contextlib
+    import sys
+
+    values = [("\\\\Device\\\\com0com10", "COM20"), ("\\\\Device\\\\com0com20", "COM21")]
+
+    def enum_value(key, i):
+        if i >= len(values):
+            raise OSError("no more values")
+        return (values[i][0], values[i][1], 1)
+
+    fake_winreg = SimpleNamespace(HKEY_LOCAL_MACHINE=0, OpenKey=lambda *a: contextlib.nullcontext(),
+                                  EnumValue=enum_value)
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    monkeypatch.setattr(cli.list_ports, "comports", lambda: [_port("COM3", "Microsoft", 0x0451, 0xBEF1)])
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    assert cli._present("COM20") == {"COM20"} and cli._present("com3") == {"com3"}
+    assert cli._present("COM99") == set()

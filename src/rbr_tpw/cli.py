@@ -157,8 +157,29 @@ def _present(port: str | None) -> set[str]:
     if "://" in port:
         return {port}
     if platform.system() == "Windows":  # COM ports are not file-system paths
-        return {port} if port.upper() in {p.device.upper() for p in list_ports.comports()} else set()
+        return {port} if port.upper() in _windows_com_ports() else set()
     return {port} if os.path.exists(port) else set()
+
+
+def _windows_com_ports() -> set[str]:
+    """Every COM port Windows knows, upper-case. pyserial lists only devices of the standard Ports class, so
+    it misses e.g. com0com's virtual ports; the registry's SERIALCOMM list (what .NET GetPortNames reads) has
+    them all."""
+    names = {p.device.upper() for p in list_ports.comports()}
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM") as key:
+            i = 0
+            while True:
+                try:
+                    names.add(str(winreg.EnumValue(key, i)[1]).upper())
+                except OSError:
+                    break
+                i += 1
+    except (ImportError, OSError):
+        pass
+    return names
 
 
 def ruskin_running() -> bool:
