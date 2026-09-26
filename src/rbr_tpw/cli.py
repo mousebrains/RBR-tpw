@@ -72,10 +72,12 @@ class Settings:
     console: Console = field(default_factory=Console)
     session_log: Path | None = None
     stop: threading.Event = field(default_factory=threading.Event)  # Ctrl-C
+    configured: set[str] = field(default_factory=set)  # serial numbers configured this session (never twice)
 
 
 _stages: dict[str, tuple[str, str]] = {}  # port -> (device label, what its worker is doing)
 _stages_lock = threading.Lock()
+_not_ready: dict[str, str] = {}  # port -> why its logger must not be deployed (configure failed or not logging)
 
 
 def _stage(port: str, what: str | None):
@@ -97,9 +99,37 @@ def _port_name(port: str) -> str:
     return Path(port).name.removeprefix("cu.")
 
 
+_ntp_cache: dict[str, tuple[float, dict]] = {}
+_ntp_lock = threading.Lock()
+NTP_REUSE_S = 300.0
+
+
+def _ntp(server: str) -> dict:
+    """ntp_offset(server), reused for NTP_REUSE_S so several loggers (or an offline laptop's timeout) cost one query."""
+    with _ntp_lock:
+        hit = _ntp_cache.get(server)
+        if hit and time.monotonic() - hit[0] < NTP_REUSE_S:
+            return dict(hit[1])
+        result = ntp_offset(server)
+        result["measured_at"] = iso(utcnow())
+        _ntp_cache[server] = (time.monotonic(), result)
+        return dict(result)
+
+
 def rbr_ports() -> set[str]:
+    """RBR loggers' serial ports. macOS lists each twice (/dev/cu.* and /dev/tty.*): use cu.*, which does not
+    wait for carrier. Linux: /dev/ttyACM* (CDC ACM)."""
+    darwin = platform.system() == "Darwin"
     return {p.device for p in list_ports.comports()
-            if p.device.startswith("/dev/cu.") and ("RBR" in (p.manufacturer or "") or "RBR" in (p.product or ""))}
+            if (p.device.startswith("/dev/cu.") or not darwin)
+            and ("RBR" in (p.manufacturer or "") or "RBR" in (p.product or ""))}
+
+
+def _present(port: str | None) -> set[str]:
+    """Ports to handle now: every RBR port, or just --port (as given, whatever it reports) while it exists."""
+    if port:
+        return {port} if os.path.exists(port) else set()
+    return rbr_ports()
 
 
 def ruskin_running() -> bool:
@@ -218,6 +248,10 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     if cfg.enable:
         plan.append("enable logging")
     log.info("configure SN%s: %s", sn, "; ".join(plan))
+    if sn in s.configured:
+        log.warning("SN%s was already configured in this session; not configuring it again (it may have been "
+                    "unplugged and replugged). Restart rbr-offload to configure it again.", sn)
+        return {"skipped": "already configured in this session"}
     if s.stop.is_set():
         log.warning("stopping (Ctrl-C): configuration skipped; logger unchanged")
         return {"skipped": "stopping"}
@@ -234,8 +268,22 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     except (ConfigError, LinkError) as err:
         log.error("CONFIGURE FAILED: %s", err)
         log.debug("configure traceback", exc_info=True)
-        return {"error": str(err)}
+        done = [st["step"] for st in ((getattr(err, "report", None) or {}).get("steps", []))]
+        try:
+            status = link.query("status")["status"]
+        except Exception:  # the link itself may be what failed
+            status = "unknown"
+        state = ("MEMORY WAS ERASED" if "erase" in done else "memory not erased") + (
+            ", logging was stopped" if "stop" in done else "")
+        _not_ready[link.port] = f"configure failed ({state}; status now {status})"
+        alarm([f"SN{sn}: CONFIGURE FAILED: {err}",
+               f"SN{sn}: {state}; status is now '{status}'. DO NOT DEPLOY until it is configured and logging."], s)
+        return {"error": str(err), "steps_done": done, "status_after": status}
+    s.configured.add(sn)
     rb = report["readback"]
+    if cfg.enable and rb["status"] not in ("logging", "pending"):
+        _not_ready[link.port] = f"status is '{rb['status']}' after enable"
+        alarm([f"SN{sn}: STATUS IS '{rb['status']}' AFTER ENABLE, NOT LOGGING OR PENDING. DO NOT DEPLOY."], s)
     clk = rb["clock"]
     off = ntp.get("offset_s") or 0.0
     log.info("now: status %s, %s %s ms, start %s, end %s, memory used %s B, battery %.3f V / %.0f J, "
@@ -285,7 +333,7 @@ def offload(port: str, s: Settings) -> Path | None:
         log.debug("driver: %s (%s)", type(driver).__name__, driver.family)
 
         _stage(port, "NTP query")
-        ntp = ntp_offset(s.ntp_server) if s.ntp_server else {"error": "disabled"}
+        ntp = _ntp(s.ntp_server) if s.ntp_server else {"error": "disabled"}
         log.debug("host NTP: %s", ntp)
         _stage(port, "measuring clock skew")
         with timing_critical("clock skew"):
@@ -421,7 +469,11 @@ def _worker(port: str, s: Settings):
                  s.session_log or "the serial transcript")
     finally:
         _stage(port, None)
-        log.info("done with %s: disconnect the logger", port)
+        reason = _not_ready.pop(port, None)
+        if reason:
+            log.error("done with %s: disconnect it, but it is NOT READY TO DEPLOY: %s", port, reason)
+        else:
+            log.info("done with %s: disconnect the logger", port)
 
 
 def run(s: Settings, once: bool, port: str | None):
@@ -432,7 +484,7 @@ def run(s: Settings, once: bool, port: str | None):
     last_status = time.monotonic()
     try:
         while True:
-            present = ({port} & rbr_ports()) if port else rbr_ports()
+            present = _present(port)
             for p, t in list(workers.items()):
                 if not t.is_alive():
                     del workers[p]
@@ -573,7 +625,12 @@ def main(argv=None):
                 sys.exit(f"{rec_path}: fwtype {record['id']['fwtype']} is not supported")
             data = {}
             for name, info in (record.get("datasets") or {"dataset1": record["raw"]}).items():
-                blob = (rec_path.parent.parent / info["file"]).read_bytes()
+                # recorded as raw/<file> relative to OUTDIR; also accept the file beside a moved record
+                where = [rec_path.parent.parent / info["file"], rec_path.parent / Path(info["file"]).name]
+                found = next((w for w in where if w.is_file()), None)
+                if found is None:
+                    sys.exit(f"{rec_path}: {info['file']} not found (looked in {', '.join(map(str, where))})")
+                blob = found.read_bytes()
                 if sha256(blob) != info["sha256"]:
                     sys.exit(f"{rec_path}: {info['file']} checksum does not match the record")
                 data[name] = blob

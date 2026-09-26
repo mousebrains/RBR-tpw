@@ -206,6 +206,10 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
     warnings.extend(notes)
     if d.trailing_bytes:
         warnings.append(f"{d.trailing_bytes} trailing bytes did not form a complete sample set and were ignored")
+    if d.bad_event_words:
+        warnings.append(f"{d.bad_event_words} event records failed their CRC" + (
+            " and were kept as readings (on this logger a reading can look like an event)"
+            if evaluated is not None else " and were dropped; sample times after them may be off"))
 
     with _atomic_dataset(path) as nc:
         chunk = _time_variables(nc, t_utc[keep], d.time_ms[keep], tflags[keep],

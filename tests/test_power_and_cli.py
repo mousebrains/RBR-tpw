@@ -48,15 +48,20 @@ def test_thresholds_yaml_and_checks():
 class FakeSolo:
     """Just enough of an fwtype-9 RBRsolo to exercise configure() without hardware."""
 
-    def __init__(self, status="finished"):
+    def __init__(self, status="finished", clock_bias_s=0.0, enable_error=None, clock=time):
         self.serial = 100689
+        self.port = "/dev/cu.fake"
         self.state = {"status": status, "starttime": "20000101000000", "endtime": "20991231235959",
                       "sampling": "mode = continuous, period = 2000", "remaining": "1ACDF88", "used": 772}
         self.locked, self.challenge, self.log = True, None, []
         self.transcript = []
+        self.offset = 0.0  # logger clock minus host clock, s
+        self.clock_bias_s = clock_bias_s  # a clock write lands this far ahead of the value written
+        self.enable_error = enable_error
+        self.clock = clock  # the host clock the logger is compared with (a virtual one in timing tests)
 
     def _now(self):
-        return dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
+        return dt.datetime.fromtimestamp(self.clock.time() + self.offset, dt.UTC).strftime("%Y%m%d%H%M%S")
 
     def note(self, text):
         pass
@@ -70,6 +75,10 @@ class FakeSolo:
         if cmd == "now":
             self.challenge = self._now()
             return f"now = {self.challenge}"
+        if cmd.startswith("now = "):
+            value = dt.datetime.strptime(cmd[6:], "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC).timestamp()
+            self.offset = value - self.clock.time() + self.clock_bias_s
+            return cmd
         if cmd.startswith("lock OFF = "):
             e2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
             secs = int((dt.datetime.strptime(self.challenge, "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC) - e2000)
@@ -111,6 +120,8 @@ class FakeSolo:
             if self.state["used"] > 0:
                 raise LoggerError(cmd, "0402", f", verify = {self.state['status']}")
             raise LoggerError(cmd, "0401", ", verify = logging")
+        if cmd == "enable" and self.enable_error:
+            raise LoggerError(cmd, self.enable_error, "simulated enable failure")
         if cmd == "enable":
             self.state["used"] = 512
             self.state["status"] = "logging" if self.state["starttime"] <= self._now() else "pending"
@@ -177,3 +188,76 @@ def test_used_battery_option_errors(tmp_path, argv):
     from rbr_tpw.cli import main
     with pytest.raises(SystemExit):
         main([str(tmp_path), *argv])
+
+
+class VirtualClock:
+    """time.time/sleep/monotonic on a virtual clock, so clock-setting tests do not depend on host scheduling."""
+
+    def __init__(self):
+        self.t = 1_790_000_000.25
+
+    def time(self):
+        self.t += 1e-6  # busy-wait loops still advance
+        return self.t
+
+    def monotonic(self):
+        return self.time()
+
+    def sleep(self, dt):
+        self.t += max(dt, 0)
+
+
+def test_set_clock_recovers_when_the_first_write_lands_ahead(monkeypatch):
+    """A write that lands 25 ms ahead needs a negative lead next time; the loop used to give up instead."""
+    import rbr_tpw.configure as cf
+    vc = VirtualClock()
+    fake = FakeSolo(clock_bias_s=0.025, clock=vc)
+    fake.locked = False
+    monkeypatch.setattr(cf, "time", vc)
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+        "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
+    out = cf.set_clock(fake, 0.0, 0.020, log=lambda *a: None)
+    assert out["ok"] and abs(out["skew_vs_utc_s"]) < 0.001
+    assert out["history"][0]["skew_vs_utc_s"] == pytest.approx(0.028, abs=1e-4)  # 3 ms lead + 25 ms bias
+    assert out["history"][-1]["lead_s"] == pytest.approx(-0.025, abs=1e-4)  # needs a negative lead
+
+
+def test_no_erase_with_data_is_refused_before_any_write():
+    from rbr_tpw.configure import ConfigError
+    fake = FakeSolo(status="logging")
+    with pytest.raises(ConfigError, match="needs an erase"):
+        configure(fake, 100689, DeployConfig(set_clock=False, erase=False), 0.0, log=lambda *a: None)
+    assert not any(c.startswith(("lock", "stop", "starttime =", "sampling mode")) for c in fake.log)
+    assert fake.state["status"] == "logging"
+
+
+def test_no_enable_tolerates_data_in_memory(monkeypatch):
+    import rbr_tpw.configure as cf
+    monkeypatch.setattr(cf, "IDLE_SAVE_S", 0.0)
+    fake = FakeSolo()
+    report = configure(fake, 100689, DeployConfig(set_clock=False, erase=False, enable=False, period_ms=1000), 0.0,
+                       log=lambda *a: None)
+    assert "enable" not in fake.log and "memclear" not in fake.log
+    assert next(st for st in report["steps"] if st["step"] == "verify")["warning"] == "0402"
+
+
+def test_failed_configure_after_erase_raises_a_do_not_deploy_alarm(capsys):
+    import io
+
+    from rbr_tpw import cli
+    from rbr_tpw.console import Console, setup_logging
+    out = io.StringIO()
+    setup_logging(Console(stream=out, interactive=False, color=False))
+    fake = FakeSolo(status="logging", enable_error="0405")
+    s = Settings(outdir=Path("."), deploy=DeployConfig(set_clock=False), assume_yes=True)
+    report = cli._configure_step(fake, s, {"channels": {}}, {}, "100689", "saved")
+    text = out.getvalue()
+    assert "erase" in report["steps_done"] and report["status_after"] == "stopped"
+    assert "MEMORY WAS ERASED" in text and "DO NOT DEPLOY" in text
+    assert "MEMORY WAS ERASED" in cli._not_ready.pop(fake.port) and "100689" not in s.configured
+
+    fake2 = FakeSolo()  # a configured logger replugged in the same session is not configured again
+    s.configured.add("100689")
+    assert cli._configure_step(fake2, s, {"channels": {}}, {}, "100689", "saved")["skipped"]
+    assert not any(c.startswith("lock") for c in fake2.log)
+    setup_logging(Console(stream=io.StringIO()))

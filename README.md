@@ -165,6 +165,12 @@ before changing each logger (`--yes` skips the question). It then:
 6. enables logging,
 7. reads everything back.
 
+If any step fails, or the logger isn't logging (or pending) afterwards, you get a loud alarm saying whether
+memory was erased. The final line then reads "NOT READY TO DEPLOY" instead of just "disconnect".
+`--no-erase` is refused when memory holds data and logging would be enabled, because the logger itself
+refuses that; use it with `--no-enable` to change settings only. A logger is configured at most once per run,
+so unplugging and replugging it won't erase it again.
+
 Settings can live in a YAML file (`--config settings.yaml`, or `--configure settings.yaml`); command-line
 options override it. See [deploy.example.yaml](https://github.com/mousebrains/RBR-tpw/blob/main/deploy.example.yaml):
 

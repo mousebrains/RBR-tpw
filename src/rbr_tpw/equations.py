@@ -268,7 +268,7 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
     is_reading = np.ones(nwords, bool)
     events: list[Event] = []
     anchors: list[tuple[int, int, int]] = []  # (sample index, unix ms, seconds since 2000)
-    i_prev = readings_before = 0
+    i_prev = readings_before = bad_markers = 0
     for i in np.flatnonzero((top == 0xF3) | (top == 0xF5) | (top == 0xF7)):
         i = int(i)
         if i < i_prev:
@@ -283,7 +283,8 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
             continue
         rec = body[b : b + size]
         if struct.unpack_from(">H", rec, 0)[0] != crc16_ccitt(rec[2:]):
-            continue  # not an event; left as a reading
+            bad_markers += 1  # signed readings can start 0xF3/0xF5/0xF7, so this may be a reading: keep it
+            continue
         readings_before += int(is_reading[i_prev:i].sum())
         is_reading[i : i + size // 4] = False
         etype, seconds = rec[2], struct.unpack_from("<I", rec, 4)[0]
@@ -317,4 +318,5 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
         if seconds < hdr.logger_time:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK
     return Decoded(header=hdr, nchan=nstored, raw=raw, flags=flags, time_ms=time_ms, time_flags=time_flags,
-                   segment=segment, events=events, trailing_bytes=trailing)
+                   segment=segment, events=events, trailing_bytes=trailing,
+                   bad_event_words=bad_markers)

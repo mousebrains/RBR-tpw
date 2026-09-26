@@ -9,11 +9,13 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
+import re
 import statistics
 import time
 from pathlib import Path
 
-from .link import Link, LoggerError
+from .hostclock import transfer
+from .link import Link, LinkError, LoggerError
 from .rawbin import hexfloat
 
 SUPPORTED_FWTYPES = {9}
@@ -30,11 +32,17 @@ def parse_logger_datetime(s: str) -> dt.datetime:
     return dt.datetime.strptime(s.strip(), "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC)
 
 
+SERIAL_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
 def identify(link: Link) -> dict:
     link.wake()
     r = link.query("id")
+    serial = r.get("serial", "")
+    if not SERIAL_RE.fullmatch(serial):  # it names files: never let a garbled or odd reply reach a path
+        raise LinkError(f"implausible serial number {serial!r} in the `id` reply")
     return {"model": r.get("model", ""), "version": r.get("version", ""),
-            "serial": r.get("serial", ""), "fwtype": int(r.get("fwtype", "-1"))}
+            "serial": serial, "fwtype": int(r.get("fwtype", "-1"))}
 
 
 def _coefficient(v: str) -> float | str:
@@ -180,7 +188,8 @@ def download(link: Link, total: int, part_path: Path, progress=None, dataset: in
         t0, b0 = time.monotonic(), offset
         while offset < total:
             n = min(CHUNK, total - offset)
-            block = link.read_data(dataset, n, offset, l3=l3)
+            with transfer():  # pauses while another logger measures or sets its clock
+                block = link.read_data(dataset, n, offset, l3=l3)
             if len(block) != n:
                 raise RuntimeError(f"short block at {offset}: {len(block)} of {n} bytes")
             f.write(block)

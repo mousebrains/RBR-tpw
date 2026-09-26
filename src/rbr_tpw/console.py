@@ -20,6 +20,8 @@ from __future__ import annotations
 import contextvars
 import logging
 import queue
+import re
+import signal
 import sys
 import threading
 import time
@@ -118,15 +120,18 @@ class Console:
         except queue.Empty:
             return False
         if isinstance(job, _Call):
+            # A Ctrl-C during the call (a NetCDF write) is held until the file is complete, then acted on.
+            pressed: list[bool] = []
+            old = signal.signal(signal.SIGINT, lambda *_: pressed.append(True))
             try:
                 job.result = job.fn(*job.args, **job.kwargs)
-            except KeyboardInterrupt:
-                job.error = RuntimeError("interrupted by Ctrl-C")
-                raise
             except Exception as err:
                 job.error = err
             finally:
+                signal.signal(signal.SIGINT, old)
                 job.done.set()
+            if pressed:
+                raise KeyboardInterrupt
             return True
         if job.cancelled:
             return False
@@ -148,6 +153,14 @@ class Console:
                 self.write(line)
 
 
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def printable(text: str) -> str:
+    """Escape control characters (e.g. ANSI escapes in a logger's reply) before they reach the terminal."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 class ConsoleHandler(logging.Handler):
     """INFO and above to the Console, tagged with the device; records with extra={"banner": True} as alarms."""
 
@@ -159,8 +172,8 @@ class ConsoleHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         try:
-            msg = record.getMessage()
-            dev = getattr(record, "device", "-")
+            msg = printable(record.getMessage())
+            dev = printable(getattr(record, "device", "-"))
             prefix = f"[{dev}] " if dev != "-" else ""
             if getattr(record, "banner", False):
                 text = f"!! {prefix}{msg} !!"

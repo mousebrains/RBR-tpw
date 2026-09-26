@@ -20,7 +20,7 @@ from pathlib import Path
 import yaml
 
 from .crc import crc16_ccitt
-from .link import Link, LoggerError
+from .link import Link, LinkError, LoggerError
 from .solo import NOMINAL_BATTERY_J, measure_clock_skew, memory, parse_logger_datetime, power
 
 FAR_FUTURE = "20991231235959"  # Ruskin's "no end time"
@@ -28,7 +28,12 @@ PAST = "20000101000000"  # start time in the past = start as soon as enabled
 
 
 class ConfigError(Exception):
-    pass
+    """A configure step failed. `report` holds the steps done so far (e.g. whether memory was erased)."""
+
+    report: dict | None = None
+
+
+IDLE_SAVE_S = 12.0  # settings are saved after 10 s idle (L3.5 ref 1.1.2; assumed, unverified, for L2 loggers)
 
 
 @dataclass
@@ -185,7 +190,9 @@ def set_clock(link: Link, ntp_offset_s: float, tolerance_s: float, attempts: int
         if abs(s_utc) <= tolerance_s:
             return {"ok": True, "skew_vs_utc_s": s_utc, "uncertainty_s": skew["uncertainty_s"], "history": history}
         lat -= s_utc  # logger ahead (s > 0) -> we sent too early -> send later
-        if not 0 <= lat < 0.5:
+        # lat may go negative (send just after the target second): the target is ~2 s ahead, so any lead in
+        # (-0.5, 0.9) s is still in the future. Stopping at lat < 0 made any first skew above +3 ms fatal.
+        if not -0.5 < lat < 0.9:
             break
     return {"ok": False, "skew_vs_utc_s": history[-1]["skew_vs_utc_s"] if history else math.nan,
             "history": history}
@@ -203,7 +210,35 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
     cur = link.query("sampling")
     start, end, period = validate(cfg, int(cur.get("period", "0") or 0))
     battery = cfg.battery_fraction()
+    if cfg.enable and not cfg.erase:  # checked before anything is written: the logger would refuse at `verify`
+        used = memory(link).get("used", 0)
+        if used > 0:
+            raise ConfigError(f"logger memory holds {used} bytes: enabling needs an erase (the logger refuses with "
+                              "E0402). Allow the erase, or use --no-enable to change settings only.")
+    try:
+        _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery)
+    except (ConfigError, LinkError) as err:
+        if isinstance(err, ConfigError):
+            err.report = report
+        else:
+            report["link_error"] = str(err)
+        raise
 
+    # Read back what the logger now holds.
+    back = {k: link.query(k)[k] for k in ("status", "starttime", "endtime")}
+    back["sampling"] = link.query("sampling")
+    back["meminfo"] = memory(link)
+    back["power"] = power(link)
+    with timing("clock check"):
+        back["clock"] = measure_clock_skew(link, reps=3)
+    report["readback"] = back
+    if not cfg.enable:
+        log(f"    keeping the port quiet for {IDLE_SAVE_S:.0f} s so the logger saves its settings")
+        time.sleep(IDLE_SAVE_S)
+    return report
+
+
+def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery):
     with Session(link, serial) as s:
         status = link.query("status")["status"]
         if status in ("logging", "pending"):  # "stopped", "disabled", "finished" need no stop
@@ -255,7 +290,7 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
 
         v_code, v_reply = _warn_ok(link, "verify")
         step("verify", reply=v_reply, warning=v_code)
-        if v_code and v_code != "0401":
+        if v_code and v_code != "0401" and not (v_code == "0402" and not cfg.enable):  # E0402 matters only to enable
             raise ConfigError(f"verify failed: E{v_code} {v_reply}")
 
         if cfg.enable:
@@ -265,16 +300,6 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float, l
             if e_code and e_code != "0401":
                 raise ConfigError(f"enable failed: E{e_code} {e_reply}")
             log(f"    enabled: {e_reply.strip(' ,')}" + (" (W: memory fills before end time)" if e_code else ""))
-
-    # Read back what the logger now holds.
-    back = {k: link.query(k)[k] for k in ("status", "starttime", "endtime")}
-    back["sampling"] = link.query("sampling")
-    back["meminfo"] = memory(link)
-    back["power"] = power(link)
-    with timing("clock check"):
-        back["clock"] = measure_clock_skew(link, reps=3)
-    report["readback"] = back
-    return report
 
 
 def _warn_ok(link: Link, cmd: str) -> tuple[str | None, str]:
