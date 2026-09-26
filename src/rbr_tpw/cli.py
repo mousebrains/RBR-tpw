@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 POLL_S = 0.5  # port scan interval
 SETTLE_S = 1.0  # let USB enumeration settle before opening a new port
 STATUS_EVERY_S = 30.0  # one-line summary while more than one logger is in progress
+ONCE_GRACE_S = 3.0  # --once: after the last logger finishes, wait this long for another still enumerating
 
 
 class Stopped(Exception):
@@ -74,6 +75,7 @@ class Settings:
     session_log: Path | None = None
     stop: threading.Event = field(default_factory=threading.Event)  # Ctrl-C
     configured: set[str] = field(default_factory=set)  # serial numbers configured this session (never twice)
+    not_ready: list[str] = field(default_factory=list)  # loggers that ended NOT READY TO DEPLOY this session
 
 
 _stages: dict[str, tuple[str, str]] = {}  # port -> (device label, what its worker is doing)
@@ -530,6 +532,7 @@ def _worker(port: str, s: Settings):
         _stage(port, None)
         reason = _not_ready.pop(port, None)
         if reason:
+            s.not_ready.append(f"{DEVICE.get()}: {reason}")
             log.error("done with %s: disconnect it, but it is NOT READY TO DEPLOY: %s", port, reason)
         else:
             log.info("done with %s: disconnect the logger", port)
@@ -540,7 +543,7 @@ def run(s: Settings, once: bool, port: str | None):
     workers: dict[str, threading.Thread] = {}
     finished: set[str] = set()  # ports whose worker ended, until they are unplugged
     announced = ruskin_warned = started_any = False
-    last_status = time.monotonic()
+    last_status = last_new = time.monotonic()
     try:
         while True:
             present = _present(port)
@@ -551,7 +554,7 @@ def run(s: Settings, once: bool, port: str | None):
             for p in sorted(finished - present):
                 finished.discard(p)
                 log.info("%s disconnected", p)
-            if once and started_any and not workers:
+            if once and started_any and not workers and time.monotonic() - last_new >= ONCE_GRACE_S:
                 return
             new = sorted(present - set(workers) - finished)
             if new and ruskin_running():
@@ -567,6 +570,7 @@ def run(s: Settings, once: bool, port: str | None):
                 workers[p] = t
                 t.start()
                 started_any, announced = True, False
+                last_new = time.monotonic()
                 log.debug("started %s for %s", t.name, p)
             if not workers and not announced:
                 log.info("Waiting for an RBR logger on USB (Ctrl-C to quit)...")
@@ -684,9 +688,16 @@ def main(argv=None):
             if driver is None:
                 sys.exit(f"{rec_path}: fwtype {record['id']['fwtype']} is not supported")
             data = {}
-            for name, info in (record.get("datasets") or {"dataset1": record["raw"]}).items():
+            datasets = record.get("datasets") or ({"dataset1": record["raw"]} if record.get("raw") else {})
+            if not datasets:
+                log.warning("%s: the logger's memory was empty at this offload; nothing to rebuild", rec_path)
+                continue
+            for name, info in datasets.items():
+                rel = Path(info["file"])
+                if rel.is_absolute() or ".." in rel.parts:  # only files beside the record or in its raw/ folder
+                    sys.exit(f"{rec_path}: refusing raw file path {info['file']!r}")
                 # recorded as raw/<file> relative to OUTDIR; also accept the file beside a moved record
-                where = [rec_path.parent.parent / info["file"], rec_path.parent / Path(info["file"]).name]
+                where = [rec_path.parent.parent / rel, rec_path.parent / rel.name]
                 found = next((w for w in where if w.is_file()), None)
                 if found is None:
                     sys.exit(f"{rec_path}: {info['file']} not found (looked in {', '.join(map(str, where))})")
@@ -718,6 +729,9 @@ def main(argv=None):
     except Exception:
         log.critical("unexpected error; stopping", exc_info=True)
         raise
+    if s.not_ready:  # scripts (e.g. with --yes) can tell that a logger must not be deployed
+        log.error("%d logger(s) NOT READY TO DEPLOY: %s", len(s.not_ready), "; ".join(s.not_ready))
+        sys.exit(2)
 
 
 if __name__ == "__main__":

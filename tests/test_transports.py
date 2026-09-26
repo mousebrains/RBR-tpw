@@ -40,6 +40,7 @@ def served(request, tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "ruskin_running", lambda: False)
     monkeypatch.setattr(cli, "SETTLE_S", 0.0)
+    monkeypatch.setattr(cli, "ONCE_GRACE_S", 0.0)
     monkeypatch.setattr(cli, "POLL_S", 0.05)
     out = io.StringIO()
     console = Console(stream=out, input_fn=lambda q: "", interactive=False, color=False)

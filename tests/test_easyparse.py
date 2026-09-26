@@ -60,7 +60,7 @@ def test_single_channel_and_wrong_nchan():
     data = make_records(t, np.full((20, 1), 12.25))
     ep = decode_easyparse(data, 1)
     assert ep.values.shape == (20, 1) and np.all(ep.values == 12.25)
-    with pytest.raises(ValueError, match="timestamps decrease"):
+    with pytest.raises(ValueError, match="is nchan=5 right"):  # misaligned records: implausible timestamps
         decode_easyparse(make_records(t, np.full((20, 6), 12.25)), 5)
 
 
@@ -70,8 +70,8 @@ def test_synthetic_events_and_bad_crc():
     bad[5] ^= 1
     events, nbad = decode_events(good + bytes(bad))
     assert events == [(1_789_245_160_000, 0x22, 16544), (1_789_245_170_000, 0x23, 471680)] and nbad == 1
-    ep = decode_easyparse(make_records([1], [[1.0]]), 1, data0=good)
-    assert len(ep.events) == 2 and ep.bad_events == 0
+    ep = decode_easyparse(make_records([1_789_245_150_000], [[1.0]]), 1, data0=good + b"\x00" * 5)
+    assert len(ep.events) == 2 and ep.bad_events == 0 and ep.event_trailing_bytes == 5
 
 
 def test_real_events_match_ruskin():
@@ -126,3 +126,13 @@ def test_dataset1_matches_ruskin_values():
         assert ep.trailing_bytes == 0 and len(ep.time_ms) == len(rows), f.name
         assert np.array_equal(ep.time_ms, rows[:, 0].astype(np.int64)), f.name
         assert np.array_equal(ep.values, rows[:, 1:], equal_nan=True), f.name
+
+
+def test_clock_reset_during_a_deployment_is_accepted():
+    """A power loss restarts the clock at 2000-01-01: the one backward step that is allowed."""
+    before = 1_789_245_190_000 + 1000 * np.arange(10)
+    after = 946_684_800_000 + 5_000 + 1000 * np.arange(10)  # the reset clock
+    ep = decode_easyparse(make_records(np.concatenate([before, after]), np.full((20, 1), 1.0)), 1)
+    assert ep.clock_resets == 1 and len(ep.time_ms) == 20
+    with pytest.raises(ValueError, match="not a reset clock"):  # a backward step within 2026 is not a reset
+        decode_easyparse(make_records(np.concatenate([before, before - 60_000]), np.full((20, 1), 1.0)), 1)

@@ -195,10 +195,11 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
     if is_sectioned_header(image):  # RBRduet / RBRconcerto (L3 ref 5.3.1, header versions 1.xxx)
         d = decode_l2(image, len(channels))
         evaluated = _evaluate_l2(d, snap)
-        # also a reset clock: a logger enabled after its clock had restarted at 2000-01-01 (rawbin rule misses it)
-        d.time_flags[d.time_ms < RESET_CLOCK_BEFORE_MS] |= TFLAG_RESET_CLOCK
     else:
         d = decode(image, len(channels))
+    # Also a reset clock: a logger enabled after its clock had restarted at 2000-01-01. The decoders' own
+    # rule (an anchor earlier than the enable time) misses it, since the enable time is then in 2000 too.
+    d.time_flags[d.time_ms < RESET_CLOCK_BEFORE_MS] |= TFLAG_RESET_CLOCK
     offload_ms = _parse_iso_ms(record.get("offload_finished") or record["offload_started"])
     t_utc, tflags, keep, notes = resolve_times(d, skew_vs_utc(record), offload_ms)
     if d.rtc_reset:
@@ -267,6 +268,8 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
                 hidden = int(ch.get("status", 0) or 0) & 0x01  # e.g. a pressure sensor's compensation thermistor
                 if std and not hidden:
                     atts["standard_name"] = std
+                if std == "depth":
+                    atts["positive"] = "down"
                 if hidden:
                     atts["rbr_channel_status"] = np.int32(ch["status"])
                     atts["comment"] += (" The logger marks this channel hidden (channelStatus bit 0x01; Ruskin does "

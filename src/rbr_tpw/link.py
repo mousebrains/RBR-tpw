@@ -28,7 +28,7 @@ from .crc import check_appended
 serial_log = logging.getLogger("rbr_tpw.serial")  # every exchange, at DEBUG, into the session log
 
 PROMPT_RE = re.compile(rb"Ready: ?")
-LINE_RE = re.compile(rb"([^\r\n]*)\r\n")
+LINE_RE = re.compile(rb"([^\r\n]*)\r?\n")  # RBR loggers send CRLF; a bare LF is accepted too
 ERROR_RE = re.compile(r"^E(\d{4})\b\s*(.*)$")
 DATA_HDR_RE = re.compile(rb"data (\d+) (\d+) (\d+)\r\n")
 L3_DATA_HDR_RE = re.compile(rb"readdata dataset = (\d+), size = (\d+), offset = (\d+)\r\n")
@@ -150,7 +150,16 @@ class Link:
         self._drain(0.1)
 
     def command(self, cmd: str, timeout: float = 3.0) -> str:
-        """Send a command and return its one-line reply (prompts stripped)."""
+        """Send a command and return its one-line reply (prompts stripped).
+
+        Input still waiting from before (e.g. a reply that arrived after a timeout) is discarded first
+        (recorded as DROP), so it cannot be taken for this command's reply."""
+        if self.ser.in_waiting:
+            self._buf += self.ser.read(self.ser.in_waiting)
+        stale = PROMPT_RE.sub(b"", self._buf)
+        if stale.strip():
+            self._record("DROP", _show(stale))
+        self._buf = b""
         self._send(cmd)
         deadline = time.monotonic() + timeout
         while True:
@@ -163,6 +172,8 @@ class Link:
                 line = m.group(1).decode("ascii", errors="replace").strip()
                 self._buf = self._buf[m.end():]
                 self._record("RX", line)
+                if line == cmd:  # an echo of the command (RBR loggers do not echo, but a terminal server may)
+                    continue
                 e = ERROR_RE.match(line)
                 if e:
                     raise LoggerError(cmd, e.group(1), e.group(2))

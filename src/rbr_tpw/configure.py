@@ -20,7 +20,7 @@ from pathlib import Path
 import yaml
 
 from .crc import crc16_ccitt
-from .link import Link, LinkError, LoggerError
+from .link import Link, LinkError, LoggerError, parse_pairs
 from .solo import NOMINAL_BATTERY_J, measure_clock_skew, memory, parse_logger_datetime, power
 
 FAR_FUTURE = "20991231235959"  # Ruskin's "no end time"
@@ -261,7 +261,13 @@ def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, en
         if battery is not None:
             mj = round(NOMINAL_BATTERY_J * battery * 1000)  # new cell: 33,696,000 mJ -> 2022900, as Ruskin stores it
             hex_mj = f"{mj:X}"
-            s.write(f"powerstatus remaining = {hex_mj}", expect=f"remaining = {hex_mj}")
+            echo = s.write(f"powerstatus remaining = {hex_mj}", expect="remaining")
+            try:  # compare as a number: a zero-padded echo (02022900) is the same value
+                echoed = int(parse_pairs(echo).get("remaining", ""), 16)
+            except ValueError:
+                echoed = None
+            if echoed != mj:
+                raise ConfigError(f"battery counter write: echo {echo!r} does not match {hex_mj}")
             got = power(link)
             if round(got["energy_remaining_J"] * 1000) != mj:
                 raise ConfigError(f"battery counter reads {got['remaining_raw']} after writing {hex_mj}")

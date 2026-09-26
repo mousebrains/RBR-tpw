@@ -120,12 +120,16 @@ def evaluate(raw: np.ndarray, channels: list[dict], defaults: dict | None = None
         if idx in active:
             raise _Problem(f"circular channel reference at channel {idx}")
         active.add(idx)
-        ch = by_index[idx]
-        words = raw[:, column[idx]]
-        cache[idx] = _equation(ch, ratio(words), lambda name, key: reference(ch, name, key))
-        cache[idx][(words >> 24) == ERROR_MARKER] = math.nan
-        active.discard(idx)
-        return cache[idx]
+        try:
+            ch = by_index[idx]
+            words = raw[:, column[idx]]
+            v = _equation(ch, ratio(words), lambda name, key: reference(ch, name, key))
+            v[(words >> 24) == ERROR_MARKER] = math.nan
+            v[~np.isfinite(v)] = math.nan  # e.g. a zero denominator: no infinities reach the NetCDF file
+            cache[idx] = v
+            return v
+        finally:
+            active.discard(idx)  # also when this channel fails, so later channels are not blamed for a cycle
 
     values = np.full(raw.shape, math.nan)
     problems: dict[int, str] = {}
