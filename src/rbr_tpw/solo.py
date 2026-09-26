@@ -37,11 +37,14 @@ def identify(link: Link) -> dict:
             "serial": r.get("serial", ""), "fwtype": int(r.get("fwtype", "-1"))}
 
 
-def _coefficient(v: str) -> float:
+def _coefficient(v: str) -> float | str:
     v = v.strip()
     if len(v) == 8 and all(ch in "0123456789ABCDEFabcdef" for ch in v):
         return hexfloat(v)  # fwtype 9 reports IEEE-754 singles as hex
-    return float(v)
+    try:
+        return float(v)  # duet/concerto/Gen3: decimal, e.g. 3.4740720e-003
+    except ValueError:
+        return v  # e.g. `n1 = value` on derived channels
 
 
 def snapshot(link: Link) -> dict:
@@ -54,6 +57,7 @@ def snapshot(link: Link) -> dict:
         ch = link.query(f"channel {i}")
         cal = link.query(f"calibration {i}")
         ch["index"] = i
+        ch["status"] = int(ch.get("status", "0") or 0)  # bit 0x04: not stored in memory (L3 ref; pyRSKtools)
         ch["calibration_datetime"] = cal.pop("datetime", "")
         cal.pop("type", None)
         ch["coefficients"] = {k: _coefficient(v) for k, v in cal.items()}
@@ -83,10 +87,8 @@ def power(link: Link) -> dict:
     """
     p = link.query("powerstatus")
     out = {"source": p.get("source", ""), "int_raw": p.get("int", ""), "remaining_raw": p.get("remaining", "")}
-    try:
-        out["battery_voltage_V"] = int(p["int"]) / 1000.0
-    except (KeyError, ValueError):
-        out["battery_voltage_V"] = float("nan")
+    out.update({f"{k}_raw": v for k, v in p.items() if k not in ("source", "int", "remaining")})
+    out["battery_voltage_V"] = parse_voltage(p.get("int", ""))
     try:
         out["energy_remaining_J"] = int(p["remaining"], 16) / 1000.0
     except (KeyError, ValueError):
@@ -96,21 +98,35 @@ def power(link: Link) -> dict:
     return out
 
 
-def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0) -> dict:
+def parse_voltage(v: str) -> float:
+    """`int` from powerstatus/power: millivolts on RBRsolos ("3634"), volts elsewhere ("3.61", "11.49")."""
+    v = (v or "").strip()
+    try:
+        return float(v) if "." in v else int(v) / 1000.0
+    except ValueError:
+        return float("nan")
+
+
+def _now(link: Link) -> str:
+    return link.query("now")["now"]
+
+
+def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clock=None) -> dict:
     """Logger clock minus host clock, resolved to a few ms.
 
-    `now` reports whole seconds, so poll it back-to-back until the second
-    increments. The tick lies between the send time of the last old reading
-    and the receive time of the first new one; take the midpoint and report
-    half the bracket as the uncertainty. Repeat `reps` times.
+    The logger reports whole seconds (`now`, or `clock(link)` for other families), so poll it
+    back-to-back until the second increments. The tick lies between the send time of the last old
+    reading and the receive time of the first new one; take the midpoint and report half the
+    bracket as the uncertainty. Repeat `reps` times.
     """
+    clock = clock or _now
     samples = []  # (skew_s, half_width_s)
     prev = None
     polls = 0
     t_end = time.monotonic() + max_seconds
     while len(samples) < reps and time.monotonic() < t_end:
         t_send = time.time_ns()
-        value = link.query("now")["now"]
+        value = clock(link)
         t_recv = time.time_ns()
         polls += 1
         logger_s = parse_logger_datetime(value).timestamp()
@@ -136,15 +152,15 @@ def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0) -> 
     }
 
 
-def download(link: Link, total: int, part_path: Path, progress=None) -> bytes:
-    """Read `total` bytes of dataset 1, appending to `part_path` so an interrupted
-    download of the same deployment resumes where it stopped.
+def download(link: Link, total: int, part_path: Path, progress=None, dataset: int = 1, l3: bool = False) -> bytes:
+    """Read `total` bytes of `dataset` (Gen3 `readdata` if l3), appending to `part_path` so an
+    interrupted download of the same deployment resumes where it stopped.
 
     A partial file is reused only if its header bytes match the logger's
     current header (same deployment).
     """
     head_len = min(512, total)
-    head = link.read_data(1, head_len, 0)
+    head = link.read_data(dataset, head_len, 0, l3=l3)
     if part_path.exists():
         with open(part_path, "rb") as f:
             old_head = f.read(head_len)
@@ -164,7 +180,7 @@ def download(link: Link, total: int, part_path: Path, progress=None) -> bytes:
         t0, b0 = time.monotonic(), offset
         while offset < total:
             n = min(CHUNK, total - offset)
-            block = link.read_data(1, n, offset)
+            block = link.read_data(dataset, n, offset, l3=l3)
             if len(block) != n:
                 raise RuntimeError(f"short block at {offset}: {len(block)} of {n} bytes")
             f.write(block)
@@ -184,5 +200,5 @@ def sha256(data: bytes) -> str:
 
 
 __all__ = ["SUPPORTED_FWTYPES", "LoggerError", "identify", "snapshot", "memory", "power",
-           "measure_clock_skew", "download", "parse_logger_datetime", "sha256",
+           "measure_clock_skew", "download", "parse_logger_datetime", "parse_voltage", "sha256",
            "NOMINAL_BATTERY_J", "RUSKIN_LOW_VOLTAGE_V"]

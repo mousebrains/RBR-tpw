@@ -285,6 +285,20 @@ def hexfloat(s: str) -> float:
     return struct.unpack(">f", bytes.fromhex(s.strip()))[0]
 
 
+RESET_CLOCK_BEFORE_MS = 978_307_200_000  # 2001-01-01T00:00:00Z: an RBR clock restarts at 2000-01-01 after a power loss
+
+
+def reset_segments(time_ms: np.ndarray, events: list[tuple[int, int, int]]) -> tuple[np.ndarray, np.ndarray]:
+    """For loggers that timestamp every sample (Ruskin values, Gen3 EasyParse): TFLAG_RESET_CLOCK on samples
+    dated before 2001, and a new clock segment after each restart event. `events` are (ms, type, sample index)."""
+    tflags = np.where(time_ms < RESET_CLOCK_BEFORE_MS, TFLAG_RESET_CLOCK, 0).astype(np.uint8)
+    segment = np.zeros(time_ms.size, np.int32)
+    for _, etype, index in events:
+        if etype in RESTART_EVENTS and 0 <= index < time_ms.size:
+            segment[index:] += 1
+    return tflags, segment
+
+
 def resolve_times(
     d: Decoded, skew_s: float | None, offload_unix_ms: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
@@ -297,9 +311,22 @@ def resolve_times(
     samples. Reset-clock sets in earlier segments have no recoverable time and
     are dropped (the raw image keeps them).
 
+    "Segment" here means the samples between clock restarts (events 0x06/0x0A/0x0B), not between time
+    anchors: an ordinary anchor (a time sync, or a twist activation on an RBRconcerto) does not reset the
+    clock, so samples on either side of it share one clock and one correction.
+
     Returns (time_ms, time_flags, keep mask, notes).
     """
-    return resolve_time_arrays(d.time_ms, d.time_flags, d.segment, skew_s, offload_unix_ms)
+    return resolve_time_arrays(d.time_ms, d.time_flags, clock_segments(d), skew_s, offload_unix_ms)
+
+
+def clock_segments(d: Decoded) -> np.ndarray:
+    """Per sample set, how many clock restarts (RTC_RESET_EVENTS) precede it."""
+    seg = np.zeros(d.time_ms.size, np.int32)
+    for e in d.events:
+        if e.type in RTC_RESET_EVENTS and 0 <= e.sample_index < seg.size:
+            seg[e.sample_index:] += 1
+    return seg
 
 
 def resolve_time_arrays(

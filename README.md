@@ -16,16 +16,27 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 
 ## Supported loggers
 
-| Logger | `id fwtype` | Offload | Configure |
-|---|---|---|---|
-| RBRsolo T (L2-era compact logger, firmware 1.000) | 9 | yes | yes |
-| Other RBR loggers | anything else | detected and skipped; nothing is changed | – |
+| Logger | `id fwtype` | Offload (read-only) | NetCDF | Configure |
+|---|---|---|---|---|
+| RBRsolo T, firmware 1.000 | 9 | yes, tested on a logger | yes | yes |
+| RBRsolo T, firmware 1.110 | 0 | yes | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | – |
+| RBRduet (L2) | 102 | yes | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
+| RBRconcerto (L2) | 103 | yes | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
+| RBRconcerto³ and other Gen3 (L3) | 104 | yes | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
+| Gen4 (L3.5) | 120 | from RBR's command reference only; untested | untested | – |
+| Anything else | – | detected and skipped; nothing is changed | – | – |
+
+Offload only reads from the logger. Whatever the decoder does, the raw memory, the settings record and the
+serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
+download later, e.g. after a decoder is added. `--configure` refuses any logger but fwtype 9: it erases memory,
+and the write sequence has only been checked on that model.
+
+The command sequences come from what RBR's Ruskin 2.26.1 sends each model (its serial logs), and from RBR's
+command references. Only the fwtype-9 solo has been run against real hardware so far. The fwtype-9 protocol is
+not in RBR's published references; it was worked out on a real logger and checked against Ruskin's own output.
 
 Ruskin `.rsk` files from any RBR logger can be converted to the same NetCDF format; see
 [Convert Ruskin .rsk files](#convert-ruskin-rsk-files).
-
-The fwtype-9 protocol is not in RBR's published command references. It was worked out on a real logger
-and checked against Ruskin's own output.
 
 ## Install
 
@@ -103,8 +114,10 @@ between the send and receive times and repeats this 3 times. The Mac's clock is 
 tick measurement plus the NTP uncertainty.
 
 If the logger lost power during a deployment, its clock restarts at 2000-01-01. Samples taken after the last
-such reset are re-timed with the skew measured at offload and flagged in `time_flag`. Samples between two
-resets have no recoverable time. They are left out of the NetCDF with a warning and kept in the raw file.
+such reset are re-timed with the skew measured at offload and flagged in `time_flag`. This includes a logger
+enabled after its clock had already reset. Samples between two resets have no recoverable time. They are left
+out of the NetCDF with a warning and kept in the raw file. Only a clock restart (an RTC-reset event) splits a
+record this way; ordinary time anchors, such as an RBRconcerto's twist-activation events, do not.
 
 ## Alarms: battery and remaining sampling time
 

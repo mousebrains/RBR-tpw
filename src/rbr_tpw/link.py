@@ -7,6 +7,9 @@ Protocol notes (RBRsolo fwtype 9, observed 2026-09-25 and in Ruskin 2.26.1 seria
 - Errors reply "E<4 digits> <text>".
 - `read data <dataset> <size> <offset>` replies "data <dataset> <size> <offset>\\r\\n",
   then <size> bytes, then a 2-byte CRC (see crc.py).
+- Gen3 (L3, fwtype 104) instead takes `readdata size = <s>, offset = <o>, dataset = <d>` and replies
+  "readdata dataset = <d>, size = <s>, offset = <o>\\r\\n", then the bytes and the CRC (L3 ref 4.6.4;
+  the form Ruskin 2.26.1 sends to RBRconcerto3 SN233442).
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ PROMPT_RE = re.compile(rb"Ready: ?")
 LINE_RE = re.compile(rb"([^\r\n]*)\r\n")
 ERROR_RE = re.compile(r"^E(\d{4})\b\s*(.*)$")
 DATA_HDR_RE = re.compile(rb"data (\d+) (\d+) (\d+)\r\n")
+L3_DATA_HDR_RE = re.compile(rb"readdata dataset = (\d+), size = (\d+), offset = (\d+)\r\n")
 DATA_ERR_RE = re.compile(rb"(E\d{4}[^\r\n]*)\r\n")
 
 
@@ -183,32 +187,37 @@ class Link:
     def query(self, cmd: str, timeout: float = 3.0) -> dict[str, str]:
         return parse_pairs(self.command(cmd, timeout))
 
-    def read_data(self, dataset: int, size: int, offset: int, timeout: float = 10.0, retries: int = 5) -> bytes:
-        """One CRC-checked `read data` block. Retries on CRC failure or timeout."""
+    def read_data(self, dataset: int, size: int, offset: int, timeout: float = 10.0, retries: int = 5,
+                  l3: bool = False) -> bytes:
+        """One CRC-checked block of a dataset (`read data`, or Gen3 `readdata` if l3). Retries on CRC failure
+        or timeout."""
         last = None
         for attempt in range(1, retries + 1):
             try:
-                return self._read_data_once(dataset, size, offset, timeout)
+                return self._read_data_once(dataset, size, offset, timeout, l3)
             except LinkError as err:
                 if isinstance(err, LoggerError):
                     raise
                 last = err
-                self.note(f"read data {dataset} {size} {offset}: attempt {attempt} failed: {err}")
+                self.note(f"dataset {dataset} {size} bytes at {offset}: attempt {attempt} failed: {err}")
                 self._drain(0.3)
-        raise LinkError(f"read data {dataset} {size} {offset} failed after {retries} attempts: {last}")
+        raise LinkError(f"dataset {dataset} {size} bytes at {offset} failed after {retries} attempts: {last}")
 
-    def _read_data_once(self, dataset: int, size: int, offset: int, timeout: float) -> bytes:
+    def _read_data_once(self, dataset: int, size: int, offset: int, timeout: float, l3: bool = False) -> bytes:
         leftover = PROMPT_RE.sub(b"", self._buf)
         if leftover.strip():
             self._record("DROP", _show(leftover))
         self._buf = b""
-        cmd = f"read data {dataset} {size} {offset}"
+        if l3:
+            cmd, header_re = f"readdata size = {size}, offset = {offset}, dataset = {dataset}", L3_DATA_HDR_RE
+        else:
+            cmd, header_re = f"read data {dataset} {size} {offset}", DATA_HDR_RE
         self._send(cmd)
         deadline = time.monotonic() + timeout
         need = None
         while True:
             if need is None:
-                m = DATA_HDR_RE.search(self._buf)
+                m = header_re.search(self._buf)
                 if m:
                     ds, n, off = (int(g) for g in m.groups())
                     if (ds, off) != (dataset, offset) or n > size:

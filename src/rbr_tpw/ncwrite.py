@@ -20,11 +20,13 @@ import netCDF4
 import numpy as np
 
 from . import __version__
+from .equations import decode_l2, evaluate, header_coefficients, is_sectioned_header
 from .rawbin import (
     EQUATIONS,
     EVENT_NAMES,
     FLAG_ERROR_CODE,
     FLAG_OUT_OF_RANGE,
+    RESET_CLOCK_BEFORE_MS,
     TFLAG_NO_ANCHOR,
     TFLAG_RESET_CLOCK,
     TFLAG_SKEW_CORRECTED,
@@ -48,6 +50,13 @@ CHANNEL_KINDS = {
     "sos_": ("speed_of_sound", "speed_of_sound_in_sea_water", "m s-1", "Speed of sound"),
     "scon": ("specific_conductivity", None, "uS cm-1", "Specific conductivity"),
 }
+
+SOLO_BATTERY_COMMENT = ("From `powerstatus` after the download. battery_voltage_V = int / 1000 (mV). "
+                        "battery_energy_remaining_J = hex(remaining) / 1000 (mJ); this is the logger's own "
+                        "energy counter, meaningful only if reset (Ruskin 'Fresh battery') when the cell "
+                        "was replaced. Nominal = one AA 3.6 V 2.6 Ah Li-SOCl2 cell (Ruskin's reset value). "
+                        "Voltage units verified against a meter; energy-counter units inferred from Ruskin "
+                        "2.26.1 behaviour, not from RBR documentation.")
 
 TIME_COMMENT = ("Logger clock, except samples flagged time_corrected_by_offload_skew in time_flag (taken after a "
                 "clock reset), which are logger clock minus the clock skew measured at offload (clock_skew_s, or "
@@ -181,8 +190,15 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
     """
     snap = record["snapshot_before"]
     channels = snap["channel_list"]
-    d = decode(image, len(channels))
     warnings = list(record.get("warnings", []))
+    evaluated = None  # (values, bad, problems, channels with the coefficients used) for sectioned L2 images
+    if is_sectioned_header(image):  # RBRduet / RBRconcerto (L3 ref 5.3.1, header versions 1.xxx)
+        d = decode_l2(image, len(channels))
+        evaluated = _evaluate_l2(d, snap)
+        # also a reset clock: a logger enabled after its clock had restarted at 2000-01-01 (rawbin rule misses it)
+        d.time_flags[d.time_ms < RESET_CLOCK_BEFORE_MS] |= TFLAG_RESET_CLOCK
+    else:
+        d = decode(image, len(channels))
     offload_ms = _parse_iso_ms(record.get("offload_finished") or record["offload_started"])
     t_utc, tflags, keep, notes = resolve_times(d, skew_vs_utc(record), offload_ms)
     if d.rtc_reset:
@@ -214,9 +230,21 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
             coeffs = ch.get("coefficients", {})
             eq = EQUATIONS.get(ch.get("equation", ""))
             varnames = [f"{name}_raw", f"{name}_flag", "time_flag"]
-            if eq is not None:
-                c = tuple(coeffs.get(f"c{i}", math.nan) for i in range(4))
-                values, bad = eq(raw, c)
+            computed = None  # (values, bad) for the kept samples
+            if evaluated is not None:
+                all_values, all_bad, problems, used = evaluated
+                coeffs = used[k].get("coefficients", coeffs)
+                if k in problems:
+                    warnings.append(f"{problems[k]}; raw readings only")
+                else:
+                    computed = (all_values[keep, k], all_bad[keep, k])
+            elif eq is not None:
+                computed = eq(raw, tuple(coeffs.get(f"c{i}", math.nan) for i in range(4)))
+            else:
+                warnings.append(f"channel {k + 1} ({ctype}, equation {ch.get('equation')!r}): no converter; "
+                                "raw readings only")
+            if computed is not None:
+                values, bad = computed
                 flags[bad & ((raw >> 24) != 0xF6)] |= FLAG_OUT_OF_RANGE
                 vv = nc.createVariable(name, "f8", ("time",), zlib=True, complevel=4, chunksizes=chunk,
                                        fill_value=np.nan)
@@ -227,17 +255,24 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
                         "comment": "Computed from the raw reading with the logger's own calibration coefficients "
                                    "(RBR 'tmp' Steinhart-Hart form, L3 command reference section 7.1.4). "
                                    "Matches Ruskin 2.26.1 to <1e-12 degC on test files."}
-                if std:
+                if evaluated is not None:
+                    atts["comment"] = ("Computed from the raw reading with the calibration stored in the logger's "
+                                       f"deployment header (equation {ch.get('equation')}, L3 command reference "
+                                       "section 7), including readings of the channels it references. Matched "
+                                       "Ruskin 2.26.1 to <=1.1e-13 on 17 RBRduet/RBRconcerto files.")
+                hidden = int(ch.get("status", 0) or 0) & 0x01  # e.g. a pressure sensor's compensation thermistor
+                if std and not hidden:
                     atts["standard_name"] = std
+                if hidden:
+                    atts["rbr_channel_status"] = np.int32(ch["status"])
+                    atts["comment"] += (" The logger marks this channel hidden (channelStatus bit 0x01; Ruskin does "
+                                        "not show it); it is not labelled as a sea-water quantity.")
                 if units and units.startswith("degree_C"):
                     atts["units_metadata"] = "temperature: on_scale"
                 for key, val in coeffs.items():
-                    atts[f"calibration_{key}"] = float(val)
+                    atts[f"calibration_{key}"] = val if isinstance(val, str) else float(val)
                 vv.setncatts(atts)
                 vv[:] = values
-            else:
-                warnings.append(f"channel {k + 1} ({ctype}, equation {ch.get('equation')!r}): no converter; "
-                                "raw readings only")
             _flag_variable(nc, name, long, flags, chunk)
 
         _event_variables(nc, [e.unix_ms for e in d.events], [e.type for e in d.events],
@@ -249,6 +284,29 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
         nc.setncatts(_global_attributes(record, warnings, t_utc[keep], period_ms=hdr.period_ms, nchan=d.nchan,
                                         rtc_reset=d.rtc_reset, deployment=deployment))
     return d, warnings, t_utc[keep]
+
+
+def _evaluate_l2(d: Decoded, snap: dict):
+    """Engineering values for a sectioned L2 image: coefficients from the memory header (the calibration in
+    force when the deployment was enabled), named in the order the logger's `calibration N` reply lists them."""
+    header_channels = d.header.fields.get("channels", [])
+    used = []
+    for ch in snap.get("channels_all") or snap["channel_list"]:
+        i = int(ch.get("index", len(used) + 1))
+        hc = header_channels[i - 1] if i <= len(header_channels) else None
+        if hc is not None and hc.get("coefficient_words"):
+            # header words are stored c0.., x0.., n0.. (the order of the `calibration N` reply); sort the names so
+            # a differently ordered source (e.g. an .rsk coefficients table) pairs them the same way
+            names = sorted(ch.get("coefficients", {}), key=lambda n: ("cxn".find(n[:1]) % 4, int(n[1:] or 0)
+                                                                      if n[1:].isdigit() else 0))
+            used.append({**ch, "coefficients": header_coefficients(hc, names)})
+        else:
+            used.append(ch)
+    settings = snap.get("settings") or {}
+    defaults = {k: float(settings[k]) for k in ("temperature", "pressure") if k in settings}
+    values, bad, problems = evaluate(d.raw, used, defaults)
+    stored = [c for c in used if not int(c.get("status", 0)) & 0x04]
+    return values, bad, problems, stored
 
 
 @dataclass
@@ -407,7 +465,8 @@ def _global_attributes(record: dict, warnings: list[str], t_ms: np.ndarray, *, p
 
     if mem:
         samples_per_day = 86_400_000 / period_ms if period_ms else math.nan
-        bytes_per_day = 4 * nchan * samples_per_day
+        bytes_per_sample = record.get("bytes_per_sample") or 4 * nchan
+        bytes_per_day = bytes_per_sample * samples_per_day
         a.update({
             "memory_size_bytes": int(mem["size"]),
             "memory_used_bytes": int(mem["used"]),
@@ -416,7 +475,7 @@ def _global_attributes(record: dict, warnings: list[str], t_ms: np.ndarray, *, p
             "memory_remaining_days": mem["remaining"] / bytes_per_day
             if snap["sampling"].get("mode") == "continuous" else math.nan,
             "memory_comment": "From `meminfo` after the download. memory_remaining_days assumes continuous "
-                              f"sampling at sampling_period_ms with {4 * nchan} bytes per sample set (events "
+                              f"sampling at sampling_period_ms with {bytes_per_sample} bytes per sample set (events "
                               "ignored).",
         })
     a.update(_remaining_attrs(record.get("remaining_time")))
@@ -428,12 +487,7 @@ def _global_attributes(record: dict, warnings: list[str], t_ms: np.ndarray, *, p
             "battery_energy_nominal_J": _num(pwr.get("energy_nominal_J")),
             "battery_energy_remaining_fraction": _num(pwr.get("energy_remaining_fraction")),
             "battery_powerstatus_raw": f"int = {pwr.get('int_raw')}, remaining = {pwr.get('remaining_raw')}",
-            "battery_comment": "From `powerstatus` after the download. battery_voltage_V = int / 1000 (mV). "
-                               "battery_energy_remaining_J = hex(remaining) / 1000 (mJ); this is the logger's own "
-                               "energy counter, meaningful only if reset (Ruskin 'Fresh battery') when the cell "
-                               "was replaced. Nominal = one AA 3.6 V 2.6 Ah Li-SOCl2 cell (Ruskin's reset value). "
-                               "Voltage units verified against a meter; energy-counter units inferred from Ruskin "
-                               "2.26.1 behaviour, not from RBR documentation.",
+            "battery_comment": pwr.get("comment") or SOLO_BATTERY_COMMENT,
         })
     a.update(record.get("extra_attributes", {}))
     if warnings:

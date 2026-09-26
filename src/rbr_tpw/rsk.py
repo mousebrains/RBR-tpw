@@ -45,17 +45,14 @@ from .ncwrite import ChannelValues, write_netcdf, write_values_netcdf
 from .rawbin import (
     EQUATIONS,
     FLAG_ERROR_CODE,
-    RESTART_EVENTS,
-    TFLAG_RESET_CLOCK,
     Decoded,
     decode,
+    reset_segments,
 )
 
 DECODABLE_FWTYPES = {0, 9}
 STATUS_HIDDEN = 0x01
 STATUS_NOT_STORED = 0x04
-# An RBR clock restarts at 2000-01-01 after a power loss; no deployment samples in 2000 on purpose.
-RESET_CLOCK_BEFORE_MS = 978_307_200_000  # 2001-01-01T00:00:00Z
 VALUE_TOLERANCE = 1e-9  # decode vs Ruskin, engineering units
 READ_BLOCK = 200_000  # data-table rows per fetch
 
@@ -383,16 +380,6 @@ def _values_events(con: sqlite3.Connection, t: np.ndarray) -> list[tuple[int, in
     return events
 
 
-def _time_segments(t: np.ndarray, events: list[tuple[int, int, int]]) -> tuple[np.ndarray, np.ndarray]:
-    """TFLAG_RESET_CLOCK on samples dated before 2001, and a new clock segment at each restart event."""
-    tflags = np.where(t < RESET_CLOCK_BEFORE_MS, TFLAG_RESET_CLOCK, 0).astype(np.uint8)
-    segment = np.zeros(t.size, np.int32)
-    for _, etype, index in events:
-        if etype in RESTART_EVENTS and 0 <= index < t.size:
-            segment[index:] += 1
-    return tflags, segment
-
-
 @dataclass
 class Result:
     route: str
@@ -432,7 +419,7 @@ def convert(path: Path, out: Path, force_values: bool = False) -> Result:
                    if image is not None and rsk.fwtype not in DECODABLE_FWTYPES else "")
             return Result(route, note=f"Ruskin's data table is empty{why}; nothing written")
         events = _values_events(con, t)
-        tflags, segment = _time_segments(t, events)
+        tflags, segment = reset_segments(t, events)
         channels = _values_channels(rsk, con, t, v)
         deployment = {"deployment_start_time": _iso(rsk.start_ms), "deployment_end_time": _iso(rsk.end_ms)}
         warnings, t_out = write_values_netcdf(
