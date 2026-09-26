@@ -39,24 +39,30 @@ def energy_per_day_J(period_ms: int, active_ms: float) -> float:
     return CELL_V * (ACTIVE_MA * active_s + SLEEP_MA * (86_400.0 - active_s)) / 1000
 
 
-def memory_days(remaining_bytes: int, period_ms: int, nchan: int) -> float:
-    return remaining_bytes / (BYTES_PER_READING * nchan * 86_400_000 / period_ms)
+def memory_days(remaining_bytes: int, period_ms: int, nchan: int, bytes_per_sample: int | None = None) -> float:
+    return remaining_bytes / ((bytes_per_sample or BYTES_PER_READING * nchan) * 86_400_000 / period_ms)
 
 
 def remaining(counter_J: float, used_bytes: int, remaining_bytes: int, period_ms: int, nchan: int,
-              active_ms: float) -> dict:
+              active_ms: float, bytes_per_sample: int | None = None, energy_model: bool = True) -> dict:
     """Days of sampling left at `period_ms`, limited by memory or by energy.
 
     The logger's energy counter does not appear to fall during a deployment (it was unchanged over
     10 days of logging on SN100685), so the modelled energy for the samples already in memory is
-    subtracted from it.
+    subtracted from it. The energy model is the RBRsolo T's; for other loggers, or without a
+    counter (fwtype 0), only the memory limit is computed.
     """
+    bps = bytes_per_sample or BYTES_PER_READING * nchan
+    m_days = memory_days(remaining_bytes, period_ms, nchan, bps)
+    if not energy_model or not math.isfinite(counter_J):
+        return {"energy_per_day_J": math.nan, "energy_used_this_deployment_J": math.nan,
+                "energy_usable_J": math.nan, "energy_days": math.nan, "memory_days": m_days, "days": m_days,
+                "limited_by": "memory (energy not modelled)", "derating": "proportional"}
     per_day = energy_per_day_J(period_ms, active_ms)
-    samples = max(0, used_bytes - HEADER_BYTES) / (BYTES_PER_READING * nchan)
+    samples = max(0, used_bytes - HEADER_BYTES) / bps
     used_this_deployment = per_day * samples * period_ms / 86_400_000
     usable = counter_J * DERATED_J / NOMINAL_J - used_this_deployment
     e_days = max(0.0, usable) / per_day if math.isfinite(usable) else math.nan
-    m_days = memory_days(remaining_bytes, period_ms, nchan)
     limit = "energy" if e_days < m_days else "memory"
     return {
         "energy_per_day_J": per_day,

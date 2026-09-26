@@ -31,21 +31,11 @@ from serial.tools import list_ports
 from . import __version__
 from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure
 from .console import DEVICE, Console, setup_logging
+from .drivers import DecodeUnavailable, Driver, driver_for
 from .hostclock import ntp_offset, timing_critical
 from .link import Link, LinkError
-from .ncwrite import write_netcdf
 from .power import remaining
-from .solo import (
-    RUSKIN_LOW_VOLTAGE_V,
-    SUPPORTED_FWTYPES,
-    download,
-    identify,
-    measure_clock_skew,
-    memory,
-    power,
-    sha256,
-    snapshot,
-)
+from .solo import RUSKIN_LOW_VOLTAGE_V, identify, measure_clock_skew, sha256
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +144,15 @@ def _progress_logger(s: Settings, port: str):
     return progress
 
 
+def _write_bytes(path: Path, data: bytes):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _write_json(path: Path, obj):
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w") as f:
@@ -164,18 +163,21 @@ def _write_json(path: Path, obj):
 
 
 def _active_ms(snap: dict) -> float:
-    ch = snap["channels"]
+    ch = snap.get("channels", {})
     return float(ch.get("latency", 0) or 0) + float(ch.get("readtime", 0) or 0)
 
 
-def _remaining(snap: dict, mem: dict, pwr: dict, period_ms: int) -> dict | None:
+def _remaining(snap: dict, mem: dict, pwr: dict, period_ms: int, driver: Driver) -> dict | None:
     if not period_ms:
         return None
-    return remaining(pwr["energy_remaining_J"], mem["used"], mem["remaining"], period_ms,
-                     len(snap["channel_list"]), _active_ms(snap))
+    return remaining(pwr.get("energy_remaining_J", math.nan), mem["used"], mem["remaining"], period_ms,
+                     len(snap["channel_list"]), _active_ms(snap), bytes_per_sample=driver.bytes_per_sample(snap),
+                     energy_model=driver.energy_model)
 
 
 def _describe(rem: dict) -> str:
+    if not math.isfinite(rem["energy_days"]):
+        return f"{rem['days']:.0f} days, limited by {rem['limited_by']}"
     return (f"{rem['days']:.0f} days, limited by {rem['limited_by']} "
             f"(energy ~{rem['energy_days']:.0f} d modelled, memory {rem['memory_days']:.0f} d)")
 
@@ -193,8 +195,13 @@ def _time_checks(sn: str, label: str, rem: dict | None, v: float, s: Settings) -
     return out
 
 
-def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, erase_note: str) -> dict:
+def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, erase_note: str,
+                    driver: Driver | None = None) -> dict:
     cfg = s.deploy
+    if driver is not None and not driver.configurable:
+        log.warning("--configure is implemented only for RBRsolo fwtype 9 so far; SN%s (fwtype %s) was offloaded "
+                    "but not changed", sn, driver.fwtype)
+        return {"skipped": f"configure not supported for fwtype {driver.fwtype}"}
     plan = []
     if cfg.set_clock:
         plan.append("set clock to UTC" if ntp.get("offset_s") is not None else "set clock to host time (NTP failed)")
@@ -236,7 +243,8 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
              rb["starttime"], rb["endtime"], rb["meminfo"]["used"], rb["power"]["battery_voltage_V"],
              rb["power"]["energy_remaining_J"], 1e3 * (clk["skew_vs_host_s"] - off))
 
-    rem = _remaining(snap, rb["meminfo"], rb["power"], int(rb["sampling"].get("period", 0) or 0))
+    rem = _remaining(snap, rb["meminfo"], rb["power"], int(rb["sampling"].get("period", 0) or 0), driver or
+                     driver_for(9))
     report["remaining_time"] = rem
     if rem:
         log.info("expected sampling time: %s", _describe(rem))
@@ -270,17 +278,18 @@ def offload(port: str, s: Settings) -> Path | None:
         link.rename_transcript(rawdir / f"{stem}.log")
         log.info("%s SN%s, firmware %s, fwtype %s on %s", ident["model"], sn, ident["version"], ident["fwtype"], port)
         log.debug("serial transcript: %s", link.transcript_path)
-        if ident["fwtype"] not in SUPPORTED_FWTYPES:
-            log.info("fwtype %s is not supported yet (supported: %s); skipping, nothing was changed on the logger.",
-                     ident["fwtype"], sorted(SUPPORTED_FWTYPES))
+        driver = driver_for(ident["fwtype"])
+        if driver is None:
+            log.info("fwtype %s is not supported yet; skipping, nothing was changed on the logger.", ident["fwtype"])
             return None
+        log.debug("driver: %s (%s)", type(driver).__name__, driver.family)
 
         _stage(port, "NTP query")
         ntp = ntp_offset(s.ntp_server) if s.ntp_server else {"error": "disabled"}
         log.debug("host NTP: %s", ntp)
         _stage(port, "measuring clock skew")
         with timing_critical("clock skew"):
-            skew = measure_clock_skew(link)
+            skew = measure_clock_skew(link, clock=driver.clock_now)
         log.debug("clock skew: %s", skew)
         if skew.get("n"):
             off = ntp.get("offset_s")
@@ -291,31 +300,39 @@ def offload(port: str, s: Settings) -> Path | None:
             log.warning("clock skew could not be measured")
 
         _stage(port, "reading settings")
-        snap = snapshot(link)
+        snap = driver.snapshot(link)
         log.debug("settings: %s", json.dumps(snap, default=str))
-        total = snap["meminfo"]["used"]
-        log.info("status %s, sampling %s %s ms, %d bytes to download", snap["status"],
-                 snap["sampling"].get("mode"), snap["sampling"].get("period"), total)
+        plan = driver.datasets(snap)
+        total = sum(n for _, _, n in plan)
+        log.info("status %s, sampling %s %s ms, %d bytes to download%s", snap["status"],
+                 snap["sampling"].get("mode"), snap["sampling"].get("period"), total,
+                 "" if len(plan) == 1 else " (" + ", ".join(f"{name} {n}" for name, _, n in plan) + ")")
 
-        part = rawdir / ".partial" / f"{sn}.bin.part"
-        image = None
+        part_dir = rawdir / ".partial"
+        data: dict[str, bytes] = {}
         if total > 0:
             if s.stop.is_set():
                 raise Stopped()
             _stage(port, "downloading")
-            image = download(link, total, part, _progress_logger(s, port))
-        after = {"meminfo": memory(link), "power": power(link), "status": link.query("status")["status"]}
+            data = driver.download(link, snap, part_dir, sn, _progress_logger(s, port))
+        after = driver.after(link)
         log.debug("after download: %s", after)
 
-        raw_path = rawdir / f"{stem}.bin"
-        if image is not None:
-            os.replace(part, raw_path)
+        datasets = {}
+        for name, blob in data.items():
+            if not blob:
+                continue
+            fname = f"{stem}.bin" if list(data) == ["dataset1"] else f"{stem}_{name.replace('/', '_')}.bin"
+            _write_bytes(rawdir / fname, blob)
+            datasets[name] = {"file": f"raw/{fname}", "bytes": len(blob), "sha256": sha256(blob)}
+        for f in driver.part_files(part_dir, sn) if part_dir.is_dir() else []:
+            f.unlink(missing_ok=True)
         warnings = []
         if skew.get("n") and abs(skew["skew_vs_host_s"]) > 60:
             warnings.append(f"clock skew {skew['skew_vs_host_s']:+.1f} s exceeds 60 s "
                             "(clock reset, or set to local time instead of UTC?)")
-        rem = _remaining(snap, after["meminfo"], after["power"], int(snap["sampling"].get("period", 0) or 0))
-        alarms = _time_checks(sn, "at offload", rem if after["status"] in ("logging", "pending") else None,
+        rem = _remaining(snap, after["meminfo"], after["power"], int(snap["sampling"].get("period", 0) or 0), driver)
+        alarms = _time_checks(sn, "at offload", rem if after["status"] in ("logging", "pending", "gated") else None,
                               after["power"]["battery_voltage_V"], s)
         warnings.extend(alarms)
         record = {
@@ -324,14 +341,16 @@ def offload(port: str, s: Settings) -> Path | None:
             "offload_started": iso(started),
             "offload_finished": iso(utcnow()),
             "id": ident,
+            "family": driver.family,
             "host_ntp": ntp,
             "clock_skew": skew,
             "snapshot_before": snap,
             "after": after,
             "remaining_time": rem,
+            "bytes_per_sample": driver.bytes_per_sample(snap),
             "thresholds": vars(s.thresholds),
-            "raw": ({"file": f"raw/{raw_path.name}", "bytes": len(image), "sha256": sha256(image)}
-                    if image is not None else None),
+            "raw": datasets.get("dataset1") or next(iter(datasets.values()), None),
+            "datasets": datasets,
             "transcript": f"raw/{stem}.log",
             "session_log": f"raw/{s.session_log.name}" if s.session_log else None,
             "warnings": warnings,
@@ -339,9 +358,11 @@ def offload(port: str, s: Settings) -> Path | None:
         _write_json(rawdir / f"{stem}.json", record)  # saved before anything is written to the logger
         log.debug("wrote %s", rawdir / f"{stem}.json")
         mem, pwr = after["meminfo"], after["power"]
-        log.info("at offload, memory: %.1f of %.1f MB free (%.1f%%); battery %.3f V, energy counter %.0f J of "
-                 "%.0f J nominal", mem["remaining"] / 1e6, mem["size"] / 1e6, 100 * mem["remaining"] / mem["size"],
-                 pwr["battery_voltage_V"], pwr["energy_remaining_J"], pwr["energy_nominal_J"])
+        energy = (f", energy counter {pwr['energy_remaining_J']:.0f} J of {pwr['energy_nominal_J']:.0f} J nominal"
+                  if math.isfinite(pwr.get("energy_remaining_J", math.nan)) else "")
+        free = f"{100 * mem['remaining'] / mem['size']:.1f}%" if mem.get("size") else "?"
+        log.info("at offload, memory: %.1f of %.1f MB free (%s); battery %.3f V%s", mem["remaining"] / 1e6,
+                 mem["size"] / 1e6, free, pwr["battery_voltage_V"], energy)
         if rem:
             log.info("at offload, sampling time left at %s ms: %s", snap["sampling"].get("period"), _describe(rem))
         for w in warnings:
@@ -350,22 +371,24 @@ def offload(port: str, s: Settings) -> Path | None:
         if alarms:
             alarm(alarms, s)
         if s.deploy is not None:
-            note = f"{total} bytes, saved to raw/{raw_path.name}" if image is not None else "already empty"
-            report = _configure_step(link, s, snap, ntp, sn, note)
+            note = f"{total} bytes, saved to raw/{stem}*.bin" if datasets else "already empty"
+            report = _configure_step(link, s, snap, ntp, sn, note, driver)
             _write_json(rawdir / f"{stem}_configure.json", report)
             log.debug("wrote %s", rawdir / f"{stem}_configure.json")
 
-    if image is None:
+    if not datasets:
         log.info("logger memory is empty; no NetCDF written")
         return None
     _stage(port, "writing NetCDF")
     nc_path = s.outdir / f"{stem}.nc"
     try:  # on the main thread: see console.Console.run_in_main
-        _, all_warnings, t_ms = s.console.run_in_main(write_netcdf, image, record, nc_path)
-    except Exception:
-        log.error("NetCDF not written; the download is saved: rbr-offload %s --rebuild %s", s.outdir,
-                  rawdir / f"{stem}.json")
-        raise
+        all_warnings, t_ms = s.console.run_in_main(driver.write_netcdf, data, record, nc_path)
+    except Exception as err:
+        how = "no decoder yet" if isinstance(err, DecodeUnavailable) else f"{type(err).__name__}"
+        log.warning("NetCDF not written (%s: %s). The download is saved; convert it later with: "
+                    "rbr-offload %s --rebuild %s", how, err, s.outdir, rawdir / f"{stem}.json")
+        log.debug("NetCDF traceback", exc_info=True)
+        return None
     log.info("%d samples written%s", len(t_ms),
              f", {iso(dt.datetime.fromtimestamp(t_ms[0] / 1e3, dt.UTC))} to "
              f"{iso(dt.datetime.fromtimestamp(t_ms[-1] / 1e3, dt.UTC))}" if len(t_ms) else "")
@@ -545,11 +568,21 @@ def main(argv=None):
         setup_logging(console)
         for rec_path in args.rebuild:
             record = json.loads(rec_path.read_text())
-            image = (rec_path.parent.parent / record["raw"]["file"]).read_bytes()
-            if sha256(image) != record["raw"]["sha256"]:
-                sys.exit(f"{rec_path}: raw file checksum does not match the record")
+            driver = driver_for(int(record["id"]["fwtype"]))
+            if driver is None:
+                sys.exit(f"{rec_path}: fwtype {record['id']['fwtype']} is not supported")
+            data = {}
+            for name, info in (record.get("datasets") or {"dataset1": record["raw"]}).items():
+                blob = (rec_path.parent.parent / info["file"]).read_bytes()
+                if sha256(blob) != info["sha256"]:
+                    sys.exit(f"{rec_path}: {info['file']} checksum does not match the record")
+                data[name] = blob
             nc_path = args.outdir / (rec_path.stem + ".nc")
-            write_netcdf(image, record, nc_path)
+            try:
+                driver.write_netcdf(data, record, nc_path)
+            except DecodeUnavailable as err:
+                log.warning("%s: not written: %s", rec_path, err)
+                continue
             log.info("wrote %s", nc_path)
         return
     rawdir = args.outdir / "raw"

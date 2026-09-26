@@ -9,9 +9,10 @@ import threading
 import time
 
 import netCDF4
+import numpy as np
 import pytest
 import serial
-from fakelogger import FakeSolo
+from fakelogger import FakeConcerto3, FakeDuet, FakeSolo
 
 from rbr_tpw import cli
 from rbr_tpw.configure import DeployConfig
@@ -41,8 +42,8 @@ def rig(tmp_path, monkeypatch):
     setup_logging(console, session_log)
 
     class Rig:
-        def add(self, name, **kw):
-            fakes[f"/dev/cu.{name}"] = FakeSolo(f"/dev/cu.{name}", **kw)
+        def add(self, name, cls=FakeSolo, **kw):
+            fakes[f"/dev/cu.{name}"] = cls(f"/dev/cu.{name}", **kw)
             return fakes[f"/dev/cu.{name}"]
 
         def settings(self, **kw):
@@ -62,7 +63,7 @@ def rig(tmp_path, monkeypatch):
 
 def fast_skew(counter):
     """Stand-in for measure_clock_skew that records how many run at once."""
-    def measure(link, reps=3, max_seconds=15.0):
+    def measure(link, reps=3, max_seconds=15.0, clock=None):
         with counter["lock"]:
             counter["now"] += 1
             counter["max"] = max(counter["max"], counter["now"])
@@ -226,3 +227,73 @@ def test_ctrl_c_in_run_stops_downloads_and_returns(rig, monkeypatch):
     assert "Ctrl-C: stopping" in console and "SN55@usbmodemC downloading" in console
     assert "download stopped (Ctrl-C)" in console and console.rstrip().endswith("Stopped.")
     assert not list(rig.tmp.glob("*.nc")) and (rig.tmp / "raw" / ".partial" / "55.bin.part").exists()
+
+
+def test_bench_mix_solo0_duet_concerto3_in_parallel(rig, monkeypatch):
+    """Tomorrow's bench: three families at once, read-only."""
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
+    solo0 = rig.add("usbmodem101", serial=76313, fwtype=0, n_samples=30_000, bytes_per_s=300_000)
+    duet = rig.add("usbmodem2101", cls=FakeDuet, n_samples=20_000, bytes_per_s=300_000)
+    c3 = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=10_000, bytes_per_s=300_000)
+    cli.run(rig.settings(), once=True, port=None)
+    raw = rig.tmp / "raw"
+
+    # fwtype 0 solo: decoded like fwtype 9; no energy counter, so memory-limited days only
+    (nc0,) = rig.tmp.glob("76313_*.nc")
+    rec0 = json.loads((raw / f"{nc0.stem}.json").read_text())
+    assert rec0["family"] == "L2" and rec0["remaining_time"]["limited_by"] == "memory (energy not modelled)"
+    with netCDF4.Dataset(nc0) as ds:
+        assert len(ds["time"]) == 30_000 and ds.instrument_firmware_type == 0
+
+    # duet: 3 stored channels; the raw download is kept whatever the decoder does
+    (dj,) = raw.glob("081500_*.json")
+    recd = json.loads(dj.read_text())
+    assert recd["raw"]["bytes"] == len(duet.image) and len(recd["snapshot_before"]["channel_list"]) == 3
+    assert recd["after"]["power"]["battery_voltage_V"] == pytest.approx(3.61)
+    assert recd["after"]["power"]["remaining_raw"] == "1BA8140"
+    assert (raw / f"{dj.stem}.bin").read_bytes() == duet.image
+    with netCDF4.Dataset(rig.tmp / f"{dj.stem}.nc") as ds:  # pressure uses channel 3 (hidden thermistor)
+        assert len(ds["time"]) == 20_000 and {"temperature", "pressure", "temperature03"} <= set(ds.variables)
+        p, t3 = ds["pressure"][:], ds["temperature03"][:]
+        assert np.all(np.isfinite(p)) and np.all(np.isfinite(t3))
+        assert "standard_name" not in ds["temperature03"].ncattrs()  # hidden channel
+    assert "no converter" not in rig.console_text() and "raw readings only" not in rig.console_text()
+
+    # concerto3: three datasets saved, EasyParse decoded, 6 stored of 8 channels
+    (cj,) = raw.glob("233442_*.json")
+    recc = json.loads(cj.read_text())
+    assert sorted(recc["datasets"]) == ["dataset0", "dataset1", "dataset2"]
+    for name, info in recc["datasets"].items():
+        assert (rig.tmp / info["file"]).read_bytes() == c3.datasets[int(name[-1])]
+    assert recc["bytes_per_sample"] == 8 + 4 * 6 and recc["after"]["power"]["battery_voltage_V"] == 14.63
+    with netCDF4.Dataset(rig.tmp / f"{cj.stem}.nc") as ds:
+        assert len(ds["time"]) == 10_000 and list(ds["event_type"][:]) == [0x18, 0x19]
+        assert {"conductivity", "temperature", "pressure", "sea_pressure", "depth", "salinity"} <= set(ds.variables)
+    assert any(c.startswith("readdata size = ") for c in c3.commands)
+    assert not any("=" in c and not c.startswith("readdata") for c in c3.commands + duet.commands + solo0.commands)
+
+
+def test_configure_refused_for_other_families(rig, monkeypatch):
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
+    duet = rig.add("usbmodemD", cls=FakeDuet, n_samples=100)
+    cli.run(rig.settings(deploy=DeployConfig(), assume_yes=True), once=True, port=None)
+    assert "--configure is implemented only for RBRsolo fwtype 9" in rig.console_text()
+    assert not any(c.startswith(("lock", "stop", "enable", "memclear", "permit")) for c in duet.commands)
+
+
+def test_unsupported_fwtype_is_left_alone(rig):
+    fake = rig.add("usbmodemU", serial=5)
+    fake.fwtype = 77
+    cli.run(rig.settings(), once=True, port=None)
+    assert "fwtype 77 is not supported yet" in rig.console_text() and fake.commands[-1] == "id"
+
+
+def test_rebuild_gen3_record(rig, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
+    rig.add("usbmodemC", cls=FakeConcerto3, n_samples=500)
+    cli.run(rig.settings(), once=True, port=None)
+    (rec,) = (rig.tmp / "raw").glob("233442_*.json")
+    out = tmp_path / "rebuilt"
+    cli.main([str(out), "--rebuild", str(rec)])
+    with netCDF4.Dataset(out / f"{rec.stem}.nc") as ds:
+        assert len(ds["time"]) == 500
