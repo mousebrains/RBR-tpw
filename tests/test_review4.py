@@ -17,6 +17,7 @@ import pytest
 from fakelogger import FakeConcerto3, FakeSolo
 from test_gen4 import FakeGen4
 from test_power_and_cli import FakeSolo as ConfigFake
+from test_power_and_cli import VirtualClock
 from test_rsk import CONCERTO, _concerto_values, make_rsk
 
 from rbr_tpw import cli, gen4, hostclock, solo
@@ -165,7 +166,9 @@ def test_a_float_period_reaches_the_logger_as_an_integer():
 
 def test_failed_ntp_is_loud_and_labelled_host(console, monkeypatch):
     import rbr_tpw.configure as cf
-    fake = ConfigFake(status="logging")
+    vc = VirtualClock()  # the clock set must not depend on host scheduling (62-101 ms late on a CI runner)
+    monkeypatch.setattr(cf, "time", vc)
+    fake = ConfigFake(status="logging", clock=vc)
     s = cli.Settings(outdir=Path("."), deploy=DeployConfig(), assume_yes=True, ntp_server="time.example")
     snap = {"status": "logging", "channel_list": [{"index": 1, "type": "temp09"}]}
     monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
@@ -325,14 +328,12 @@ def test_synthetic_duet_header_has_the_extra_pressure_word():
     assert words["pres21"] == 12 and words["temp12"] == 4  # as on SN081500
 
 
-def test_configure_reports_its_clock_reference():
+def test_configure_reports_its_clock_reference(monkeypatch):
     import rbr_tpw.configure as cf
-    fake = ConfigFake(status="logging")
-    cf_measure = cf.measure_clock_skew
-    try:
-        cf.measure_clock_skew = lambda link, reps=3: {"n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001,
-                                                       "spread_s": 0.0, "measured_at": ""}
-        report = configure(fake, 100689, DeployConfig(), 0.012, log=lambda *a: None)
-    finally:
-        cf.measure_clock_skew = cf_measure
+    vc = VirtualClock()
+    monkeypatch.setattr(cf, "time", vc)
+    fake = ConfigFake(status="logging", clock=vc)
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+        "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001, "spread_s": 0.0, "measured_at": ""})
+    report = configure(fake, 100689, DeployConfig(), 0.012, log=lambda *a: None)
     assert report["clock_reference"].startswith("UTC")
