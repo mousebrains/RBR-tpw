@@ -15,6 +15,7 @@ import serial
 from fakelogger import FakeConcerto3, FakeDuet, FakeSolo
 
 from rbr_tpw import cli
+from rbr_tpw import link as link_module
 from rbr_tpw.configure import DeployConfig
 from rbr_tpw.console import Console, setup_logging
 
@@ -25,12 +26,12 @@ def rig(tmp_path, monkeypatch):
     fakes: dict[str, FakeSolo] = {}
     busy: set[str] = set()
 
-    def open_port(port, baudrate=115200, timeout=None, exclusive=None):
+    def open_port(port, baudrate=115200):
         if port in busy:
             raise serial.SerialException(35, f"Could not exclusively lock port {port}: [Errno 35]")
         return fakes[port]
 
-    monkeypatch.setattr(serial, "Serial", open_port)
+    monkeypatch.setattr(link_module, "open_serial", open_port)
     monkeypatch.setattr(cli, "rbr_ports", lambda: set(fakes) | busy)
     monkeypatch.setattr(cli, "ruskin_running", lambda: False)
     monkeypatch.setattr(cli, "SETTLE_S", 0.0)

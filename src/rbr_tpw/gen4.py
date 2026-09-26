@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from .crc import crc16_ccitt
+from .hostclock import transfer
 from .link import Link, LinkError, LoggerError, _show
 
 FWTYPES = {120}  # 2.6.2, 3.3.3 "120 for L3.5 instruments". (3.3.1 examples: 130 RBRsolo4, 150 RBRoem; unverified)
@@ -370,7 +371,8 @@ def download(link: Link, part_dir: Path, sn: str, progress=None) -> dict[str, by
                 offset = len(head)
             while offset < size:
                 n = min(CHUNK, size - offset)
-                block = download_block(link, obj, n, offset)
+                with transfer():  # pauses while another logger measures or sets its clock
+                    block = download_block(link, obj, n, offset)
                 if not block:
                     link.note(f"{obj}: logger returned no bytes at {offset} of {size}; stopping there")
                     break

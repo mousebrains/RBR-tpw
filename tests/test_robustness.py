@@ -36,26 +36,48 @@ def test_non_finite_temperature_is_flagged():
     assert bad[0] and np.isnan(t[0])
 
 
-def _port(device, manufacturer="RBR"):
-    return SimpleNamespace(device=device, manufacturer=manufacturer, product="")
+def _port(device, manufacturer="RBR", vid=None, pid=None):
+    return SimpleNamespace(device=device, manufacturer=manufacturer, product="", vid=vid, pid=pid,
+                           serial_number=None, description="", location=None, hwid="")
 
 
-def test_port_discovery_on_linux_and_macos(monkeypatch):
+def test_port_discovery_on_each_os(monkeypatch):
     ports = [_port("/dev/ttyACM0"), _port("/dev/cu.usbmodem101"), _port("/dev/tty.usbmodem101"),
-             _port("/dev/ttyACM1", "Arduino")]
+             _port("/dev/ttyACM1", "Arduino"),
+             _port("COM3", "Microsoft", vid=0x0451, pid=0xBEF1),  # Windows' own driver hides the maker's name
+             _port("COM4", "Microsoft", vid=0x0451, pid=0xF432)]  # a TI device that is not an RBR logger
     monkeypatch.setattr(cli.list_ports, "comports", lambda: ports)
     monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
-    assert cli.rbr_ports() == {"/dev/ttyACM0", "/dev/cu.usbmodem101", "/dev/tty.usbmodem101"}
+    assert cli.rbr_ports() == {"/dev/ttyACM0", "/dev/cu.usbmodem101", "/dev/tty.usbmodem101", "COM3"}
     monkeypatch.setattr(cli.platform, "system", lambda: "Darwin")
     assert cli.rbr_ports() == {"/dev/cu.usbmodem101"}
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    assert "COM3" in cli.rbr_ports() and "COM4" not in cli.rbr_ports()
+    assert cli._present("com3") == {"com3"} and cli._present("COM9") == set()
+    assert cli.port_info("COM3")["vid"] == "0x0451" and cli.port_info("COM3")["pid"] == "0xBEF1"
 
 
 def test_explicit_port_is_used_as_given(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "rbr_ports", lambda: set())
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
     dev = tmp_path / "ttyACM7"
     assert cli._present(str(dev)) == set()
     dev.touch()
     assert cli._present(str(dev)) == {str(dev)}
+    assert cli._present("socket://127.0.0.1:5000") == {"socket://127.0.0.1:5000"}
+
+
+def test_port_names_are_safe_in_file_names():
+    assert cli._port_name("/dev/cu.usbmodem101") == "usbmodem101" and cli._port_name("COM3") == "COM3"
+    assert cli._port_name("socket://127.0.0.1:5000") == "127.0.0.1_5000"
+    assert cli._port_name("\\\\.\\COM12") == "COM12"
+
+
+def test_missing_process_tools_do_not_crash(monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError("pgrep")
+    monkeypatch.setattr(cli.subprocess, "run", missing)
+    assert cli.ruskin_running() is False
 
 
 class _IdLink:
@@ -131,3 +153,57 @@ def test_transfers_pause_while_a_clock_is_timed():
     t.join(5)
     order = [name for name, _ in sorted(events, key=lambda e: e[1])]
     assert order == ["block1 start", "block1 end", "timing start", "timing end", "block2 start"]
+
+
+def _fake_ntp_server(offset_s):
+    """A local SNTP server whose clock is host + offset_s; returns (port, stop)."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(0.1)
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                data, addr = sock.recvfrom(512)
+            except OSError:
+                continue
+            t2 = time.time() + offset_s
+            reply = bytearray(48)
+            reply[0], reply[1] = 0x24, 1  # version 4, mode 4 (server); stratum 1
+            reply[24:32] = data[40:48]  # originate = the client's transmit timestamp
+            reply[32:40] = hostclock._to_ntp(t2)
+            reply[40:48] = hostclock._to_ntp(time.time() + offset_s)
+            sock.sendto(bytes(reply), addr)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return sock.getsockname()[1], stop
+
+
+def test_sntp_recovers_a_known_offset():
+    port, stop = _fake_ntp_server(0.250)
+    try:
+        r = hostclock.ntp_offset("127.0.0.1", port=port)
+    finally:
+        stop.set()
+    assert r["offset_s"] == pytest.approx(0.250, abs=0.005) and r["n"] == 4 and r["stratum"] == 1
+    assert 0 <= r["uncertainty_s"] < 0.005
+
+
+def test_sntp_offline_fails_fast():
+    t0 = time.monotonic()
+    r = hostclock.ntp_offset("no-such-host.invalid")
+    assert "cannot resolve" in r["error"] and time.monotonic() - t0 < 3.5
+
+
+def test_host_clock_resolution_is_sub_millisecond():
+    """Skew and clock setting rely on it (Python >= 3.13 on Windows: GetSystemTimePreciseAsFileTime)."""
+    deltas = []
+    last = time.time_ns()
+    while len(deltas) < 2000:
+        now = time.time_ns()
+        if now != last:
+            deltas.append(now - last)
+            last = now
+    assert min(deltas) < 1_000_000

@@ -293,3 +293,91 @@ class FakeConcerto3(FakePort):
             r[f"meminfo dataset {d}"] = (f"meminfo dataset = {d}, used = {len(blob)}, remaining = "
                                          f"{size - len(blob)}, size = {size}")
         return r
+
+
+# --- real transports: the simulated loggers behind a TCP socket (any OS) or a pseudo-terminal (POSIX), so the
+# code under test opens them with real pyserial (serial_for_url), not a replaced one.
+
+def serve_socket(fake: FakePort):
+    """Serve `fake` on 127.0.0.1: returns ("socket://127.0.0.1:<port>", stop). Accepts one client at a time,
+    again after each disconnect (so an offload can be resumed)."""
+    import socket
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(0.05)
+    stop = threading.Event()
+
+    def run():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            conn.settimeout(0.002)
+            with conn:
+                while not stop.is_set():
+                    try:
+                        data = conn.recv(4096)
+                        if not data:
+                            break  # the client closed the port
+                        fake.write(data)
+                    except TimeoutError:
+                        pass
+                    except OSError:
+                        break
+                    out = fake.read(65536)
+                    if out:
+                        try:
+                            conn.sendall(out)
+                        except OSError:
+                            break
+
+    fake.timeout = 0.002  # keep the relay loop responsive
+    t = threading.Thread(target=run, name=f"fake-socket-{fake.port}", daemon=True)
+    t.start()
+
+    def close():
+        stop.set()
+        t.join(2)
+        srv.close()
+
+    return f"socket://127.0.0.1:{srv.getsockname()[1]}", close
+
+
+def serve_pty(fake: FakePort):
+    """Serve `fake` on a pseudo-terminal (macOS/Linux): returns (slave device path, stop). pyserial opens the
+    path like a USB serial port: termios settings, exclusive flock, real read timeouts."""
+    import os
+    import select
+
+    master, slave = os.openpty()  # slave kept open so the master never reads EIO between clients
+    path = os.ttyname(slave)
+    stop = threading.Event()
+
+    def run():
+        while not stop.is_set():
+            ready, _, _ = select.select([master], [], [], 0.002)
+            if ready:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    fake.write(data)
+            out = fake.read(65536)
+            while out and not stop.is_set():
+                out = out[os.write(master, out):]
+
+    fake.timeout = 0.002  # keep the relay loop responsive
+    t = threading.Thread(target=run, name=f"fake-pty-{fake.port}", daemon=True)
+    t.start()
+
+    def close():
+        stop.set()
+        t.join(2)
+        os.close(master)
+        os.close(slave)
+
+    return path, close

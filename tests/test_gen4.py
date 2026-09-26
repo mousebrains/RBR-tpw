@@ -10,9 +10,9 @@ import time
 
 import numpy as np
 import pytest
-import serial
 
 from rbr_tpw import gen4
+from rbr_tpw import link as link_module
 from rbr_tpw.crc import crc16_ccitt
 from rbr_tpw.link import Link, LinkError, LoggerError
 
@@ -237,14 +237,17 @@ class FakeGen4:
 def port(monkeypatch):
     holder = {}
 
-    def open_port(name, baudrate=115200, timeout=None, exclusive=None):
+    def open_port(name, baudrate=115200):
         return holder["fake"]
 
-    monkeypatch.setattr(serial, "Serial", open_port)
+    monkeypatch.setattr(link_module, "open_serial", open_port)
 
     def connect(fake, tmp_path=None):
         holder["fake"] = fake
-        return Link("/dev/cu.gen4test", transcript=tmp_path / "t.log" if tmp_path else None)
+        link = Link("/dev/cu.gen4test")
+        if tmp_path:
+            link.start_transcript(tmp_path / "t.log")
+        return link
 
     return connect
 
