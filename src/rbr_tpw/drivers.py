@@ -289,7 +289,9 @@ class Gen3Driver(Driver):
             from .easyparse import decode_easyparse
         except ImportError as err:
             raise DecodeUnavailable("the EasyParse decoder is not installed yet") from err
-        ep = decode_easyparse(data["dataset1"], len(record["snapshot_before"]["channel_list"]),
+        # dataset 1 may be absent: events but no samples (a gated logger never activated). Live, download() gives
+        # b""; --rebuild only has the datasets the record lists, which are the non-empty ones.
+        ep = decode_easyparse(data.get("dataset1", b""), len(record["snapshot_before"]["channel_list"]),
                               data.get("dataset0") or None)
         warns = []
         if ep.trailing_bytes:

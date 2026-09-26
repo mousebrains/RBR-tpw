@@ -281,9 +281,13 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
         marker = int(top[i])
         size = 8 if marker == 0xF7 else 12 if marker == 0xF5 else (4 * body[b + 10] if b + 10 < len(body) else 0)
         if size < 8 or b + size > len(body):
-            if b + size > len(body):
-                is_reading[i:] = False  # truncated event at the very end
-                break
+            # A 0xF3 word with a bad length byte, or a record that would run past the end of the image. Signed
+            # readings can carry these top bytes, and a record that runs past the end cannot be CRC-checked, so
+            # the word is kept as a reading and counted like a CRC failure; what it leaves incomplete at the end
+            # is reported as trailing bytes. (Dropping everything from here on, as before, silently lost the tail
+            # of a record after one reading in about [-0.20, -0.12]; a truncated event at the very end is
+            # "extremely rare" per L3 ref 5.3.2, and costs at most one bogus final set.)
+            bad_markers += 1
             continue
         rec = body[b : b + size]
         if struct.unpack_from(">H", rec, 0)[0] != crc16_ccitt(rec[2:]):

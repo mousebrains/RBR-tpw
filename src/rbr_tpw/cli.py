@@ -664,6 +664,15 @@ def _shutdown(s: Settings, workers: dict[str, threading.Thread]):
         log.error("quit at once; interrupted: %s", busy)
         if "configuring" in busy:
             log.error("a logger was interrupted while being configured: check it (status, memory) before deploying")
+        # The workers are abandoned (daemon threads), so their own bookkeeping never runs: one blocked in
+        # run_in_main() with its NetCDF write queued would otherwise leave the exit status 0 (issue #9 item 4).
+        with _stages_lock:
+            interrupted = list(_stages.values())
+        for dev, what in interrupted:
+            if not any(f.startswith(f"{dev}:") for f in s.failed):
+                s.failed.append(f"{dev}: interrupted (Ctrl-C twice) while {what}")
+            if what == "configuring" and not any(r.startswith(f"{dev}:") for r in s.not_ready):
+                s.not_ready.append(f"{dev}: interrupted while being configured; check it before deploying")
         return
     log.info("Stopped.")
 

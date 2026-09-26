@@ -5,6 +5,9 @@ Protocol notes (RBRsolo fwtype 9, observed 2026-09-25 and in Ruskin 2.26.1 seria
   the logger then sends a "Ready: " prompt with no line ending, and a stale prompt
   can precede the next reply, so prompts are stripped wherever they appear.
 - Errors reply "E<4 digits> <text>".
+- A setting write is answered with the command text itself: `now = X`, `starttime = X`, `endtime = X` and
+  `sampling mode = M, period = P` all came back verbatim from SN100689 (2026-09-25 transcripts). Other writes
+  answer differently (`stop = stopped`, `permit = memclear`, `lock = off`, `powerstatus source = ...`).
 - `read data <dataset> <size> <offset>` replies "data <dataset> <size> <offset>\\r\\n",
   then <size> bytes, then a 2-byte CRC (see crc.py).
 - Gen3 (L3, fwtype 104) instead takes `readdata size = <s>, offset = <o>, dataset = <d>` and replies
@@ -33,6 +36,10 @@ ERROR_RE = re.compile(r"^E(\d{4})\b\s*(.*)$")
 DATA_HDR_RE = re.compile(rb"data (\d+) (\d+) (\d+)\r\n")
 L3_DATA_HDR_RE = re.compile(rb"readdata dataset = (\d+), size = (\d+), offset = (\d+)\r\n")
 DATA_ERR_RE = re.compile(rb"(E\d{4}[^\r\n]*)\r\n")
+# A reply line equal to the command is the logger's answer to a setting write (see the protocol notes). It is
+# taken as an echo, and skipped, only if another line follows within this long (a transport that echoes; none
+# of the RBR loggers do). Real write replies arrive 3-55 ms after the command; an echo would come sooner.
+ECHO_GRACE_S = 0.1
 
 
 class LinkError(Exception):
@@ -162,6 +169,8 @@ class Link:
         self._buf = b""
         self._send(cmd)
         deadline = time.monotonic() + timeout
+        echo: str | None = None  # a line equal to the command, and when to accept it as the reply
+        echo_deadline = 0.0
         while True:
             self._buf = PROMPT_RE.sub(b"", self._buf)
             m = LINE_RE.search(self._buf)
@@ -172,12 +181,19 @@ class Link:
                 line = m.group(1).decode("ascii", errors="replace").strip()
                 self._buf = self._buf[m.end():]
                 self._record("RX", line)
-                if line == cmd:  # an echo of the command (RBR loggers do not echo, but a terminal server may)
+                if line == cmd and echo is None:
+                    # The reply to a setting write on an RBR logger, or an echo from the transport: it is the
+                    # reply unless another line follows within ECHO_GRACE_S. Until d55d897 it was returned at
+                    # once; from d55d897 to 4944021 it was always skipped, which left every `--configure` write
+                    # waiting for a second line that never came (issue #9).
+                    echo, echo_deadline = line, time.monotonic() + ECHO_GRACE_S
                     continue
                 e = ERROR_RE.match(line)
                 if e:
                     raise LoggerError(cmd, e.group(1), e.group(2))
                 return line
+            if echo is not None and time.monotonic() >= echo_deadline:
+                return echo
             if time.monotonic() > deadline:
                 self.note(f"timeout after {timeout:g} s waiting for a reply to {cmd!r}; unparsed {_show(self._buf)}")
                 raise LinkError(f"timeout waiting for reply to {cmd!r} (buffer {self._buf[:80]!r})")

@@ -9,12 +9,14 @@ readings) and Gen3 EasyParse (dataset 1 records, dataset 0 events); transfers ca
 from __future__ import annotations
 
 import datetime as dt
+import re
 import struct
 import threading
 import time
 
 import numpy as np
 
+from rbr_tpw.configure import unlock_key
 from rbr_tpw.crc import crc16_ccitt
 
 MEMORY_SIZE = 132_120_576
@@ -205,6 +207,100 @@ class FakeSolo(FakePort):
             "meminfo": f"meminfo used = {used}, remaining = {MEMORY_SIZE - used}, size = {MEMORY_SIZE}",
             "powerstatus": power,
         }
+
+
+class FakeSoloWritable(FakeSolo):
+    """A FakeSolo that also takes the writes configure() sends, answering as SN100689 did on 2026-09-25
+    (output/raw/100689_20260925T2*.log): `now = X`, `starttime = X`, `endtime = X` and
+    `sampling mode = M, period = P` are answered with the command text itself; `stop`, `lock`, `permit`,
+    `powerstatus remaining`, `verify` and `enable` answer differently, and `memclear` gives only the prompt.
+    Writes need `lock OFF = <key>` first, keyed on the last `now` reply. The reply to a write while locked is
+    assumed (never seen from the logger: Ruskin always unlocks first)."""
+
+    E2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+
+    def __init__(self, port: str, **kw):
+        super().__init__(port, **kw)
+        self.state = {"status": "logging", "starttime": "20000101000010", "endtime": "20991231235959",
+                      "sampling": "mode = continuous, period = 500", "remaining": "1ACDF88", "used": len(self.image)}
+        self.locked = True
+        self.challenge: dt.datetime | None = None  # the last `now` reply, whole seconds
+        self.offset_s = 0.0  # written by `now = X`: logger clock minus host clock
+
+    def now(self) -> dt.datetime:
+        return super().now() + dt.timedelta(seconds=self.offset_s)
+
+    def replies(self):
+        r = super().replies()
+        st = self.state
+        r.update({
+            "status": f"status = {st['status']}",
+            "starttime": f"starttime = {st['starttime']}",
+            "endtime": f"endtime = {st['endtime']}",
+            "sampling": f"sampling {st['sampling']}",
+            "meminfo": f"meminfo used = {st['used']}, remaining = {MEMORY_SIZE - st['used']}, size = {MEMORY_SIZE}",
+            "powerstatus": f"powerstatus source = usb, int = 3634, remaining = {st['remaining']}",
+        })
+        return r
+
+    WRITES = ("stop", "now = ", "starttime = ", "endtime = ", "sampling mode", "powerstatus remaining = ",
+              "permit memclear", "memclear", "verify", "enable", "lock OFF = ", "lock on")
+
+    def _handle(self, cmd: str):
+        st = self.state
+        if cmd == "now":
+            self.commands.append(cmd)
+            self.challenge = self.now().replace(microsecond=0)
+            return self._reply(f"now = {self.challenge:%Y%m%d%H%M%S}")
+        if not cmd.startswith(self.WRITES):
+            return super()._handle(cmd)
+        self.commands.append(cmd)
+        if cmd.startswith("lock OFF = "):
+            secs = int((self.challenge - self.E2000).total_seconds()) if self.challenge else -1
+            self.locked = int(cmd.split("=")[1]) != unlock_key(self.serial, secs)
+            return self._reply("E0108" if self.locked else "lock = off")
+        if cmd == "lock on":
+            self.locked = True
+            return self._reply("lock = on")
+        if cmd == "verify":  # a read, in the L2 warning form: "E0401 , verify = logging" on SN100689
+            if st["used"]:
+                return self._reply(f"E0402 , verify = {st['status']}")
+            return self._reply("E0401 , verify = logging")
+        if self.locked:
+            return self._reply("E0102 invalid command")
+        if cmd == "stop":
+            if st["status"] not in ("logging", "pending"):
+                return self._reply(f"E0406 stop = {st['status']}")
+            st["status"] = "stopped"
+            return self._reply("stop = stopped")
+        if cmd.startswith("now = "):
+            t = dt.datetime.strptime(cmd[6:], "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC)
+            self.offset_s = t.timestamp() - time.time() - self.skew_s
+            return self._reply(cmd)
+        m = re.fullmatch(r"(starttime|endtime) = (\d{14})", cmd)
+        if m:
+            st[m.group(1)] = m.group(2)
+            return self._reply(cmd)
+        if cmd.startswith("sampling mode = "):
+            st["sampling"] = cmd.split(" ", 1)[1]
+            return self._reply(cmd)
+        if cmd.startswith("powerstatus remaining = "):
+            st["remaining"] = cmd.rsplit(" ", 1)[1]
+            return self._reply(f"powerstatus source = usb, int = 0, remaining = {st['remaining']}")
+        if cmd == "permit memclear":
+            return self._reply("permit = memclear")
+        if cmd == "memclear":
+            st["used"] = 0
+            with self._lock:
+                self._out += b"Ready: "  # no reply line, only the prompt
+            return
+        if cmd == "enable":
+            if st["used"]:
+                return self._reply("E0402 memory not empty, erase first")
+            st["used"] = 512
+            st["status"] = "logging" if st["starttime"] <= f"{self.now():%Y%m%d%H%M%S}" else "pending"
+            return self._reply("E0401 , enable = logging" if st["status"] == "logging" else "enable = pending")
+        return self._reply("E0102 invalid command")
 
 
 class FakeDuet(FakePort):
