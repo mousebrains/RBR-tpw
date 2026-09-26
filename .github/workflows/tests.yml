@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# One run per branch or PR: a new push to a PR cancels its superseded run. Runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
