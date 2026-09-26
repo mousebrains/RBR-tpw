@@ -43,9 +43,16 @@ jobs:
           .\setupc.exe --silent install PortName=COM20 PortName=COM21
           .\setupc.exe list
           Pop-Location
-          $ports = [System.IO.Ports.SerialPort]::GetPortNames()
+          # Windows finishes setting up each port's device in the background: wait for both to appear.
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Seconds 2
+            $ports = [System.IO.Ports.SerialPort]::GetPortNames()
+          } until (($ports -contains "COM20" -and $ports -contains "COM21") -or (Get-Date) -gt $deadline)
           Write-Host "COM ports: $ports"
-          if (-not ($ports -contains "COM20" -and $ports -contains "COM21")) { throw "COM20/COM21 were not created" }
+          Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -like "*com0com*" } |
+            Format-Table Status, Problem, FriendlyName, InstanceId -AutoSize | Out-String -Width 200 | Write-Host
+          if (-not ($ports -contains "COM20" -and $ports -contains "COM21")) { throw "COM20/COM21 did not appear" }
           "RBR_TPW_COM_PAIR=COM20,COM21" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - run: uv sync --dev
       - run: uv run ruff check src tests
