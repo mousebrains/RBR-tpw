@@ -44,22 +44,23 @@ def timing_critical(what: str = "") -> Iterator[None]:
     global _timing
     t0 = time.monotonic()
     with _TIMING_LOCK:
+        old = sys.getswitchinterval()
         with _quiet:
             _timing = True
-            while _transfers:
-                _quiet.wait()
-        waited = time.monotonic() - t0
-        if waited > 0.05:
-            log.debug("waited %.1f s for the timing lock and in-flight transfers (%s)", waited, what)
-        old = sys.getswitchinterval()
-        sys.setswitchinterval(min(old, 0.0005))
-        try:
+        try:  # everything after raising the flag is inside the try, so the flag is always lowered
+            with _quiet:
+                while _transfers:
+                    _quiet.wait()
+            waited = time.monotonic() - t0
+            if waited > 0.05:
+                log.debug("waited %.1f s for the timing lock and in-flight transfers (%s)", waited, what)
+            sys.setswitchinterval(min(old, 0.0005))
             yield
         finally:
-            sys.setswitchinterval(old)
-            with _quiet:
+            with _quiet:  # the flag first: downloads must never stay paused
                 _timing = False
                 _quiet.notify_all()
+            sys.setswitchinterval(old)
 
 
 NTP_TO_UNIX = 2_208_988_800  # seconds from 1900-01-01 (NTP era 0) to 1970-01-01

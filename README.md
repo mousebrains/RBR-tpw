@@ -59,6 +59,7 @@ with simulated loggers only so far.
 ```sh
 rbr-offload /path/to/data            # handle every logger plugged in, in parallel, until Ctrl-C
 rbr-offload /path/to/data --once     # the logger(s) connected now (or the first to appear), then exit
+                                     # (after a 3 s wait for any logger still being recognized)
 ```
 
 Each logger gets its own worker, so four loggers on a hub download at the same time. Console lines are
@@ -72,6 +73,8 @@ Ctrl-C stops each download after its current block; reconnecting the logger resu
 being configured finishes its configuration first, so it is never left erased but not logging. A second
 Ctrl-C quits at once and names anything it interrupted. A port already opened by another copy of
 `rbr-offload` is skipped.
+
+`rbr-offload` exits with status 2 if any logger ended NOT READY TO DEPLOY, e.g. after a failed `--configure`, so a script can tell.
 
 For each logger this writes:
 

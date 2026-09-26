@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .crc import crc16_ccitt
+from .rawbin import EPOCH2000_MS, RESET_CLOCK_BEFORE_MS
+
+EPOCH2100_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
 
 EVENT_SIZE = 16
 EVENT_MARKER = 0xF4
@@ -37,6 +40,8 @@ class EasyParse:
     events: list[tuple[int, int, int]] = field(default_factory=list)  # (logger-clock ms, type code, payload)
     trailing_bytes: int = 0  # bytes after the last whole record in dataset 1
     bad_events: int = 0  # dataset-0 records that failed the CRC or marker check (not in `events`)
+    clock_resets: int = 0  # places where the timestamps jump back to the reset clock (2000-01-01)
+    event_trailing_bytes: int = 0  # bytes after the last whole 16-byte record in dataset 0
 
 
 def record_dtype(nchan: int) -> np.dtype:
@@ -46,7 +51,9 @@ def record_dtype(nchan: int) -> np.dtype:
 def decode_easyparse(data1: bytes, nchan: int, data0: bytes | None = None) -> EasyParse:
     """Split dataset 1 into timestamped sample sets of `nchan` float32 values (and dataset 0 into events).
 
-    Raises ValueError if the timestamps show that `nchan` is wrong (they must never decrease).
+    Timestamps may jump back only to a clock that restarted at 2000-01-01 after a power loss (counted in
+    clock_resets; the NetCDF writer re-times the last such segment). Raises ValueError if the timestamps are
+    implausible or go backwards otherwise: then `nchan` is wrong or the data is corrupt.
     """
     if nchan < 1:
         raise ValueError("nchan must be >= 1")
@@ -55,10 +62,16 @@ def decode_easyparse(data1: bytes, nchan: int, data0: bytes | None = None) -> Ea
     rec = np.frombuffer(data1[: n * size], dtype=record_dtype(nchan))
     t = rec["t"].astype(np.int64)
     raw_f32 = rec["v"].reshape(n, nchan)
-    if n > 1 and (np.diff(t) < 0).any():
-        bad = int(np.flatnonzero(np.diff(t) < 0)[0])
-        raise ValueError(f"timestamps decrease at sample {bad + 1} of {n}: is nchan={nchan} right "
+    implausible = (rec["t"] < EPOCH2000_MS) | (rec["t"] >= EPOCH2100_MS)
+    if implausible.any():
+        bad = int(np.flatnonzero(implausible)[0])
+        raise ValueError(f"implausible timestamp at sample {bad + 1} of {n}: is nchan={nchan} right "
                          f"(record size {size} bytes)?")
+    back = np.flatnonzero(np.diff(t) < 0) + 1  # first sample after each backward step
+    not_reset = back[t[back] >= RESET_CLOCK_BEFORE_MS]
+    if not_reset.size:
+        raise ValueError(f"timestamps decrease at sample {int(not_reset[0])} of {n} to a time that is not a reset "
+                         f"clock: is nchan={nchan} right (record size {size} bytes)?")
     bits = raw_f32.view("<u4")
     isnan = np.isnan(raw_f32)
     error_codes = np.where(isnan, bits, 0).astype(np.uint32)
@@ -66,7 +79,8 @@ def decode_easyparse(data1: bytes, nchan: int, data0: bytes | None = None) -> Ea
         values = raw_f32.astype(np.float64)
     events, bad = decode_events(data0) if data0 is not None else ([], 0)
     return EasyParse(time_ms=t, values=values, error_codes=error_codes, events=events,
-                     trailing_bytes=len(data1) - n * size, bad_events=bad)
+                     trailing_bytes=len(data1) - n * size, bad_events=bad, clock_resets=int(back.size),
+                     event_trailing_bytes=len(data0) % EVENT_SIZE if data0 is not None else 0)
 
 
 def event_ok(rec: bytes) -> bool:

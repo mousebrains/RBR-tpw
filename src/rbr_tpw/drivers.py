@@ -276,8 +276,15 @@ class Gen3Driver(Driver):
             raise DecodeUnavailable("the EasyParse decoder is not installed yet") from err
         ep = decode_easyparse(data["dataset1"], len(record["snapshot_before"]["channel_list"]),
                               data.get("dataset0") or None)
+        warns = record.setdefault("warnings", [])
         if ep.trailing_bytes:
-            record.setdefault("warnings", []).append(f"{ep.trailing_bytes} trailing bytes in dataset 1 were ignored")
+            warns.append(f"{ep.trailing_bytes} trailing bytes in dataset 1 were ignored")
+        if ep.event_trailing_bytes:
+            warns.append(f"{ep.event_trailing_bytes} trailing bytes in dataset 0 (events) were ignored")
+        if ep.bad_events:
+            warns.append(f"{ep.bad_events} event records failed their CRC or marker check and were ignored")
+        if ep.clock_resets:
+            warns.append(f"the logger's clock restarted {ep.clock_resets} time(s) during the deployment")
         return write_engineering(
             ep.time_ms, ep.values, ep.error_codes, ep.events, record, path,
             values_comment="Engineering value as stored by the logger (Gen3 EasyParse, L3 command reference 5.2).",
