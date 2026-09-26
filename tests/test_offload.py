@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+import types
 
 import netCDF4
 import numpy as np
@@ -177,7 +178,9 @@ def test_stop_between_blocks_then_resume(rig, monkeypatch):
 def test_configure_is_skipped_once_stopping(rig):
     s = rig.settings(deploy=DeployConfig())
     s.stop.set()
-    assert cli._configure_step(object(), s, {}, {}, "1", "x") == {"skipped": "stopping"}
+    link = types.SimpleNamespace(port="/dev/cu.stopping")
+    assert cli._configure_step(link, s, {}, {}, "1", "x") == {"skipped": "stopping"}
+    assert "not configured" in cli._not_ready.pop(link.port)  # a requested configure that did not happen
 
 
 def test_console_asks_one_question_at_a_time():

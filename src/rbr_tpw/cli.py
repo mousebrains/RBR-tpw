@@ -75,12 +75,15 @@ class Settings:
     session_log: Path | None = None
     stop: threading.Event = field(default_factory=threading.Event)  # Ctrl-C
     configured: set[str] = field(default_factory=set)  # serial numbers configured this session (never twice)
+    configure_failed: set[str] = field(default_factory=set)  # serial numbers whose configure failed this session
     not_ready: list[str] = field(default_factory=list)  # loggers that ended NOT READY TO DEPLOY this session
+    failed: list[str] = field(default_factory=list)  # loggers whose offload or NetCDF failed this session
 
 
 _stages: dict[str, tuple[str, str]] = {}  # port -> (device label, what its worker is doing)
 _stages_lock = threading.Lock()
 _not_ready: dict[str, str] = {}  # port -> why its logger must not be deployed (configure failed or not logging)
+_failed: dict[str, str] = {}  # port -> why its offload is incomplete (no download, or no NetCDF when one was due)
 
 
 def _stage(port: str, what: str | None):
@@ -285,12 +288,25 @@ def _time_checks(sn: str, label: str, rem: dict | None, v: float, s: Settings) -
     return out
 
 
+def _configure_state(done: list[str]) -> str:
+    """What a failed configure did to the logger, from its step report ("x_sent" without "x": unconfirmed)."""
+    def said(step: str, yes: str, maybe: str, no: str | None) -> str | None:
+        return yes if step in done else maybe if f"{step}_sent" in done else no
+
+    parts = [said("erase", "MEMORY WAS ERASED", "MEMORY MAY HAVE BEEN ERASED (sent, not confirmed)",
+                  "memory not erased"),
+             said("stop", "logging was stopped", "logging may have been stopped", None),
+             said("enable", "logging was enabled (a later step failed)", "logging may have been enabled", None)]
+    return ", ".join(p for p in parts if p)
+
+
 def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, erase_note: str,
                     driver: Driver | None = None) -> dict:
     cfg = s.deploy
     if driver is not None and not driver.configurable:
         log.warning("--configure is implemented only for RBRsolo fwtype 9 so far; SN%s (fwtype %s) was offloaded "
                     "but not changed", sn, driver.fwtype)
+        _not_ready[link.port] = f"not configured: --configure is not supported for fwtype {driver.fwtype}"
         return {"skipped": f"configure not supported for fwtype {driver.fwtype}"}
     plan = []
     if cfg.set_clock:
@@ -311,15 +327,22 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     if sn in s.configured:
         log.warning("SN%s was already configured in this session; not configuring it again (it may have been "
                     "unplugged and replugged). Restart rbr-offload to configure it again.", sn)
+        if snap.get("status") not in ("logging", "pending"):
+            _not_ready[link.port] = f"configured earlier in this session, but its status is now '{snap.get('status')}'"
         return {"skipped": "already configured in this session"}
     if s.stop.is_set():
         log.warning("stopping (Ctrl-C): configuration skipped; logger unchanged")
+        _not_ready[link.port] = "not configured: stopped (Ctrl-C) first; logger unchanged"
         return {"skipped": "stopping"}
+    if sn in s.configure_failed:  # safe to retry: the offload above saved whatever the logger held
+        log.warning("SN%s: configure failed earlier in this session; trying again (its memory was downloaded and "
+                    "saved again first)", sn)
     if not s.assume_yes:
         answer = s.console.ask(f"  [{DEVICE.get()}] configure SN{sn} as above? [y/N] ")
         log.info("operator answered %r", answer)
         if answer.strip().lower() not in ("y", "yes"):
             log.info("configuration skipped; logger unchanged")
+            _not_ready[link.port] = "not configured: the operator declined; logger unchanged"
             return {"skipped": True}
     _stage(link.port, "configuring")
     try:
@@ -333,8 +356,8 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
             status = link.query("status")["status"]
         except Exception:  # the link itself may be what failed
             status = "unknown"
-        state = ("MEMORY WAS ERASED" if "erase" in done else "memory not erased") + (
-            ", logging was stopped" if "stop" in done else "")
+        state = _configure_state(done)
+        s.configure_failed.add(sn)
         _not_ready[link.port] = f"configure failed ({state}; status now {status})"
         alarm([f"SN{sn}: CONFIGURE FAILED: {err}",
                f"SN{sn}: {state}; status is now '{status}'. DO NOT DEPLOY until it is configured and logging."], s)
@@ -388,7 +411,9 @@ def offload(port: str, s: Settings) -> Path | None:
         log.debug("serial transcript: %s", link.transcript_path)
         driver = driver_for(ident["fwtype"])
         if driver is None:
-            log.info("fwtype %s is not supported yet; skipping, nothing was changed on the logger.", ident["fwtype"])
+            log.error("fwtype %s is not supported yet; nothing downloaded, nothing changed on the logger",
+                      ident["fwtype"])
+            _failed[port] = f"fwtype {ident['fwtype']} is not supported; nothing downloaded"
             return None
         log.debug("driver: %s (%s)", type(driver).__name__, driver.family)
 
@@ -496,6 +521,8 @@ def offload(port: str, s: Settings) -> Path | None:
         how = "no decoder yet" if isinstance(err, DecodeUnavailable) else f"{type(err).__name__}"
         log.warning("NetCDF not written (%s: %s). The download is saved; convert it later with: "
                     "rbr-offload %s --rebuild %s", how, err, s.outdir, rawdir / f"{stem}.json")
+        if not isinstance(err, DecodeUnavailable):  # no decoder yet: the saved download is the intended result
+            _failed[port] = f"download saved, but NetCDF not written ({how}: {err})"
         log.debug("NetCDF traceback", exc_info=True)
         return None
     log.info("%d samples written%s", len(t_ms),
@@ -517,23 +544,31 @@ def _worker(port: str, s: Settings):
         offload(port, s)
     except Stopped:
         log.warning("download stopped (Ctrl-C) after a complete block; reconnect the logger to resume it")
+        _failed[port] = "download stopped (Ctrl-C) before it was complete"
     except serial.SerialException as err:
         if "exclusively lock" in str(err) or "Access is denied" in str(err) or "PermissionError" in str(err):
+            # not a failure: another rbr-offload (one per logger is supported) has this port
             log.info("%s is in use by another program (another rbr-offload?); skipped", port)
         else:
             log.error("serial port error: %s", err)
             log.debug("traceback", exc_info=True)
+            _failed[port] = f"serial port error: {err}"
     except Exception as err:
         log.error("%s: %s", type(err).__name__, err)
         log.debug("traceback", exc_info=True)
         log.info("A partial download resumes if you reconnect the logger. Details in %s",
                  s.session_log or "the serial transcript")
+        _failed[port] = f"{type(err).__name__}: {err}"
     finally:
         _stage(port, None)
-        reason = _not_ready.pop(port, None)
+        failed, reason = _failed.pop(port, None), _not_ready.pop(port, None)
+        if failed:
+            s.failed.append(f"{DEVICE.get()}: {failed}")
         if reason:
             s.not_ready.append(f"{DEVICE.get()}: {reason}")
             log.error("done with %s: disconnect it, but it is NOT READY TO DEPLOY: %s", port, reason)
+        elif failed:
+            log.error("done with %s: disconnect it; OFFLOAD INCOMPLETE: %s", port, failed)
         else:
             log.info("done with %s: disconnect the logger", port)
 
@@ -603,6 +638,50 @@ def _shutdown(s: Settings, workers: dict[str, threading.Thread]):
             log.error("a logger was interrupted while being configured: check it (status, memory) before deploying")
         return
     log.info("Stopped.")
+
+
+class RebuildError(Exception):
+    pass
+
+
+def _rebuild(rec_path: Path, outdir: Path):
+    """NetCDF from one saved offload record (raw/SN_time.json) and its raw files."""
+    record = json.loads(rec_path.read_text())
+    if not isinstance(record, dict) or "fwtype" not in (record.get("id") or {}):
+        kind = "a configure report" if isinstance(record, dict) and "steps" in record else "not an offload record"
+        log.info("%s: %s; skipped", rec_path, kind)
+        return
+    driver = driver_for(int(record["id"]["fwtype"]))
+    if driver is None:
+        raise RebuildError(f"fwtype {record['id']['fwtype']} is not supported")
+    data = {}
+    datasets = record.get("datasets") or ({"dataset1": record["raw"]} if record.get("raw") else {})
+    if not datasets:
+        log.warning("%s: the logger's memory was empty at this offload; nothing to rebuild", rec_path)
+        return
+    for name, info in datasets.items():
+        rel = Path(info["file"])
+        if rel.is_absolute() or ".." in rel.parts:  # only files beside the record or in its raw/ folder
+            raise RebuildError(f"refusing raw file path {info['file']!r}")
+        # recorded as raw/<file> relative to OUTDIR; also accept the file beside a moved record
+        where = [rec_path.parent.parent / rel, rec_path.parent / rel.name]
+        found = next((w for w in where if w.is_file()), None)
+        if found is None:
+            raise RebuildError(f"{info['file']} not found (looked in {', '.join(map(str, where))})")
+        blob = found.read_bytes()
+        if sha256(blob) != info["sha256"]:
+            raise RebuildError(f"{info['file']} checksum does not match the record")
+        data[name] = blob
+    nc_path = outdir / (rec_path.stem + ".nc")
+    try:
+        warnings, _ = driver.write_netcdf(data, record, nc_path)
+    except DecodeUnavailable as err:  # the saved download is all there is for now: not a failure
+        log.warning("%s: not written: %s", rec_path, err)
+        return
+    for w in warnings:
+        if w not in record.get("warnings", []):
+            log.warning("%s: %s", rec_path.name, w)
+    log.info("wrote %s", nc_path)
 
 
 def main(argv=None):
@@ -682,36 +761,17 @@ def main(argv=None):
     console = Console()
     if args.rebuild:
         setup_logging(console)
+        failed = []
         for rec_path in args.rebuild:
-            record = json.loads(rec_path.read_text())
-            driver = driver_for(int(record["id"]["fwtype"]))
-            if driver is None:
-                sys.exit(f"{rec_path}: fwtype {record['id']['fwtype']} is not supported")
-            data = {}
-            datasets = record.get("datasets") or ({"dataset1": record["raw"]} if record.get("raw") else {})
-            if not datasets:
-                log.warning("%s: the logger's memory was empty at this offload; nothing to rebuild", rec_path)
-                continue
-            for name, info in datasets.items():
-                rel = Path(info["file"])
-                if rel.is_absolute() or ".." in rel.parts:  # only files beside the record or in its raw/ folder
-                    sys.exit(f"{rec_path}: refusing raw file path {info['file']!r}")
-                # recorded as raw/<file> relative to OUTDIR; also accept the file beside a moved record
-                where = [rec_path.parent.parent / rel, rec_path.parent / rel.name]
-                found = next((w for w in where if w.is_file()), None)
-                if found is None:
-                    sys.exit(f"{rec_path}: {info['file']} not found (looked in {', '.join(map(str, where))})")
-                blob = found.read_bytes()
-                if sha256(blob) != info["sha256"]:
-                    sys.exit(f"{rec_path}: {info['file']} checksum does not match the record")
-                data[name] = blob
-            nc_path = args.outdir / (rec_path.stem + ".nc")
             try:
-                driver.write_netcdf(data, record, nc_path)
-            except DecodeUnavailable as err:
-                log.warning("%s: not written: %s", rec_path, err)
-                continue
-            log.info("wrote %s", nc_path)
+                _rebuild(rec_path, args.outdir)
+            except (RebuildError, OSError, ValueError, KeyError) as err:  # report it, and go on to the next
+                why = str(err) if isinstance(err, RebuildError) else f"{type(err).__name__}: {err}"
+                log.error("%s: NOT rebuilt: %s", rec_path, why)
+                log.debug("rebuild traceback", exc_info=True)
+                failed.append(f"{rec_path}: {why}")
+        if failed:
+            sys.exit(f"{len(failed)} of {len(args.rebuild)} record(s) not rebuilt: " + "; ".join(failed))
         return
     rawdir = args.outdir / "raw"
     rawdir.mkdir(exist_ok=True)
@@ -729,9 +789,14 @@ def main(argv=None):
     except Exception:
         log.critical("unexpected error; stopping", exc_info=True)
         raise
-    if s.not_ready:  # scripts (e.g. with --yes) can tell that a logger must not be deployed
+    # exit status bits, so scripts (e.g. with --once --yes) can tell: 1 an offload or its NetCDF failed,
+    # 2 a logger must not be deployed (configure failed, skipped or declined, or it is not logging)
+    if s.failed:
+        log.error("%d OFFLOAD(S) INCOMPLETE: %s", len(s.failed), "; ".join(s.failed))
+    if s.not_ready:
         log.error("%d logger(s) NOT READY TO DEPLOY: %s", len(s.not_ready), "; ".join(s.not_ready))
-        sys.exit(2)
+    if s.failed or s.not_ready:
+        sys.exit((1 if s.failed else 0) | (2 if s.not_ready else 0))
 
 
 if __name__ == "__main__":

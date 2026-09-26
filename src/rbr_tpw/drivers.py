@@ -28,7 +28,7 @@ import numpy as np
 from . import solo
 from .link import Link, LoggerError
 from .ncwrite import ChannelValues, write_netcdf, write_values_netcdf
-from .rawbin import FLAG_ERROR_CODE, reset_segments
+from .rawbin import FLAG_ERROR_CODE, event_indices, reset_segments
 
 STATUS_HIDDEN = 0x01  # channelStatus bits (L3 ref; RBR's pyRSKtools)
 STATUS_NOT_STORED = 0x04
@@ -45,6 +45,13 @@ def _q(link: Link, cmd: str) -> dict:
     except LoggerError as err:
         link.note(f"{cmd!r} not available on this logger: {err}")
         return {}
+
+
+def _iso_ms(ms: int | None) -> str:
+    """Unix ms -> ISO-8601 UTC ('' if absent or zero)."""
+    if not ms:
+        return ""
+    return dt.datetime.fromtimestamp(ms / 1000, dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _iso(compact: str | None) -> str:
@@ -80,12 +87,16 @@ def _no_energy(pwr: dict, comment: str) -> dict:
 
 def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.ndarray,
                       events: list[tuple[int, int, int]], record: dict, path: Path, values_comment: str,
-                      flag_comment: str) -> tuple[list[str], np.ndarray]:
+                      flag_comment: str, channels: list[dict] | None = None) -> tuple[list[str], np.ndarray]:
     """NetCDF from engineering values the logger stored with a timestamp per sample (Gen3 EasyParse, Gen4).
-    `events` are (logger-clock ms, type, payload)."""
+    `events` are (logger-clock ms, type, payload). `channels` describe the columns of `values` in order
+    (default: the snapshot's channel_list)."""
     snap = record["snapshot_before"]
-    chans = snap["channel_list"]
-    ev = [(int(ms), int(typ), int(np.searchsorted(time_ms, ms))) for ms, typ, _ in events]
+    chans = snap["channel_list"] if channels is None else channels
+    if values.shape[1] != len(chans):
+        raise ValueError(f"{values.shape[1]} data columns but {len(chans)} channel descriptions")
+    ev = [(int(ms), int(typ), i) for (ms, typ, _), i in
+          zip(events, event_indices(time_ms, [int(e[0]) for e in events]), strict=True)]
     tflags, segment = reset_segments(time_ms, ev)
     cvs = []
     for k, c in enumerate(chans):
@@ -276,7 +287,7 @@ class Gen3Driver(Driver):
             raise DecodeUnavailable("the EasyParse decoder is not installed yet") from err
         ep = decode_easyparse(data["dataset1"], len(record["snapshot_before"]["channel_list"]),
                               data.get("dataset0") or None)
-        warns = record.setdefault("warnings", [])
+        warns = []
         if ep.trailing_bytes:
             warns.append(f"{ep.trailing_bytes} trailing bytes in dataset 1 were ignored")
         if ep.event_trailing_bytes:
@@ -285,6 +296,8 @@ class Gen3Driver(Driver):
             warns.append(f"{ep.bad_events} event records failed their CRC or marker check and were ignored")
         if ep.clock_resets:
             warns.append(f"the logger's clock restarted {ep.clock_resets} time(s) during the deployment")
+        # a copy: the caller's record already went to the JSON file, and it prints what is new in the result
+        record = {**record, "warnings": [*record.get("warnings", []), *warns]}
         return write_engineering(
             ep.time_ms, ep.values, ep.error_codes, ep.events, record, path,
             values_comment="Engineering value as stored by the logger (Gen3 EasyParse, L3 command reference 5.2).",
@@ -327,11 +340,24 @@ class Gen4Driver(Driver):
         return self.g.download(link, part_dir, sn, progress)
 
     def write_netcdf(self, data, record, path):
-        time_ms, values, error_codes, events = self.g.decode(data, record["snapshot_before"])
+        snap = record["snapshot_before"]
+        ds, sch, cols, _, _ = self.g.columns(data, snap)
+        time_ms, values, error_codes, events = self.g.decode(data, snap, ds, sch)
+        # the columns as the dataset's own metadata describes them, not the logger's current channel list
+        channels = [{"index": c["index"], "type": c.get("type", ""), "label": c.get("label", ""),
+                     "userunits": c.get("userunits", ""), "status": STATUS_HIDDEN if c.get("hidden") else 0,
+                     "equation": c.get("equation", ""), "coefficients": c.get("coefficients", {}),
+                     "calibration_datetime": _iso_ms(c.get("calibration_ms"))} for c in cols]
+        others = sorted(k[: -len("/data")] for k, v in data.items()
+                        if k.endswith("/data") and v and k != f"{ds}/{sch}/data")
+        warns = [f"this NetCDF holds dataset {ds} schedule {sch} only; also downloaded but NOT converted: "
+                 f"{', '.join(others)} (saved in raw/)"] if others else []
+        record = {**record, "warnings": [*record.get("warnings", []), *warns]}
         return write_engineering(time_ms, values, error_codes, events, record, path,
                                  values_comment="Engineering value as stored by the logger (Gen4, L3.5 reference "
                                                 "section 4.2; decoder untested on a real logger).",
-                                 flag_comment="logger_error_code: the logger stored a NaN error code for this reading.")
+                                 flag_comment="logger_error_code: the logger stored a NaN error code for this reading.",
+                                 channels=channels)
 
 
 def driver_for(fwtype: int) -> Driver | None:
