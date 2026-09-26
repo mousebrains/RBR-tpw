@@ -169,6 +169,8 @@ def download(link: Link, total: int, part_path: Path, progress=None, dataset: in
     """
     head_len = min(512, total)
     head = link.read_data(dataset, head_len, 0, l3=l3)
+    if len(head) != head_len:  # it is written at offset 0 and the next block read from head_len
+        raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
     if part_path.exists():
         with open(part_path, "rb") as f:
             old_head = f.read(head_len)

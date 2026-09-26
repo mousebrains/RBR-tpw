@@ -60,7 +60,7 @@ jobs:
             Format-Table Status, Problem, FriendlyName, InstanceId -AutoSize | Out-String -Width 200 | Write-Host
           if (-not ($ports -contains "COM20" -and $ports -contains "COM21")) { throw "COM20/COM21 did not appear" }
           "RBR_TPW_COM_PAIR=COM20,COM21" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - run: uv sync --dev
+      - run: uv sync --locked --dev
       - name: Serial ports as pyserial lists them (Windows)
         if: runner.os == 'Windows'
         run: uv run python -m serial.tools.list_ports -v

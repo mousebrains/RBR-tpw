@@ -301,11 +301,15 @@ def clock_runs(time_ms: np.ndarray) -> np.ndarray:
     return np.concatenate(([0], np.flatnonzero(np.diff(time_ms) < 0) + 1)).astype(np.int64)
 
 
+EVENT_JITTER_MS = 60_000  # events in acquisition order may step back a little: 1.7 s seen in a Gen3 .rsk
+
+
 def event_indices(time_ms: np.ndarray, event_ms: list[int]) -> list[int]:
     """Index of the sample each event precedes, for events listed in acquisition order (Gen3 dataset 0, Gen4
-    events). np.searchsorted over the whole record is wrong once the clock has gone back: each event is placed
-    within one run of increasing sample times, moving to a later run when event times step back (a restart)
-    or an event on the reset clock follows samples on a set clock."""
+    events, .rsk rowid order). np.searchsorted over the whole record is wrong once the clock has gone back: each
+    event is placed within one run of increasing sample times. It moves to a later run when it is on the reset
+    clock and either follows samples on a set clock or steps back by more than EVENT_JITTER_MS (a restart);
+    smaller steps back are ordinary event jitter."""
     n = time_ms.size
     if not n:
         return [0] * len(event_ms)
@@ -313,7 +317,7 @@ def event_indices(time_ms: np.ndarray, event_ms: list[int]) -> list[int]:
     last = len(starts) - 2
     r, prev, out = 0, None, []
     for e in event_ms:
-        if prev is not None and e < prev and r < last:
+        if prev is not None and e < min(prev - EVENT_JITTER_MS, RESET_CLOCK_BEFORE_MS) and r < last:
             r += 1
         while e < RESET_CLOCK_BEFORE_MS <= time_ms[starts[r]] and r < last:
             r += 1
@@ -324,7 +328,7 @@ def event_indices(time_ms: np.ndarray, event_ms: list[int]) -> list[int]:
             i = b  # the clock restarted after this run and no sample followed
         else:
             i = a + int(np.searchsorted(time_ms[a:b], e))
-        out.append(max(i, out[-1]) if out else i)
+        out.append(i)  # not forced to increase: an event's own time places it, and events jitter (see above)
         prev = e
     return out
 
@@ -397,7 +401,8 @@ def resolve_time_arrays(
             else:
                 shifted = t[fix] - int(round(1000 * skew_s))
                 prev_ok = i0 == 0 or reset[i0 - 1] or shifted[0] > t[i0 - 1]
-                if shifted[-1] <= offload_unix_ms + 5000 and prev_ok:
+                # still before 2001 after the shift: the skew was measured on a clock set since the reset
+                if shifted[-1] <= offload_unix_ms + 5000 and prev_ok and shifted[0] >= RESET_CLOCK_BEFORE_MS:
                     t[fix] = shifted
                     tf[fix] |= TFLAG_SKEW_CORRECTED
                     notes.append(f"{int(fix.sum())} samples after a clock reset were re-timed by subtracting the "

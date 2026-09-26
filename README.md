@@ -61,7 +61,8 @@ with simulated loggers only so far.
 ```sh
 rbr-offload /path/to/data            # handle every logger plugged in, in parallel, until Ctrl-C
 rbr-offload /path/to/data --once     # the logger(s) connected now (or the first to appear), then exit
-                                     # (after a 3 s wait for any logger still being recognized)
+                                     # (it waits 3 s after the last logger finishes, in case another
+                                     # is still being recognized)
 ```
 
 Each logger gets its own worker, so four loggers on a hub download at the same time. Console lines are
@@ -82,7 +83,8 @@ So that a script can tell, `rbr-offload` exits with status bits set:
   failed or was stopped, or its NetCDF was not written. A logger without a decoder yet doesn't count, since
   its saved download is all there is to get.
 - 2 means a logger ended NOT READY TO DEPLOY. That covers a `--configure` that failed, was skipped (a model it
-  doesn't support, or Ctrl-C) or was declined, and a logger that isn't logging afterwards.
+  doesn't support, or Ctrl-C) or was declined, and a logger that isn't logging afterwards, including one
+  configured with `--no-enable`.
 
 A run where both happen exits with 3.
 
@@ -176,7 +178,8 @@ rbr-offload DIR --configure deploy.yaml --used-battery 14/50   # a cell with 14 
 before changing each logger (`--yes` skips the question). It then:
 
 1. stops logging,
-2. sets the clock to UTC, aligned to the second and checked afterwards,
+2. sets the clock to UTC, aligned to the second and checked afterwards. Without NTP it uses the host clock.
+   With `--no-ntp` it says so in the plan; if NTP was asked for but failed, it also gives a loud warning,
 3. optionally resets the battery energy counter: `--fresh-battery` when a new cell was installed, or
    `--used-battery USED/LIFE` for a cell already used elsewhere, e.g. `14/50` for 14 days used of an expected
    50-day life in that instrument. The counter is set to (LIFE − USED)/LIFE of a new cell, so the energy
@@ -190,12 +193,15 @@ before changing each logger (`--yes` skips the question). It then:
 If any step fails, or the logger isn't logging (or pending) afterwards, you get a loud alarm saying whether
 memory was erased. If the reply to the erase was lost, it says the memory may have been erased. The final line then reads "NOT READY TO DEPLOY" instead of just "disconnect".
 `--no-erase` is refused when memory holds data and logging would be enabled, because the logger itself
-refuses that; use it with `--no-enable` to change settings only. A logger is configured at most once per run,
+refuses that; use it with `--no-enable` to change settings only. A logger left stopped that way is reported
+NOT READY. The schedule options (`--period-ms`, `--start`, `--end`) are checked before any logger is touched.
+If a logger is still logging during its download, the plan says how many bytes it logged since then. Those
+bytes are not in the download and the erase removes them. A logger is configured at most once per run,
 so unplugging and replugging it won't erase it again. The exception is a logger whose configure failed:
 reconnecting it tries again. The offload that runs first saves whatever that logger holds.
 
-Settings can live in a YAML file (`--config settings.yaml`, or `--configure settings.yaml`); command-line
-options override it. See [deploy.example.yaml](https://github.com/mousebrains/RBR-tpw/blob/main/deploy.example.yaml):
+Settings can live in a YAML file (`--config settings.yaml`, or `--configure settings.yaml`, but not both);
+command-line options override it. See [deploy.example.yaml](https://github.com/mousebrains/RBR-tpw/blob/main/deploy.example.yaml):
 
 ```yaml
 thresholds:

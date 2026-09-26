@@ -30,7 +30,7 @@ import yaml
 from serial.tools import list_ports
 
 from . import __version__
-from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure
+from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure, validate
 from .console import DEVICE, Console, setup_logging
 from .drivers import DecodeUnavailable, Driver, driver_for
 from .hostclock import ntp_offset, timing_critical
@@ -61,7 +61,10 @@ class Thresholds:
         unknown = set(data) - {"min_battery_voltage", "min_days"}
         if unknown:
             raise ConfigError(f"{path}: unknown thresholds {sorted(unknown)}")
-        return cls(**data)
+        for k, v in data.items():  # checked here: a string would only fail at the first offload, mid-way
+            if (v is None and k != "min_days") or isinstance(v, bool) or not isinstance(v, int | float | None):
+                raise ConfigError(f"{path}: thresholds.{k} must be a number, not {v!r}")
+        return cls(**{k: float(v) if v is not None else None for k, v in data.items()})
 
 
 @dataclass
@@ -309,8 +312,10 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
         _not_ready[link.port] = f"not configured: --configure is not supported for fwtype {driver.fwtype}"
         return {"skipped": f"configure not supported for fwtype {driver.fwtype}"}
     plan = []
+    no_ntp = ntp.get("offset_s") is None
     if cfg.set_clock:
-        plan.append("set clock to UTC" if ntp.get("offset_s") is not None else "set clock to host time (NTP failed)")
+        plan.append("set clock to UTC" if not no_ntp else "set clock to HOST time (" + (
+            f"NTP failed: {ntp.get('error')}" if s.ntp_server else "--no-ntp") + ")")
     battery = cfg.battery_fraction()
     if battery == 1:
         plan.append("reset battery counter to a fresh cell")
@@ -324,6 +329,9 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     if cfg.enable:
         plan.append("enable logging")
     log.info("configure SN%s: %s", sn, "; ".join(plan))
+    if cfg.set_clock and no_ntp and s.ntp_server:  # asked for UTC, getting the unchecked host clock: say it loudly
+        log.warning("SN%s: THE CLOCK WILL BE SET FROM THE HOST CLOCK, NOT CHECKED AGAINST UTC (NTP failed: %s)",
+                    sn, ntp.get("error"), extra={"banner": True})
     if sn in s.configured:
         log.warning("SN%s was already configured in this session; not configuring it again (it may have been "
                     "unplugged and replugged). Restart rbr-offload to configure it again.", sn)
@@ -347,7 +355,7 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     _stage(link.port, "configuring")
     try:
         # Runs to the end even after Ctrl-C: stopping between erase and enable would leave the logger idle.
-        report = configure(link, int(sn), cfg, ntp.get("offset_s") or 0.0, log=log.info, timing=timing_critical)
+        report = configure(link, int(sn), cfg, ntp.get("offset_s"), log=log.info, timing=timing_critical)
     except (ConfigError, LinkError) as err:
         log.error("CONFIGURE FAILED: %s", err)
         log.debug("configure traceback", exc_info=True)
@@ -367,12 +375,16 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     if cfg.enable and rb["status"] not in ("logging", "pending"):
         _not_ready[link.port] = f"status is '{rb['status']}' after enable"
         alarm([f"SN{sn}: STATUS IS '{rb['status']}' AFTER ENABLE, NOT LOGGING OR PENDING. DO NOT DEPLOY."], s)
+    elif not cfg.enable and rb["status"] not in ("logging", "pending"):
+        _not_ready[link.port] = f"not enabled (--no-enable); status '{rb['status']}'"
+        log.warning("SN%s: configured but not enabled (--no-enable): status '%s', it is not logging", sn,
+                    rb["status"])
     clk = rb["clock"]
     off = ntp.get("offset_s") or 0.0
     log.info("now: status %s, %s %s ms, start %s, end %s, memory used %s B, battery %.3f V / %.0f J, "
-             "clock %+.1f ms vs UTC", rb["status"], rb["sampling"].get("mode"), rb["sampling"].get("period"),
+             "clock %+.1f ms vs %s", rb["status"], rb["sampling"].get("mode"), rb["sampling"].get("period"),
              rb["starttime"], rb["endtime"], rb["meminfo"]["used"], rb["power"]["battery_voltage_V"],
-             rb["power"]["energy_remaining_J"], 1e3 * (clk["skew_vs_host_s"] - off))
+             rb["power"]["energy_remaining_J"], 1e3 * (clk["skew_vs_host_s"] - off), "host" if no_ntp else "UTC")
 
     rem = _remaining(snap, rb["meminfo"], rb["power"], int(rb["sampling"].get("period", 0) or 0), driver or
                      driver_for(9))
@@ -420,6 +432,9 @@ def offload(port: str, s: Settings) -> Path | None:
         _stage(port, "NTP query")
         ntp = _ntp(s.ntp_server) if s.ntp_server else {"error": "disabled"}
         log.debug("host NTP: %s", ntp)
+        if s.ntp_server and ntp.get("offset_s") is None:
+            log.warning("NTP query to %s failed (%s): clock skews are relative to the host clock, not UTC",
+                        s.ntp_server, ntp.get("error"))
         _stage(port, "measuring clock skew")
         with timing_critical("clock skew"):
             skew = measure_clock_skew(link, clock=driver.clock_now)
@@ -458,15 +473,21 @@ def offload(port: str, s: Settings) -> Path | None:
             fname = f"{stem}.bin" if list(data) == ["dataset1"] else f"{stem}_{name.replace('/', '_')}.bin"
             _write_bytes(rawdir / fname, blob)
             datasets[name] = {"file": f"raw/{fname}", "bytes": len(blob), "sha256": sha256(blob)}
-        for f in driver.part_files(part_dir, sn) if part_dir.is_dir() else []:
-            f.unlink(missing_ok=True)
         warnings = []
         if skew.get("n") and abs(skew["skew_vs_host_s"]) > 60:
             warnings.append(f"clock skew {skew['skew_vs_host_s']:+.1f} s exceeds 60 s "
                             "(clock reset, or set to local time instead of UTC?)")
-        rem = _remaining(snap, after["meminfo"], after["power"], int(snap["sampling"].get("period", 0) or 0), driver)
-        alarms = _time_checks(sn, "at offload", rem if after["status"] in ("logging", "pending", "gated") else None,
-                              after["power"]["battery_voltage_V"], s)
+        try:  # derived numbers: an odd reply here must not cost the record of a saved download
+            rem = _remaining(snap, after["meminfo"], after["power"], int(snap["sampling"].get("period", 0) or 0),
+                             driver)
+            alarms = _time_checks(sn, "at offload", rem if after["status"] in ("logging", "pending", "gated")
+                                  else None, after["power"]["battery_voltage_V"], s)
+        except Exception as err:
+            log.error("remaining sampling time not estimated (%s: %s); the download and its record are saved",
+                      type(err).__name__, err)
+            log.debug("traceback", exc_info=True)
+            rem, alarms = None, []
+            warnings.append(f"remaining sampling time not estimated: {type(err).__name__}: {err}")
         warnings.extend(alarms)
         record = {
             "tool": {"name": "rbr-tpw", "version": __version__},
@@ -483,7 +504,8 @@ def offload(port: str, s: Settings) -> Path | None:
             "remaining_time": rem,
             "bytes_per_sample": driver.bytes_per_sample(snap),
             "thresholds": vars(s.thresholds),
-            "raw": datasets.get("dataset1") or next(iter(datasets.values()), None),
+            "raw": datasets.get("dataset1") or next((v for k, v in datasets.items() if k.endswith("/data")), None)
+            or next(iter(datasets.values()), None),
             "datasets": datasets,
             "transcript": f"raw/{stem}.log",
             "session_log": f"raw/{s.session_log.name}" if s.session_log else None,
@@ -491,6 +513,8 @@ def offload(port: str, s: Settings) -> Path | None:
         }
         _write_json(rawdir / f"{stem}.json", record)  # saved before anything is written to the logger
         log.debug("wrote %s", rawdir / f"{stem}.json")
+        for f in driver.part_files(part_dir, sn) if part_dir.is_dir() else []:  # only now: all is saved
+            f.unlink(missing_ok=True)
         mem, pwr = after["meminfo"], after["power"]
         energy = (f", energy counter {pwr['energy_remaining_J']:.0f} J of {pwr['energy_nominal_J']:.0f} J nominal"
                   if math.isfinite(pwr.get("energy_remaining_J", math.nan)) else "")
@@ -506,6 +530,9 @@ def offload(port: str, s: Settings) -> Path | None:
             alarm(alarms, s)
         if s.deploy is not None:
             note = f"{total} bytes, saved to raw/{stem}*.bin" if datasets else "already empty"
+            logged = int(after["meminfo"].get("used", 0) or 0) - int((snap.get("meminfo") or {}).get("used", 0) or 0)
+            if logged > 0:  # still logging during the download: these came after the snapshot and are not saved
+                note += f"; {logged} bytes logged since the download began are NOT saved"
             report = _configure_step(link, s, snap, ntp, sn, note, driver)
             _write_json(rawdir / f"{stem}_configure.json", report)
             log.debug("wrote %s", rawdir / f"{stem}_configure.json")
@@ -578,7 +605,7 @@ def run(s: Settings, once: bool, port: str | None):
     workers: dict[str, threading.Thread] = {}
     finished: set[str] = set()  # ports whose worker ended, until they are unplugged
     announced = ruskin_warned = started_any = False
-    last_status = last_new = time.monotonic()
+    last_status = last_new = time.monotonic()  # last_new: a worker started or ended (--once grace)
     try:
         while True:
             present = _present(port)
@@ -586,6 +613,7 @@ def run(s: Settings, once: bool, port: str | None):
                 if not t.is_alive():
                     del workers[p]
                     finished.add(p)
+                    last_new = time.monotonic()  # the --once grace also runs from the last worker's end
             for p in sorted(finished - present):
                 finished.discard(p)
                 log.info("%s disconnected", p)
@@ -659,13 +687,16 @@ def _rebuild(rec_path: Path, outdir: Path):
     if not datasets:
         log.warning("%s: the logger's memory was empty at this offload; nothing to rebuild", rec_path)
         return
+    roots = [rec_path.parent.parent.resolve(), rec_path.parent.resolve()]
     for name, info in datasets.items():
         rel = Path(info["file"])
-        if rel.is_absolute() or ".." in rel.parts:  # only files beside the record or in its raw/ folder
+        if rel.is_absolute() or rel.anchor or ".." in rel.parts:  # anchor: "/x" is not absolute on Windows
             raise RebuildError(f"refusing raw file path {info['file']!r}")
         # recorded as raw/<file> relative to OUTDIR; also accept the file beside a moved record
         where = [rec_path.parent.parent / rel, rec_path.parent / rel.name]
         found = next((w for w in where if w.is_file()), None)
+        if found is not None and not any(found.resolve().is_relative_to(r) for r in roots):  # e.g. a symlink out
+            raise RebuildError(f"refusing raw file {info['file']!r}: it resolves outside {roots[0]}")
         if found is None:
             raise RebuildError(f"{info['file']} not found (looked in {', '.join(map(str, where))})")
         blob = found.read_bytes()
@@ -721,6 +752,8 @@ def main(argv=None):
     g.add_argument("--yes", action="store_true", help="do not ask before configuring or acknowledging alarms")
     args = ap.parse_args(argv)
 
+    if args.config and args.configure:
+        ap.error("give the settings file to --config or to --configure, not both")
     cfg_file = Path(args.configure) if args.configure else args.config
     try:
         thresholds = Thresholds.from_yaml(cfg_file) if cfg_file else Thresholds()
@@ -752,6 +785,8 @@ def main(argv=None):
             setattr(deploy, k, v)
         try:
             deploy.battery_fraction()
+            # period, start and end now, not after a download; the period is checked again per logger
+            validate(deploy, deploy.period_ms or 500)
         except ConfigError as err:
             ap.error(str(err))
     elif overrides:

@@ -260,7 +260,11 @@ class Gen3Driver(Driver):
         snap["settings"] = _q(link, "settings")
         snap["info"] = _q(link, "info")
         off = clock.get("offsetfromutc", "")
-        if off and float(off.replace("+", "") or 0) != 0:
+        try:
+            nonzero = float(off.replace("+", "") or 0) != 0
+        except ValueError:  # "unknown": the default, and what setting the clock leaves (L3 ref 4.1.1)
+            nonzero = False
+        if nonzero:
             link.note(f"logger clock offsetfromutc = {off}: its clock may be local time, not UTC")
         return snap
 
@@ -352,7 +356,8 @@ class Gen4Driver(Driver):
                         if k.endswith("/data") and v and k != f"{ds}/{sch}/data")
         warns = [f"this NetCDF holds dataset {ds} schedule {sch} only; also downloaded but NOT converted: "
                  f"{', '.join(others)} (saved in raw/)"] if others else []
-        record = {**record, "warnings": [*record.get("warnings", []), *warns]}
+        record = {**record, "warnings": [*record.get("warnings", []), *warns],
+                  "raw": (record.get("datasets") or {}).get(f"{ds}/{sch}/data", record.get("raw"))}
         return write_engineering(time_ms, values, error_codes, events, record, path,
                                  values_comment="Engineering value as stored by the logger (Gen4, L3.5 reference "
                                                 "section 4.2; decoder untested on a real logger).",
