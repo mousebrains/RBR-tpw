@@ -109,10 +109,12 @@ def test_ntp_is_reused_between_loggers(monkeypatch):
 
 def test_transfers_pause_while_a_clock_is_timed():
     events = []
+    in_flight = threading.Event()
 
     def downloader():
         with hostclock.transfer():  # in flight when the timing step starts: it must finish first
             events.append(("block1 start", time.monotonic()))
+            in_flight.set()
             time.sleep(0.2)
             events.append(("block1 end", time.monotonic()))
         time.sleep(0.05)
@@ -121,7 +123,7 @@ def test_transfers_pause_while_a_clock_is_timed():
 
     t = threading.Thread(target=downloader)
     t.start()
-    time.sleep(0.05)
+    assert in_flight.wait(5)
     with hostclock.timing_critical("test"):
         events.append(("timing start", time.monotonic()))
         time.sleep(0.3)

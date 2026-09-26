@@ -48,7 +48,7 @@ def test_thresholds_yaml_and_checks():
 class FakeSolo:
     """Just enough of an fwtype-9 RBRsolo to exercise configure() without hardware."""
 
-    def __init__(self, status="finished", clock_bias_s=0.0, enable_error=None):
+    def __init__(self, status="finished", clock_bias_s=0.0, enable_error=None, clock=time):
         self.serial = 100689
         self.port = "/dev/cu.fake"
         self.state = {"status": status, "starttime": "20000101000000", "endtime": "20991231235959",
@@ -58,9 +58,10 @@ class FakeSolo:
         self.offset = 0.0  # logger clock minus host clock, s
         self.clock_bias_s = clock_bias_s  # a clock write lands this far ahead of the value written
         self.enable_error = enable_error
+        self.clock = clock  # the host clock the logger is compared with (a virtual one in timing tests)
 
     def _now(self):
-        return dt.datetime.fromtimestamp(time.time() + self.offset, dt.UTC).strftime("%Y%m%d%H%M%S")
+        return dt.datetime.fromtimestamp(self.clock.time() + self.offset, dt.UTC).strftime("%Y%m%d%H%M%S")
 
     def note(self, text):
         pass
@@ -76,7 +77,7 @@ class FakeSolo:
             return f"now = {self.challenge}"
         if cmd.startswith("now = "):
             value = dt.datetime.strptime(cmd[6:], "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC).timestamp()
-            self.offset = value - time.time() + self.clock_bias_s
+            self.offset = value - self.clock.time() + self.clock_bias_s
             return cmd
         if cmd.startswith("lock OFF = "):
             e2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
@@ -189,14 +190,36 @@ def test_used_battery_option_errors(tmp_path, argv):
         main([str(tmp_path), *argv])
 
 
-def test_set_clock_recovers_when_the_first_write_lands_ahead():
+class VirtualClock:
+    """time.time/sleep/monotonic on a virtual clock, so clock-setting tests do not depend on host scheduling."""
+
+    def __init__(self):
+        self.t = 1_790_000_000.25
+
+    def time(self):
+        self.t += 1e-6  # busy-wait loops still advance
+        return self.t
+
+    def monotonic(self):
+        return self.time()
+
+    def sleep(self, dt):
+        self.t += max(dt, 0)
+
+
+def test_set_clock_recovers_when_the_first_write_lands_ahead(monkeypatch):
     """A write that lands 25 ms ahead needs a negative lead next time; the loop used to give up instead."""
-    from rbr_tpw.configure import set_clock
-    fake = FakeSolo(clock_bias_s=0.025)
+    import rbr_tpw.configure as cf
+    vc = VirtualClock()
+    fake = FakeSolo(clock_bias_s=0.025, clock=vc)
     fake.locked = False
-    out = set_clock(fake, 0.0, 0.020, log=lambda *a: None)
-    assert out["ok"] and abs(out["skew_vs_utc_s"]) < 0.020 and len(out["history"]) >= 2
-    assert out["history"][0]["skew_vs_utc_s"] > 0.020 and out["history"][-1]["lead_s"] < 0
+    monkeypatch.setattr(cf, "time", vc)
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+        "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
+    out = cf.set_clock(fake, 0.0, 0.020, log=lambda *a: None)
+    assert out["ok"] and abs(out["skew_vs_utc_s"]) < 0.001
+    assert out["history"][0]["skew_vs_utc_s"] == pytest.approx(0.028, abs=1e-4)  # 3 ms lead + 25 ms bias
+    assert out["history"][-1]["lead_s"] == pytest.approx(-0.025, abs=1e-4)  # needs a negative lead
 
 
 def test_no_erase_with_data_is_refused_before_any_write():
