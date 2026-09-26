@@ -5,11 +5,9 @@ NOT READY exit status, and Windows sleep resolution."""
 import io
 import json
 import math
-import statistics
 import struct
 import sys
 import threading
-import time
 
 import netCDF4
 import numpy as np
@@ -186,12 +184,24 @@ def test_exit_status_2_when_a_logger_is_not_ready(tmp_path, monkeypatch):
     setup_logging(Console(stream=io.StringIO()))
 
 
-def test_sleep_resolution_is_fine_enough_for_the_clock_set():
-    """set_clock sleeps to ~5 ms before the send, then spins. Python >= 3.11 on Windows uses a high-resolution
-    waitable timer; before that sleep ticked in 15.6 ms steps (the review's concern)."""
-    overshoot = []
-    for _ in range(20):
-        t0 = time.perf_counter()
-        time.sleep(0.002)
-        overshoot.append(time.perf_counter() - t0 - 0.002)
-    assert statistics.median(overshoot) < 0.005
+def test_clock_set_is_on_time_even_when_sleep_overshoots(monkeypatch):
+    """time.sleep overshot a 2 ms sleep by 15 ms (median) on a GitHub macOS runner: set_clock must not rely on
+    it. On a virtual clock whose sleep always overshoots by 20 ms, the time is still sent on schedule."""
+    from test_power_and_cli import FakeSolo as ConfigFake
+    from test_power_and_cli import VirtualClock
+
+    import rbr_tpw.configure as cf
+
+    class Overshooting(VirtualClock):
+        def sleep(self, dt):
+            super().sleep(dt + 0.020)
+
+    vc = Overshooting()
+    fake = ConfigFake(clock=vc)
+    fake.locked = False
+    monkeypatch.setattr(cf, "time", vc)
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+        "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
+    out = cf.set_clock(fake, 0.0, 0.020, log=lambda *a: None)
+    # sent at the planned instant (3 ms lead), not ~16 ms late as when sleeping to 4 ms before
+    assert out["history"][0]["skew_vs_utc_s"] == pytest.approx(0.003, abs=1e-4) and out["ok"]

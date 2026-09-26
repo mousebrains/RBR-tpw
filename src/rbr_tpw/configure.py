@@ -33,6 +33,7 @@ class ConfigError(Exception):
     report: dict | None = None
 
 
+SPIN_S = 0.050  # set_clock spins (does not sleep) for this long before sending the time
 IDLE_SAVE_S = 12.0  # settings are saved after 10 s idle (L3.5 ref 1.1.2; assumed, unverified, for L2 loggers)
 
 
@@ -171,8 +172,10 @@ def set_clock(link: Link, ntp_offset_s: float, tolerance_s: float, attempts: int
         utc_now = time.time() + ntp_offset_s
         target = math.floor(utc_now) + 2
         send_at_host = target - lat - ntp_offset_s
-        while (remaining := send_at_host - time.time()) > 0.005:
-            time.sleep(remaining - 0.004)
+        # Sleep to within SPIN_S of the send time, then spin: sleep may overshoot by 15 ms or more (median
+        # 15 ms for a 2 ms sleep on a GitHub macOS runner, 2026-09-26), which would send the command late.
+        while (remaining := send_at_host - time.time()) > SPIN_S:
+            time.sleep(remaining - SPIN_S)
         while time.time() < send_at_host:
             pass
         stamp = dt.datetime.fromtimestamp(target, dt.UTC).strftime("%Y%m%d%H%M%S")
