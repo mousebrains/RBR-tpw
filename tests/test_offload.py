@@ -121,7 +121,11 @@ def test_parallel_offloads_overlap_but_skew_does_not(rig, monkeypatch, capfd):
     overlaps = [min(a[-1][1], b[-1][1]) - max(a[1][0], b[1][0])
                 for a, b in itertools.combinations([f.reads for f in fakes], 2)]
     assert max(overlaps) > 0.3  # downloads ran at the same time
-    assert elapsed < 3 * 1.0 + 1.5  # each download alone takes ~1 s; one after another would be ~3.6 s
+    # one after another, the downloads would span at least the sum of their durations; together, much less.
+    # Relative, not a wall-clock bound: a slow CI runner ran these 400 kB/s fakes at ~140 kB/s (elapsed 6.1 s).
+    spans = [(f.reads[1][0], f.reads[-1][1]) for f in fakes]
+    total = max(e for _, e in spans) - min(b for b, _ in spans)
+    assert total < 0.8 * sum(e - b for b, e in spans), (total, spans, elapsed)
     for sn in ("101", "102", "103"):
         (log,) = (rig.tmp / "raw").glob(f"{sn}_*.log")
         text = log.read_text()
@@ -159,10 +163,12 @@ def test_stop_between_blocks_then_resume(rig, monkeypatch):
     s = rig.settings()
     t = threading.Thread(target=cli._worker, args=("/dev/cu.usbmodemS", s))
     t.start()
-    time.sleep(0.9)
+    part = rig.tmp / "raw" / ".partial" / "77.bin.part"
+    deadline = time.monotonic() + 30  # Ctrl-C once a block is on disk (a fixed 0.9 s was too short on a slow runner)
+    while not (part.exists() and part.stat().st_size >= 512 + 68_000) and time.monotonic() < deadline:
+        time.sleep(0.01)
     s.stop.set()
     t.join(10)
-    part = rig.tmp / "raw" / ".partial" / "77.bin.part"
     size = part.stat().st_size
     assert (size - 512) % 68_000 == 0 and 512 < size < 512 + 600_000  # stopped on a block boundary
     assert "download stopped (Ctrl-C)" in rig.console_text()
