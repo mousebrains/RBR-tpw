@@ -359,9 +359,14 @@ class FakeConcerto3(FakePort):
                 ("temp22", "tmp", "C", "conductivitycelltemperature_00", 13),
                 ("temp10", "tmp", "C", "pressuretemperature_00", 13)]
 
-    def __init__(self, port: str, serial: int = 233442, n_samples: int = 2000, **kw):
+    def __init__(self, port: str, serial: int = 233442, n_samples: int = 2000, status_form: str = "numeric", **kw):
+        """status_form: "numeric" reports the 8 channels with the channelStatus bitfield, as SN233442 did in Ruskin's
+        logs up to 2026-09-25; "onoff" reports the 6 stored channels with `status = on`, as it did on 2026-09-26
+        (L3 ref 4.7.2 form; the two hidden channels were no longer listed)."""
         super().__init__(port, **kw)
         self.serial = serial
+        self.status_form = status_form
+        self.channels = self.CHANNELS if status_form == "numeric" else [c for c in self.CHANNELS if c[4] == 0]
         t0 = 1_790_000_000_000
         self.datasets = {2: bytes(range(256)) * 4 + bytes(180),  # 1204 bytes like SN233442's header; not decoded
                          1: easyparse_image(n_samples, 6, t0),
@@ -374,17 +379,19 @@ class FakeConcerto3(FakePort):
             "deployment": "deployment starttime = 20000101000000, endtime = 20991231235959, status = logging",
             "deployment status": "deployment status = logging",
             "sampling": "sampling mode = continuous, period = 1000",
-            "channels": "channels count = 8, on = 8, settlingtime = 60, readtime = 290, minperiod = 470",
+            "channels": f"channels count = {len(self.channels)}, on = {len(self.channels)}, settlingtime = 60, "
+                        "readtime = 290, minperiod = 470",
             "memformat": "memformat type = calbin00, newtype = calbin00, availabletypes = rawbin00|calbin00",
             "power": "power source = usb, int = 14.63, ext = 0.01, reg = n/a",
             "powerinternal": "powerinternal batterytype = lisocl2, capacity = 232.0e+003, used = 28.93e+003",
             "settings": "settings fetchpoweroffdelay = 8000, sensorpoweralwayson = off, atmosphere = 10.1325000",
             "info": "info pn = L3-M11-F15-BEC11-OP1-G1-SCT12-SP11, fwlock = off",
         }
-        for i, (typ, eq, units, label, status) in enumerate(self.CHANNELS, 1):
-            r[f"channel {i}"] = (f"channel {i} type = {typ}, module = {i}, status = {status}, settlingtime = 60, "
-                                 f"readtime = 290, equation = {eq}, userunits = {units}, derived = off, "
-                                 f"label = {label}")
+        for i, (typ, eq, units, label, status) in enumerate(self.channels, 1):
+            shown = status if self.status_form == "numeric" else "on"
+            r[f"channel {i}"] = (f"channel {i} type = {typ}, module = {i}, status = {shown}, settlingtime = 60, "
+                                 f"readtime = 290, equation = {eq}, userunits = {units}, "
+                                 f"derived = {'on' if eq.startswith('deri_') else 'off'}, label = {label}")
             r[f"calibration {i}"] = (f"calibration {i} label = {label}, datetime = 20250528165608, "
                                      f"c0 = 30.056130e-003, c1 = 158.07142e+000")
         for d, blob in self.datasets.items():

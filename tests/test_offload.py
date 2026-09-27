@@ -299,6 +299,22 @@ def test_unsupported_fwtype_is_left_alone(rig):
     assert "fwtype 77 is not supported yet" in rig.console_text() and fake.commands[-1] == "id"
 
 
+def test_concerto3_reporting_on_off_channel_status(rig, monkeypatch):
+    """SN233442 on 2026-09-26 (bench): six channels, each `status = on` (the L3 ref 4.7.2 form), where the day before
+    it gave Ruskin the numeric bitfield. int('on') aborted the offload before any download."""
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
+    rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300, status_form="onoff")
+    cli.run(rig.settings(), once=True, port=None)
+    assert "OFFLOAD INCOMPLETE" not in rig.console_text()
+    (rec,) = (rig.tmp / "raw").glob("233442_*.json")
+    snap = json.loads(rec.read_text())["snapshot_before"]
+    assert [c["status_as_reported"] for c in snap["channels_all"]] == ["on"] * 6
+    assert [c["status"] for c in snap["channel_list"]] == [0] * 6  # all six stored, the three derived ones included
+    (nc,) = rig.tmp.glob("233442_*.nc")
+    with netCDF4.Dataset(nc) as ds:
+        assert len(ds["time"]) == 300 and ds["salinity"].rbr_channel_status == 0
+
+
 def test_rebuild_gen3_record(rig, monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
     rig.add("usbmodemC", cls=FakeConcerto3, n_samples=500)

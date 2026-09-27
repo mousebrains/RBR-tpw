@@ -63,13 +63,36 @@ def _iso(compact: str | None) -> str:
     return t.isoformat().replace("+00:00", "Z")
 
 
+def channel_status(value) -> int | None:
+    """`channel N ... status = X` as the STATUS_* bitfield, or None if X is not understood.
+
+    Gen3 loggers answer `on` or `off` (L3 ref 4.7.2, and RBRconcerto3 SN233442 on 2026-09-26), or the numeric
+    channelStatus bitfield that L2 loggers use (the same SN233442 answered `0` and `13` in Ruskin's logs the day
+    before, with two hidden channels it no longer lists). Per the reference, `on` means sampled and stored (derived
+    channels included in EasyParse, never in rawbin00) and `off` means neither, so `off` maps to STATUS_NOT_STORED."""
+    v = str(value).strip().lower()
+    if v in ("", "on"):
+        return 0
+    if v == "off":
+        return STATUS_NOT_STORED
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
 def _channels(link: Link, count: int) -> list[dict]:
     out = []
     for i in range(1, count + 1):
         ch = link.query(f"channel {i}")
         cal = _q(link, f"calibration {i}")
         ch["index"] = i
-        ch["status"] = int(ch.get("status", "0") or 0)
+        ch["status_as_reported"] = ch.get("status", "")
+        status = channel_status(ch["status_as_reported"])
+        if status is None:  # not fatal: the download is still saved; a wrong channel count shows up in the decode
+            link.note(f"channel {i}: status {ch['status_as_reported']!r} not understood; treated as a stored channel")
+            status = 0
+        ch["status"] = status
         ch["calibration_datetime"] = cal.pop("datetime", "")
         cal.pop("type", None)
         cal.pop("label", None)
