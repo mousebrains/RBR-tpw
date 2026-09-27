@@ -16,8 +16,8 @@ import time
 
 import numpy as np
 
-from rbr_tpw.configure import unlock_key
 from rbr_tpw.crc import crc16_ccitt
+from rbr_tpw.lock import unlock_key
 
 MEMORY_SIZE = 132_120_576
 SYNC_S = 843_696_000  # 2026-09-25T00:00:00Z in seconds since 2000
@@ -88,11 +88,23 @@ class FakePort:
     `bytes_per_s` throttles transfers like a real logger; `fail_at_offset` makes a transfer fail."""
 
     def __init__(self, port: str, bytes_per_s: float | None = None, fail_at_offset: int | None = None,
-                 skew_s: float = 0.0):
+                 skew_s: float = 0.0, drop_every: int | None = None, drop_first: set[str] | None = None):
         self.port = port
         self.bytes_per_s = bytes_per_s
         self.fail_at_offset = fail_at_offset
         self.skew_s = skew_s
+        # No reply at all (no line, no prompt), as RBRconcerto SN060275 (fw 1.460) does now and then: to every Nth
+        # command (drop_every), or to the first occurrence of each command named in drop_first.
+        self.drop_every = drop_every
+        self.drop_first = set(drop_first or ())
+        self.dropped: list[str] = []
+        # The write lock (lock.py). Lockable fakes list hidden channels and numeric statuses only when unlocked, as
+        # SN060275 and SN233442 did on 2026-09-26; refuse_unlock answers `lock OFF` with E0108 (wrong key).
+        self.lockable = False
+        self.locked = True
+        self.refuse_unlock = False
+        self.unlocks = 0
+        self._challenge: dt.datetime | None = None  # the last `now`/`clock` reply, whole seconds
         self.datasets: dict[int, bytes] = {}
         self.timeout = 0.02
         self.commands: list[str] = []
@@ -157,11 +169,59 @@ class FakePort:
             self._ready_at = t0 + (len(block) / self.bytes_per_s if self.bytes_per_s else 0)
         self.reads.append((t0, max(t0, self._ready_at)))
 
+    def _handle_lock(self, cmd: str) -> bool:
+        """`lock`, `lock OFF = <key>`, `lock on`; remembers the challenge (`now`/`clock`) for the key."""
+        from rbr_tpw.lock import unlock_key
+
+        if cmd in ("now", "clock"):
+            self._challenge = self.now().replace(microsecond=0)
+            self._reply(f"now = {self._challenge:%Y%m%d%H%M%S}" if cmd == "now" else
+                        f"clock datetime = {self._challenge:%Y%m%d%H%M%S}, offsetfromutc = +0.00")
+            return True
+        if cmd == "lock":
+            self._reply(f"lock = {'on' if self.locked else 'off'}")
+            return True
+        if cmd == "lock on":
+            self.locked = True
+            self._reply("lock = on")
+            return True
+        if cmd.startswith("lock OFF = "):
+            e2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+            secs = int((self._challenge - e2000).total_seconds()) if self._challenge else -1
+            if self.refuse_unlock or int(cmd.split("=")[1]) != unlock_key(self.serial, secs):
+                self._reply("E0108 invalid argument to command")
+            else:
+                self.locked = False
+                self.unlocks += 1
+                self._reply("lock = off")
+            return True
+        return False
+
+    @staticmethod
+    def locked_view(channel_lines: dict[str, str], count_line: str) -> dict[str, str]:
+        """What a locked logger shows of `channels` and `channel N`: hidden channels (status bit 0x01) left out,
+        the rest renumbered, and `status = on` instead of the bitfield."""
+        shown = []
+        for i in range(1, len(channel_lines) + 1):
+            line = channel_lines[f"channel {i}"]
+            status = int(re.search(r"status = (\d+)", line).group(1))
+            if not status & 0x01:
+                shown.append(re.sub(r"status = \d+", "status = on", line))
+        out = {f"channel {k}": re.sub(r"^channel \d+", f"channel {k}", line) for k, line in enumerate(shown, 1)}
+        out["channels"] = re.sub(r"count = \d+, on = \d+", f"count = {len(shown)}, on = {len(shown)}", count_line)
+        return out
+
     def _handle(self, cmd: str):
         self.commands.append(cmd)
         if cmd == "":
             with self._lock:
                 self._out += b"Ready: "
+            return
+        if (self.drop_every and len(self.commands) % self.drop_every == 0) or cmd in self.drop_first:
+            self.drop_first.discard(cmd)
+            self.dropped.append(cmd)  # silence: no reply line, no prompt
+            return
+        if self.lockable and self._handle_lock(cmd):
             return
         if cmd.startswith("read data "):
             dataset, size, offset = (int(x) for x in cmd.split()[2:5])
@@ -315,11 +375,19 @@ class FakeDuet(FakePort):
     def __init__(self, port: str, serial: int = 81500, n_samples: int = 2000, **kw):
         super().__init__(port, **kw)
         self.serial = serial
+        self.lockable = True
         self.image = l2_sectioned_image(n_samples, [("temp12", 0, self.TEMP), ("pres21", 0, self.PRES),
                                                     ("temp05", 9, self.COMP)], serial)
         self.datasets = {1: self.image}
 
     def replies(self):
+        r = self._replies()
+        if self.locked:  # SN060275 locked: 8 of 9 channels, `status = on`; unlocked: all 9, numeric
+            r.update(self.locked_view({k: v for k, v in r.items() if re.fullmatch(r"channel \d+", k)}, r["channels"]))
+            r.pop("calibration 3")  # E0108 like `channel 3`
+        return r
+
+    def _replies(self):
         used = len(self.image)
         return {
             "id": f"id model = RBRduet, version = 3.220, serial = {self.serial:06d}, fwtype = 102",
@@ -360,14 +428,23 @@ class FakeConcerto3(FakePort):
                 ("temp10", "tmp", "C", "pressuretemperature_00", 13)]
 
     def __init__(self, port: str, serial: int = 233442, n_samples: int = 2000, **kw):
+        """Locked, it lists its 6 stored channels with `status = on`, as SN233442 did on 2026-09-26; unlocked (the
+        key from its `clock` reply), all 8 with the channelStatus bitfield, as in Ruskin's logs."""
         super().__init__(port, **kw)
         self.serial = serial
+        self.lockable = True
         t0 = 1_790_000_000_000
         self.datasets = {2: bytes(range(256)) * 4 + bytes(180),  # 1204 bytes like SN233442's header; not decoded
                          1: easyparse_image(n_samples, 6, t0),
                          0: easyparse_event(t0 - 500, 0x18) + easyparse_event(t0 + 1000 * n_samples, 0x19)}
 
     def replies(self):
+        r = self._replies()
+        if self.locked:
+            r.update(self.locked_view({k: v for k, v in r.items() if re.fullmatch(r"channel \d+", k)}, r["channels"]))
+        return r
+
+    def _replies(self):
         r = {
             "id": f"id model = RBRconcerto3, version = 1.162, serial = {self.serial}, fwtype = 104",
             "clock": f"clock datetime = {self.now():%Y%m%d%H%M%S}, offsetfromutc = +0.00",
@@ -383,8 +460,8 @@ class FakeConcerto3(FakePort):
         }
         for i, (typ, eq, units, label, status) in enumerate(self.CHANNELS, 1):
             r[f"channel {i}"] = (f"channel {i} type = {typ}, module = {i}, status = {status}, settlingtime = 60, "
-                                 f"readtime = 290, equation = {eq}, userunits = {units}, derived = off, "
-                                 f"label = {label}")
+                                 f"readtime = 290, equation = {eq}, userunits = {units}, "
+                                 f"derived = {'on' if eq.startswith('deri_') else 'off'}, label = {label}")
             r[f"calibration {i}"] = (f"calibration {i} label = {label}, datetime = 20250528165608, "
                                      f"c0 = 30.056130e-003, c1 = 158.07142e+000")
         for d, blob in self.datasets.items():

@@ -20,7 +20,7 @@ import netCDF4
 import numpy as np
 
 from . import __version__
-from .equations import decode_l2, evaluate, header_coefficients, is_sectioned_header
+from .equations import decode_l2, evaluate, header_coefficients, is_sectioned_header, parse_l2_header
 from .rawbin import (
     EQUATIONS,
     EVENT_NAMES,
@@ -193,8 +193,10 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
     warnings = list(record.get("warnings", []))
     evaluated = None  # (values, bad, problems, channels with the coefficients used) for sectioned L2 images
     if is_sectioned_header(image):  # RBRduet / RBRconcerto (L3 ref 5.3.1, header versions 1.xxx)
+        all_channels = _header_completed_channels(image, snap, warnings)
+        channels = [c for c in all_channels if not int(c.get("status", 0)) & 0x04]  # the stored ones, in order
         d = decode_l2(image, len(channels))
-        evaluated = _evaluate_l2(d, snap)
+        evaluated = _evaluate_l2(d, snap, all_channels)
     else:
         d = decode(image, len(channels))
     # Also a reset clock: a logger enabled after its clock had restarted at 2000-01-01. The decoders' own
@@ -294,12 +296,38 @@ def write_netcdf(image: bytes, record: dict, path: Path) -> tuple[Decoded, list[
     return d, warnings, t_utc[keep]
 
 
-def _evaluate_l2(d: Decoded, snap: dict):
+def _header_completed_channels(image: bytes, snap: dict, warnings: list[str]) -> list[dict]:
+    """The logger's channel list, completed from the deployment header when the logger listed fewer channels.
+
+    Locked, a duet or concerto leaves its hidden channels out of `channels` (bench 2026-09-26: SN060275 lists 8
+    of 9; the ninth, the pressure-compensation thermistor, is stored in every sample set). The header lists them
+    all, with type, status and coefficients but no equation name: a temp* channel is decoded as `tmp`, anything
+    else keeps its raw readings. Hidden channels come last on every logger seen, so positions still line up."""
+    listed = list(snap.get("channels_all") or snap["channel_list"])
+    try:
+        header_channels = parse_l2_header(image).fields.get("channels", [])
+    except Exception:  # noqa: BLE001  (an unparseable header is reported by decode_l2 itself)
+        return listed
+    for hc in header_channels[len(listed):]:
+        ctype = str(hc.get("type", ""))
+        equation = "tmp" if ctype.startswith("temp") else ""
+        names = ["c0", "c1", "c2", "c3"] if equation else []
+        listed.append({"index": int(hc["index"]), "type": ctype, "status": int(hc.get("status", 0)),
+                       "equation": equation, "userunits": "C" if equation else "",
+                       "coefficients": header_coefficients(hc, names) if names else {},
+                       "calibration_datetime": "", "from_deployment_header": True})
+        warnings.append(f"channel {hc['index']} ({ctype}, status {hc.get('status')}) is in the deployment header "
+                        "but the logger did not list it (a locked logger hides its hidden channels); "
+                        + ("decoded as `tmp` with the header's coefficients" if equation else "raw readings only"))
+    return listed
+
+
+def _evaluate_l2(d: Decoded, snap: dict, channels: list[dict] | None = None):
     """Engineering values for a sectioned L2 image: coefficients from the memory header (the calibration in
     force when the deployment was enabled), named in the order the logger's `calibration N` reply lists them."""
     header_channels = d.header.fields.get("channels", [])
     used = []
-    for ch in snap.get("channels_all") or snap["channel_list"]:
+    for ch in channels if channels is not None else (snap.get("channels_all") or snap["channel_list"]):
         i = int(ch.get("index", len(used) + 1))
         hc = header_channels[i - 1] if i <= len(header_channels) else None
         if hc is not None and hc.get("coefficient_words"):

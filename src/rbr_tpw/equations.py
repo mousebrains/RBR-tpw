@@ -37,10 +37,10 @@ import numpy as np
 
 from .crc import crc16_ccitt
 from .rawbin import (
+    ANCHOR_EVENTS,
     EPOCH2000_MS,
     FEATURE_AVERAGING,
     FEATURE_BURSTING,
-    RESTART_EVENTS,
     TFLAG_NO_ANCHOR,
     TFLAG_RESET_CLOCK,
     Decoded,
@@ -299,7 +299,7 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
         ms = struct.unpack_from("<H", rec, 8)[0] if marker != 0xF7 else 0
         index = readings_before // nstored
         events.append(Event(offset=hdr.length + b, type=etype, seconds=seconds, crc_ok=True, sample_index=index))
-        anchors_next = bool(rec[11] & 1) if marker == 0xF3 else (etype == TIME_SYNC or etype in RESTART_EVENTS)
+        anchors_next = bool(rec[11] & 1) if marker == 0xF3 else etype in ANCHOR_EVENTS  # 0xF3 carries the flag
         if anchors_next:
             anchors.append((index, EPOCH2000_MS + 1000 * seconds + ms, seconds))
         i_prev = i + size // 4

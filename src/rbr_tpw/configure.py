@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import struct
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
@@ -19,9 +18,9 @@ from pathlib import Path
 
 import yaml
 
-from .crc import crc16_ccitt
 from .link import Link, LinkError, LoggerError, parse_pairs
-from .solo import NOMINAL_BATTERY_J, measure_clock_skew, memory, parse_logger_datetime, power
+from .lock import Session, unlock_key  # noqa: F401  (re-exported: the tests import unlock_key from here)
+from .solo import NOMINAL_BATTERY_J, measure_clock_skew, memory, power
 
 FAR_FUTURE = "20991231235959"  # Ruskin's "no end time"
 PAST = "20000101000000"  # start time in the past = start as soon as enabled
@@ -115,55 +114,6 @@ def validate(cfg: DeployConfig, current_period_ms: int) -> tuple[str, str, int]:
     if end != FAR_FUTURE and end <= dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S"):
         raise ConfigError(f"end {end} is in the past")
     return start, end, period
-
-
-def unlock_key(serial: int, logger_seconds: int) -> int:
-    """Write-unlock key for `lock OFF = <key>` on L2-family loggers.
-
-    Challenge-response on the logger's most recently reported `now` (seconds
-    since 2000-01-01) and its serial number. Reproduces Ruskin 2.26.1
-    PhysicalL2.computeKey; verified against three keys Ruskin sent SN100689
-    on 2026-09-25 (little-endian int32 bytes, CRC-16/CCITT-FALSE).
-    """
-    c_sn = crc16_ccitt(struct.pack("<i", serial))
-    c_t = crc16_ccitt(struct.pack("<i", logger_seconds))
-    hi = (((serial >> 16) & 0xFFFF) ^ c_t) & 0xFFFF
-    lo = ((logger_seconds & 0xFFFF) ^ c_sn) & 0xFFFF
-    return (hi << 16) | lo
-
-
-class Session:
-    """Unlocked write session; always re-locks on exit."""
-
-    def __init__(self, link: Link, serial: int):
-        self.link = link
-        self.serial = serial
-
-    def unlock(self):
-        now = self.link.query("now")["now"]  # sets the logger's challenge
-        secs = int((parse_logger_datetime(now) - dt.datetime(2000, 1, 1, tzinfo=dt.UTC)).total_seconds())
-        r = self.link.command(f"lock OFF = {unlock_key(self.serial, secs)}")
-        if "off" not in r.lower():
-            raise ConfigError(f"unlock failed: {r!r}")
-
-    def __enter__(self):
-        self.unlock()
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            self.link.command("lock on")
-        except Exception as err:
-            self.link.note(f"lock on failed: {err}")
-
-    def write(self, cmd: str, expect: str | None = None, timeout: float = 3.0) -> str:
-        """Send a setting; the logger echoes it back. `expect` is a substring the echo must contain."""
-        self.unlock()
-        r = self.link.command(cmd, timeout)
-        want = (expect if expect is not None else cmd).replace(" ", "").lower()
-        if want not in r.replace(" ", "").lower():
-            raise ConfigError(f"{cmd!r}: unexpected reply {r!r}")
-        return r
 
 
 def set_clock(link: Link, ntp_offset_s: float | None, tolerance_s: float, attempts: int = 4, log=print) -> dict:

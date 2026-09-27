@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .hostclock import transfer
 from .link import Link, LinkError, LoggerError
+from .lock import unlocked_if_possible
 from .rawbin import hexfloat
 
 SUPPORTED_FWTYPES = {9}
@@ -55,22 +56,58 @@ def _coefficient(v: str) -> float | str:
         return v  # e.g. `n1 = value` on derived channels
 
 
-def snapshot(link: Link) -> dict:
-    """Configuration, state, memory, and power, as reported by the logger."""
+STATUS_HIDDEN = 0x01  # channelStatus bits (L3 ref; RBR's pyRSKtools)
+STATUS_NOT_STORED = 0x04
+
+
+def channel_status(value, stored_if_on: bool = True) -> int | None:
+    """`channel N ... status = X` as the STATUS_* bitfield, or None if X is not understood.
+
+    Unlocked (as Ruskin always is), a logger reports the numeric channelStatus bitfield. Locked, L2 and Gen3
+    loggers report `on` or `off` (L3 ref 4.7.2: on = sampled, and stored if the format stores that channel; off =
+    neither) and leave hidden channels out of the list (bench 2026-09-26, SN060275 and SN233442). `stored_if_on`
+    is False for a derived channel in rawbin00, which is never stored (ref 4.7.2); EasyParse stores it."""
+    v = str(value).strip().lower()
+    if v in ("", "on"):
+        return 0 if stored_if_on else STATUS_NOT_STORED
+    if v == "off":
+        return STATUS_NOT_STORED
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def snapshot(link: Link, unlock_serial: int | None = None) -> dict:
+    """Configuration, state, memory, and power, as reported by the logger.
+
+    With `unlock_serial`, the channel list is read unlocked (`lock OFF = <key>`, as Ruskin does), which is the
+    only way to see hidden channels and the numeric status; the lock is restored afterwards. Locked, a duet or
+    concerto lists neither its hidden compensation thermistor nor the numeric status, and that thermistor is
+    stored in every sample set."""
     snap = {"now": link.query("now")["now"], "status": link.query("status")["status"],
             "starttime": link.query("starttime")["starttime"], "endtime": link.query("endtime")["endtime"],
-            "sampling": link.query("sampling"), "channels": link.query("channels")}
+            "sampling": link.query("sampling")}
     channels = []
-    for i in range(1, int(snap["channels"]["count"]) + 1):
-        ch = link.query(f"channel {i}")
-        cal = link.query(f"calibration {i}")
-        ch["index"] = i
-        ch["status"] = int(ch.get("status", "0") or 0)  # bit 0x04: not stored in memory (L3 ref; pyRSKtools)
-        ch["calibration_datetime"] = cal.pop("datetime", "")
-        cal.pop("type", None)
-        ch["coefficients"] = {k: _coefficient(v) for k, v in cal.items()}
-        ch["coefficients_as_reported"] = cal
-        channels.append(ch)
+    with unlocked_if_possible(link, unlock_serial) as unlocked:
+        snap["channels"] = link.query("channels")
+        snap["channels_read_unlocked"] = unlocked
+        for i in range(1, int(snap["channels"]["count"]) + 1):
+            ch = link.query(f"channel {i}")
+            cal = link.query(f"calibration {i}")
+            ch["index"] = i
+            ch["status_as_reported"] = ch.get("status", "")
+            derived = ch.get("derived", "").lower() == "on" or ch.get("equation", "").startswith("deri_")
+            status = channel_status(ch["status_as_reported"], stored_if_on=not derived)  # rawbin00: no derived
+            if status is None:
+                link.note(f"channel {i}: status {ch['status_as_reported']!r} not understood; treated as stored")
+                status = 0
+            ch["status"] = status
+            ch["calibration_datetime"] = cal.pop("datetime", "")
+            cal.pop("type", None)
+            ch["coefficients"] = {k: _coefficient(v) for k, v in cal.items()}
+            ch["coefficients_as_reported"] = cal
+            channels.append(ch)
     snap["channel_list"] = channels
     snap["meminfo"] = memory(link)
     snap["power"] = power(link)
