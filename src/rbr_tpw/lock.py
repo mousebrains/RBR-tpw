@@ -15,7 +15,7 @@ import struct
 from contextlib import contextmanager
 
 from .crc import crc16_ccitt
-from .link import Link, LinkError
+from .link import Link, LinkError, LoggerError
 
 E2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
 
@@ -73,10 +73,21 @@ class Session:
         return self
 
     def __exit__(self, *exc):
-        try:
-            self.link.command("lock on")
-        except Exception as err:
-            self.link.note(f"lock on failed: {err}")
+        self.relock()
+
+    def relock(self):
+        """`lock on`, re-sent once if no reply comes (a logger that drops a command must not stay unlocked)."""
+        for attempt in (1, 2):
+            try:
+                self.link.command("lock on")
+                return
+            except LoggerError as err:
+                self.link.note(f"lock on failed: {err}")
+                return
+            except Exception as err:  # noqa: BLE001  (a timeout, or a port error: re-lock is best effort)
+                self.link.note(f"lock on: no reply ({err}); {'re-sending it once' if attempt == 1 else 'giving up'}")
+                if attempt == 1:
+                    self.link._drain(0.3)
 
     def write(self, cmd: str, expect: str | None = None, timeout: float = 3.0) -> str:
         """Send a setting; the logger echoes it back. `expect` is a substring the echo must contain."""
@@ -101,9 +112,11 @@ def unlocked_if_possible(link: Link, serial: int | None, clock_cmd: str = "now")
         session.unlock()
     except LinkError as err:  # no `lock` command (older firmware?), wrong key, or a dropped reply
         link.note(f"could not unlock to read the full channel list ({err}); reading it locked")
+        if not isinstance(err, LoggerError):  # no reply: the logger may have unlocked all the same
+            session.relock()
         yield False
         return
     try:
         yield True
     finally:
-        session.__exit__(None, None, None)
+        session.relock()

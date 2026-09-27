@@ -427,7 +427,7 @@ def offload(port: str, s: Settings) -> Path | None:
                       ident["fwtype"])
             _failed[port] = f"fwtype {ident['fwtype']} is not supported; nothing downloaded"
             return None
-        driver.serial = int(sn)
+        driver.serial = int(sn) if str(sn).isdigit() else None  # None: no unlock; the channel table is read locked
         log.debug("driver: %s (%s)", type(driver).__name__, driver.family)
 
         _stage(port, "NTP query")

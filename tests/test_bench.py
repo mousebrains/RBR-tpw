@@ -150,3 +150,32 @@ def test_samples_after_a_cpu_reset_event_are_timed_from_it():
     assert d.time_ms[n_before - 1] == EPOCH2000_MS + 1000 * SYNC_S + 500 * (n_before - 1)  # unchanged before
     assert d.time_ms[n_before] == t_event and d.time_ms[-1] == t_event + 500 * (n_after - 1)  # re-anchored after
     assert len(set(clock_segments(d).tolist())) == 1  # the clock was not reset: one clock segment, one skew
+
+
+# --- the lock handshake against a logger that drops replies
+
+
+class DropsLockReplies(FakeDuet):
+    """No reply to the first `lock OFF` (though it takes effect) and to the first `lock on`."""
+
+    def _handle(self, cmd):
+        if cmd.startswith("lock OFF = ") and not getattr(self, "_dropped_off", False):
+            self._dropped_off = True
+            self.commands.append(cmd)
+            self._handle_lock(cmd)  # the logger acts on it ...
+            self._out.clear()  # ... but its reply is lost
+            self.dropped.append(cmd)
+            return
+        super()._handle(cmd)
+
+
+def test_a_logger_that_drops_lock_replies_ends_up_locked(rig):  # noqa: F811
+    fake = rig.add("usbmodem101", cls=DropsLockReplies, n_samples=100, drop_first={"lock on"})
+    cli.run(rig.settings(), once=True, port=None)
+    assert "OFFLOAD INCOMPLETE" not in rig.console_text()
+    assert fake.locked  # `lock OFF` reply lost -> the tool re-locks anyway; `lock on` reply lost -> re-sent
+    assert [c for c in fake.dropped if c.startswith("lock")] == [c for c in fake.dropped]  # exactly those two
+    assert fake.commands.count("lock on") >= 2
+    (rec,) = (rig.tmp / "raw").glob("081500_*.json")
+    assert json.loads(rec.read_text())["snapshot_before"]["channels_read_unlocked"] is False
+    assert list(rig.tmp.glob("081500_*.nc"))
