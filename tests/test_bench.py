@@ -3,6 +3,7 @@ then gives no reply at all to a command. Reads are re-sent once, as Ruskin does,
 that fails does not abort the offload. (The concerto3 `status = on` case from the same session is in
 test_offload.test_concerto3_reporting_on_off_channel_status.)"""
 
+import io
 import json
 import time
 
@@ -179,3 +180,58 @@ def test_a_logger_that_drops_lock_replies_ends_up_locked(rig):  # noqa: F811
     (rec,) = (rig.tmp / "raw").glob("081500_*.json")
     assert json.loads(rec.read_text())["snapshot_before"]["channels_read_unlocked"] is False
     assert list(rig.tmp.glob("081500_*.nc"))
+
+
+# --- configure on fwtype 0 (RBRsolo firmware 1.110): same sequence as fwtype 9, no energy counter, no endtime write
+
+
+def test_configure_fwtype0_through_the_real_link(fake_link):
+    from fakelogger import FakeSoloWritable
+
+    from rbr_tpw.configure import ConfigError, DeployConfig, configure
+
+    fake = FakeSoloWritable("/dev/cu.fake", fwtype=0, serial=76313, n_samples=50)
+    fake.state["endtime"] = "20991231235959"
+    link = fake_link(fake)
+    report = configure(link, 76313, DeployConfig(set_clock=False), ntp_offset_s=0.0, log=lambda *a: None, fwtype=0)
+    assert [s["step"] for s in report["steps"]] == ["stop_sent", "stop", "schedule", "erase_sent", "erase", "verify",
+                                                    "enable_sent", "enable"]
+    sched = next(s for s in report["steps"] if s["step"] == "schedule")
+    assert sched["endtime_written"] is False and sched["period_ms"] == 500  # the logger's own period was kept
+    sent = fake.commands
+    assert not any(c.startswith(("endtime = ", "powerstatus remaining")) for c in sent)
+    assert "sampling mode = continuous, period = 500" in sent and "starttime = 20000101000000" in sent
+    assert report["readback"]["status"] == "logging" and fake.state["used"] == 512 and fake.locked
+    # a battery-counter request is refused before anything is written
+    fake2 = FakeSoloWritable("/dev/cu.fake2", fwtype=0, serial=76313, n_samples=50)
+    link2 = fake_link(fake2)
+    with pytest.raises(ConfigError, match="no energy counter"):
+        configure(link2, 76313, DeployConfig(set_clock=False, fresh_battery=True), 0.0, log=lambda *a: None, fwtype=0)
+    assert "stop" not in fake2.commands and fake2.state["status"] == "logging"
+
+
+def test_cli_configure_on_a_fwtype0_solo(tmp_path, monkeypatch):
+    from fakelogger import FakeSoloWritable
+
+    from rbr_tpw.console import Console, setup_logging
+
+    fake = FakeSoloWritable("/dev/cu.X", fwtype=0, serial=76313, n_samples=50)
+    monkeypatch.setattr(link_module, "open_serial", lambda port, baudrate: fake)
+    monkeypatch.setattr(cli, "rbr_ports", lambda: {"/dev/cu.X"})
+    monkeypatch.setattr(cli, "ruskin_running", lambda: False)
+    monkeypatch.setattr(cli, "SETTLE_S", 0.0)
+    monkeypatch.setattr(cli, "ONCE_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "measure_clock_skew", lambda link, **k: {
+        "n": 3, "skew_vs_host_s": 0.0, "uncertainty_s": 0.003, "spread_s": 0.001, "measured_at": ""})
+    code = 0
+    try:
+        cli.main([str(tmp_path), "--once", "--no-ntp", "--configure", "--no-clock", "--yes"])
+    except SystemExit as exc:
+        code = exc.code
+    finally:
+        setup_logging(Console(stream=io.StringIO()))
+    assert code == 0
+    (rep,) = (tmp_path / "raw").glob("*76313_*_configure.json")  # the fake reports its serial unpadded
+    report = json.loads(rep.read_text())
+    assert [s["step"] for s in report["steps"]][-1] == "enable" and "error" not in report
+    assert fake.state["status"] == "logging" and fake.state["used"] == 512 and fake.locked

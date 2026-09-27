@@ -307,8 +307,8 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
                     driver: Driver | None = None) -> dict:
     cfg = s.deploy
     if driver is not None and not driver.configurable:
-        log.warning("--configure is implemented only for RBRsolo fwtype 9 so far; SN%s (fwtype %s) was offloaded "
-                    "but not changed", sn, driver.fwtype)
+        log.warning("--configure is implemented only for RBRsolo (fwtype 9 and 0) so far; SN%s (fwtype %s) was "
+                    "offloaded but not changed", sn, driver.fwtype)
         _not_ready[link.port] = f"not configured: --configure is not supported for fwtype {driver.fwtype}"
         return {"skipped": f"configure not supported for fwtype {driver.fwtype}"}
     plan = []
@@ -355,7 +355,8 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     _stage(link.port, "configuring")
     try:
         # Runs to the end even after Ctrl-C: stopping between erase and enable would leave the logger idle.
-        report = configure(link, int(sn), cfg, ntp.get("offset_s"), log=log.info, timing=timing_critical)
+        report = configure(link, int(sn), cfg, ntp.get("offset_s"), log=log.info, timing=timing_critical,
+                           fwtype=driver.fwtype if driver is not None else 9)
     except (ConfigError, LinkError) as err:
         log.error("CONFIGURE FAILED: %s", err)
         log.debug("configure traceback", exc_info=True)

@@ -297,9 +297,10 @@ class FakeSoloWritable(FakeSolo):
             "status": f"status = {st['status']}",
             "starttime": f"starttime = {st['starttime']}",
             "endtime": f"endtime = {st['endtime']}",
-            "sampling": f"sampling {st['sampling']}",
+            "sampling": f"sampling {'schedule = 1, ' if self.fwtype == 0 else ''}{st['sampling']}",
             "meminfo": f"meminfo used = {st['used']}, remaining = {MEMORY_SIZE - st['used']}, size = {MEMORY_SIZE}",
-            "powerstatus": f"powerstatus source = usb, int = 3634, remaining = {st['remaining']}",
+            "powerstatus": ("powerstatus source = usb, int = 3491" if self.fwtype == 0 else
+                            f"powerstatus source = usb, int = 3634, remaining = {st['remaining']}"),
         })
         return r
 
@@ -328,6 +329,8 @@ class FakeSoloWritable(FakeSolo):
             return self._reply("E0401 , verify = logging")
         if self.locked:
             return self._reply("E0102 invalid command")
+        if self.fwtype == 0 and cmd.startswith(("endtime = ", "powerstatus remaining = ")):
+            return self._reply("E0102 invalid command")  # never seen from a fwtype-0 logger: assumed unsupported
         if cmd == "stop":
             if st["status"] not in ("logging", "pending"):
                 return self._reply(f"E0406 stop = {st['status']}")

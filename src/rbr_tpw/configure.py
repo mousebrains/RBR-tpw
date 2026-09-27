@@ -1,10 +1,14 @@
-"""Configure and enable an RBRsolo (fwtype 9): clock, battery counter, schedule, erase, enable.
+"""Configure and enable an RBRsolo (fwtype 9, and fwtype 0): clock, battery counter, schedule, erase, enable.
 
 The write sequence mirrors what Ruskin 2.26.1 sends to these loggers (from
 ~/Ruskin/logs/ruskin_serial.log, 2026-09-25): `lock OFF = <session key>`,
 `stop`, `now = <UTC>`, `starttime = `, `endtime = `, `sampling mode = , period = `,
 `verify`, `permit memclear`, `memclear`, `enable`, `lock on`.
 Erasing is only allowed after the same session's download has been saved.
+
+fwtype 0 (RBRsolo firmware 1.110): Ruskin's logs (2026-09-27 check, 13 loggers) show the same commands and
+replies, except that there is no energy counter (no `powerstatus remaining =` write) and Ruskin never wrote
+`endtime =` to one, so that write is skipped when the logger already holds the wanted end time.
 """
 
 from __future__ import annotations
@@ -163,11 +167,14 @@ def set_clock(link: Link, ntp_offset_s: float | None, tolerance_s: float, attemp
 
 
 def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float | None, log=print,
-              timing=nullcontext) -> dict:
+              timing=nullcontext, fwtype: int = 9) -> dict:
     """Apply `cfg`. Caller must already have saved this session's download if cfg.erase.
 
     `ntp_offset_s` is UTC minus host (None: no NTP, so the clock is set to the host clock).
-    `timing(what)` wraps the host-timestamp-sensitive steps (see hostclock.timing_critical)."""
+    `timing(what)` wraps the host-timestamp-sensitive steps (see hostclock.timing_critical).
+    `fwtype` is 9 or 0 (see the module docstring for what differs on 0)."""
+    if fwtype not in (0, 9):
+        raise ConfigError(f"configure is implemented for RBRsolo fwtype 9 and 0, not fwtype {fwtype}")
     report: dict = {"config": asdict(cfg), "steps": [],
                     "clock_reference": "UTC (host clock corrected by NTP)" if ntp_offset_s is not None else
                     "host clock (no NTP)"}
@@ -180,13 +187,16 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float | 
     cur = link.query("sampling")
     start, end, period = validate(cfg, int(cur.get("period", "0") or 0))
     battery = cfg.battery_fraction()
+    if battery is not None and fwtype == 0:  # checked before anything is written
+        raise ConfigError("this logger (fwtype 0) has no energy counter: --fresh-battery and --used-battery do not "
+                          "apply; leave them out")
     if cfg.enable and not cfg.erase:  # checked before anything is written: the logger would refuse at `verify`
         used = memory(link).get("used", 0)
         if used > 0:
             raise ConfigError(f"logger memory holds {used} bytes: enabling needs an erase (the logger refuses with "
                               "E0402). Allow the erase, or use --no-enable to change settings only.")
     try:
-        _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery)
+        _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery, fwtype)
         # Read back what the logger now holds.
         back = {k: link.query(k)[k] for k in ("status", "starttime", "endtime")}
         back["sampling"] = link.query("sampling")
@@ -205,7 +215,7 @@ def configure(link: Link, serial: int, cfg: DeployConfig, ntp_offset_s: float | 
     return report
 
 
-def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery):
+def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, end, period, battery, fwtype=9):
     with Session(link, serial) as s:
         status = link.query("status")["status"]
         if status in ("logging", "pending"):  # "stopped", "disabled", "finished" need no stop
@@ -247,9 +257,16 @@ def _apply(link, serial, cfg, ntp_offset_s, log, timing, report, step, start, en
             log(f"    battery counter set to {got['energy_remaining_J']:.0f} J, {what}")
 
         s.write(f"starttime = {start}")
-        s.write(f"endtime = {end}")
+        # `endtime =` is verified on fwtype 9 (SN100689). Ruskin never wrote it to a fwtype-0 logger in the logs in
+        # hand, so there it is only written when the logger's end time differs from the wanted one.
+        endtime_written = True
+        if fwtype == 0 and link.query("endtime").get("endtime") == end:
+            endtime_written = False
+            link.note(f"endtime already {end}: not written (the write is unverified on fwtype 0)")
+        else:
+            s.write(f"endtime = {end}")
         s.write(f"sampling mode = {cfg.mode}, period = {period}")
-        step("schedule", starttime=start, endtime=end, mode=cfg.mode, period_ms=period)
+        step("schedule", starttime=start, endtime=end, mode=cfg.mode, period_ms=period, endtime_written=endtime_written)
         log(f"    schedule: {cfg.mode}, {period} ms, start {start}, end {end}")
 
         if cfg.erase:

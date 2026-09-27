@@ -19,7 +19,7 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 | Logger | `id fwtype` | Offload (read-only) | NetCDF | Configure |
 |---|---|---|---|---|
 | RBRsolo T, firmware 1.000 | 9 | yes, tested on a logger | yes | yes |
-| RBRsolo T, firmware 1.110 | 0 | yes | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | – |
+| RBRsolo T, firmware 1.110 | 0 | yes, tested on 13 loggers | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | yes (same sequence as fwtype 9; no energy counter, so no `--fresh-battery`) |
 | RBRduet (L2) | 102 | yes | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
 | RBRconcerto (L2) | 103 | yes | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
 | RBRconcerto³ and other Gen3 (L3) | 104 | yes | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
@@ -32,8 +32,8 @@ loggers leave their hidden channels (e.g. the pressure-compensation thermistor, 
 set) out of the list and answer `status = on` instead of the numeric status; the record says whether the table
 was read unlocked (`channels_read_unlocked`). Whatever the decoder does, the raw memory, the settings record and
 the serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
-download later, e.g. after a decoder is added. `--configure` refuses any logger but fwtype 9: it erases memory,
-and the write sequence has only been checked on that model. A Gen4 logger's download keeps every dataset
+download later, e.g. after a decoder is added. `--configure` refuses any logger but the RBRsolo (fwtype 9 and 0): it erases memory,
+and the write sequence has only been checked on those models. A Gen4 logger's download keeps every dataset
 and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning names any other
 dataset or schedule that holds data.
 

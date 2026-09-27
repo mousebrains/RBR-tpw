@@ -124,7 +124,7 @@ def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.n
 
 class Driver:
     family = "?"
-    configurable = False  # --configure (writes to the logger) is implemented and tested for fwtype 9 only
+    configurable = False  # --configure (writes to the logger): RBRsolo fwtype 9 (tested 2026-09-26) and 0
     energy_model = False  # power.py's RBRsolo T model applies
     l3 = False  # Gen3 `readdata` transfers
 
@@ -183,7 +183,7 @@ class L2Driver(Driver):
 
     def __init__(self, fwtype: int):
         super().__init__(fwtype)
-        self.configurable = fwtype == 9
+        self.configurable = fwtype in (0, 9)
         self.energy_model = fwtype in (0, 9)  # RBRsolo T constants; fwtype 0 has no energy counter
 
     def clock_now(self, link: Link) -> str:
