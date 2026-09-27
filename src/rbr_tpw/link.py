@@ -224,8 +224,22 @@ class Link:
                 raise LinkError(f"timeout waiting for prompt after {cmd!r}")
             self._buf += self.ser.read(max(1, self.ser.in_waiting))
 
-    def query(self, cmd: str, timeout: float = 3.0) -> dict[str, str]:
-        return parse_pairs(self.command(cmd, timeout))
+    def query(self, cmd: str, timeout: float = 3.0, retries: int = 1) -> dict[str, str]:
+        """A read command's reply as key/value pairs. Unlike command(), a read is re-sent once if no reply comes.
+
+        RBRconcerto SN060275 (fwtype 103, fw 1.460) now and then gives no reply at all to a command, with nothing
+        before or after it to explain why (bench 2026-09-26: the sixth of six back-to-back `now` polls; a probe of
+        1000 such polls lost none). Ruskin's own serial log shows the same logger dropping `sensor 1`, and Ruskin
+        re-sending it after 3 s. Writes are not retried here: a re-sent `now = X` would set the clock late."""
+        for attempt in range(retries + 1):
+            try:
+                return parse_pairs(self.command(cmd, timeout))
+            except LinkError as err:
+                if isinstance(err, LoggerError) or attempt == retries:
+                    raise
+                self.note(f"no reply to {cmd!r}; re-sending it once (as Ruskin does)")
+                self._drain(0.3)
+        raise AssertionError("unreachable")
 
     def read_data(self, dataset: int, size: int, offset: int, timeout: float = 10.0, retries: int = 5,
                   l3: bool = False) -> bytes:

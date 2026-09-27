@@ -436,8 +436,12 @@ def offload(port: str, s: Settings) -> Path | None:
             log.warning("NTP query to %s failed (%s): clock skews are relative to the host clock, not UTC",
                         s.ntp_server, ntp.get("error"))
         _stage(port, "measuring clock skew")
-        with timing_critical("clock skew"):
-            skew = measure_clock_skew(link, clock=driver.clock_now)
+        try:
+            with timing_critical("clock skew"):
+                skew = measure_clock_skew(link, clock=driver.clock_now)
+        except LinkError as err:  # a logger that stops answering for a moment: not a reason to skip the download
+            link.note(f"clock skew not measured: {err}")
+            skew = {"n": 0, "error": str(err)}
         log.debug("clock skew: %s", skew)
         if skew.get("n"):
             off = ntp.get("offset_s")

@@ -88,11 +88,16 @@ class FakePort:
     `bytes_per_s` throttles transfers like a real logger; `fail_at_offset` makes a transfer fail."""
 
     def __init__(self, port: str, bytes_per_s: float | None = None, fail_at_offset: int | None = None,
-                 skew_s: float = 0.0):
+                 skew_s: float = 0.0, drop_every: int | None = None, drop_first: set[str] | None = None):
         self.port = port
         self.bytes_per_s = bytes_per_s
         self.fail_at_offset = fail_at_offset
         self.skew_s = skew_s
+        # No reply at all (no line, no prompt), as RBRconcerto SN060275 (fw 1.460) does now and then: to every Nth
+        # command (drop_every), or to the first occurrence of each command named in drop_first.
+        self.drop_every = drop_every
+        self.drop_first = set(drop_first or ())
+        self.dropped: list[str] = []
         self.datasets: dict[int, bytes] = {}
         self.timeout = 0.02
         self.commands: list[str] = []
@@ -162,6 +167,10 @@ class FakePort:
         if cmd == "":
             with self._lock:
                 self._out += b"Ready: "
+            return
+        if (self.drop_every and len(self.commands) % self.drop_every == 0) or cmd in self.drop_first:
+            self.drop_first.discard(cmd)
+            self.dropped.append(cmd)  # silence: no reply line, no prompt
             return
         if cmd.startswith("read data "):
             dataset, size, offset = (int(x) for x in cmd.split()[2:5])
