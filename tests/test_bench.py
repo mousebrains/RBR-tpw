@@ -235,3 +235,34 @@ def test_cli_configure_on_a_fwtype0_solo(tmp_path, monkeypatch):
     report = json.loads(rep.read_text())
     assert [s["step"] for s in report["steps"]][-1] == "enable" and "error" not in report
     assert fake.state["status"] == "logging" and fake.state["used"] == 512 and fake.locked
+
+
+# --- a sensor that failed after the deployment was recorded: decode by the header's statuses, not today's
+
+
+def test_channel_stored_per_header_when_the_logger_now_says_otherwise(rig):  # noqa: F811
+    """RBRduet SN081015 (bench 2026-09-27): its compensation thermistor was stored during the July deployment
+    (header status 9) but now reports status 31, unresponsive. Decoding with today's two stored channels misread
+    every 12-byte sample set; the header's three are right."""
+    fake = rig.add("usbmodem101", cls=FakeDuet, n_samples=200)
+    base = fake._replies
+
+    def replies():
+        r = base()
+        r["channel 3"] = (r["channel 3"].replace("status = 9", "status = 31")
+                          .replace("readtime = 40", "readtime = 4294967295"))
+        r["channels"] = r["channels"].replace("on = 3", "on = 2")
+        return r
+
+    fake._replies = replies
+    cli.run(rig.settings(), once=True, port=None)
+    text = rig.console_text()
+    assert "OFFLOAD INCOMPLETE" not in text
+    assert "the logger now reports status 31, the deployment header status 9; decoded as recorded" in text
+    (rec,) = (rig.tmp / "raw").glob("081500_*.json")
+    snap = json.loads(rec.read_text())["snapshot_before"]
+    assert [c["status"] for c in snap["channels_all"]] == [0, 0, 31] and len(snap["channel_list"]) == 2  # as reported
+    (nc,) = rig.tmp.glob("081500_*.nc")
+    with netCDF4.Dataset(nc) as ds:
+        assert len(ds["time"]) == 200 and "temperature03" in ds.variables and "pressure" in ds.variables
+        assert ds["temperature03"].rbr_channel_status == 9
