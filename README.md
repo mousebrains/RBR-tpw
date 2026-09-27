@@ -19,7 +19,7 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 | Logger | `id fwtype` | Offload (read-only) | NetCDF | Configure |
 |---|---|---|---|---|
 | RBRsolo T, firmware 1.000 | 9 | yes, tested on a logger | yes | yes |
-| RBRsolo T, firmware 1.110 | 0 | yes, tested on 13 loggers | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | yes (same sequence as fwtype 9; no energy counter, so no `--fresh-battery`) |
+| RBRsolo T, firmware 1.110 | 0 | yes, tested on 13 loggers | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | yes, tested on a logger (same sequence as fwtype 9; no energy counter, so no `--fresh-battery`) |
 | RBRduet (L2) | 102 | yes | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
 | RBRconcerto (L2) | 103 | yes | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
 | RBRconcerto³ and other Gen3 (L3) | 104 | yes | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
