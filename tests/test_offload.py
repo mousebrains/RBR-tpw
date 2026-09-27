@@ -281,7 +281,11 @@ def test_bench_mix_solo0_duet_concerto3_in_parallel(rig, monkeypatch):
         assert len(ds["time"]) == 10_000 and list(ds["event_type"][:]) == [0x18, 0x19]
         assert {"conductivity", "temperature", "pressure", "sea_pressure", "depth", "salinity"} <= set(ds.variables)
     assert any(c.startswith("readdata size = ") for c in c3.commands)
-    assert not any("=" in c and not c.startswith("readdata") for c in c3.commands + duet.commands + solo0.commands)
+    # nothing is written: the only commands with `=` are Gen3 `readdata` reads and the write-lock handshake
+    # (`lock OFF = <key>` ... `lock on`) that reveals the full channel table, as Ruskin does on every connection
+    sent = c3.commands + duet.commands + solo0.commands
+    assert not any("=" in c and not c.startswith(("readdata", "lock OFF = ")) for c in sent)
+    assert all(c in ("lock on", "lock") or c.startswith("lock OFF = ") for c in sent if c.startswith("lock"))
 
 
 def test_configure_refused_for_other_families(rig, monkeypatch):
@@ -289,7 +293,10 @@ def test_configure_refused_for_other_families(rig, monkeypatch):
     duet = rig.add("usbmodemD", cls=FakeDuet, n_samples=100)
     cli.run(rig.settings(deploy=DeployConfig(), assume_yes=True), once=True, port=None)
     assert "--configure is implemented only for RBRsolo fwtype 9" in rig.console_text()
-    assert not any(c.startswith(("lock", "stop", "enable", "memclear", "permit")) for c in duet.commands)
+    assert not any(c.startswith(("stop", "enable", "memclear", "permit", "now =", "starttime =", "endtime =",
+                                 "sampling mode", "powerstatus remaining =")) for c in duet.commands)
+    assert [c for c in duet.commands if c.startswith("lock")] == [c for c in duet.commands
+                                                                 if c.startswith("lock OFF = ") or c == "lock on"]
 
 
 def test_unsupported_fwtype_is_left_alone(rig):
@@ -299,20 +306,40 @@ def test_unsupported_fwtype_is_left_alone(rig):
     assert "fwtype 77 is not supported yet" in rig.console_text() and fake.commands[-1] == "id"
 
 
-def test_concerto3_reporting_on_off_channel_status(rig, monkeypatch):
-    """SN233442 on 2026-09-26 (bench): six channels, each `status = on` (the L3 ref 4.7.2 form), where the day before
-    it gave Ruskin the numeric bitfield. int('on') aborted the offload before any download."""
+def test_concerto3_channel_table_is_read_unlocked(rig, monkeypatch):
+    """SN233442 on 2026-09-26 (bench): locked it listed six channels, each `status = on` (L3 ref 4.7.2), where
+    Ruskin's logs show eight with the numeric bitfield. Ruskin unlocks first; so does the tool now, keyed on
+    the `clock` reply. int('on') had aborted the offload before any download."""
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
-    rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300, status_form="onoff")
+    fake = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300)
     cli.run(rig.settings(), once=True, port=None)
     assert "OFFLOAD INCOMPLETE" not in rig.console_text()
+    assert fake.unlocks == 1 and fake.locked
     (rec,) = (rig.tmp / "raw").glob("233442_*.json")
     snap = json.loads(rec.read_text())["snapshot_before"]
-    assert [c["status_as_reported"] for c in snap["channels_all"]] == ["on"] * 6
-    assert [c["status"] for c in snap["channel_list"]] == [0] * 6  # all six stored, the three derived ones included
+    assert snap["channels_read_unlocked"] is True
+    assert [c["status_as_reported"] for c in snap["channels_all"]] == ["0"] * 6 + ["13"] * 2
+    assert [c["status"] for c in snap["channel_list"]] == [0] * 6  # the six stored, the three derived ones included
     (nc,) = rig.tmp.glob("233442_*.nc")
     with netCDF4.Dataset(nc) as ds:
         assert len(ds["time"]) == 300 and ds["salinity"].rbr_channel_status == 0
+
+
+def test_concerto3_locked_listing_still_decodes(rig, monkeypatch):
+    """If the unlock is refused, the locked six-channel `status = on` list is exactly what EasyParse stores."""
+    monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
+    fake = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300)
+    fake.refuse_unlock = True
+    cli.run(rig.settings(), once=True, port=None)
+    assert "OFFLOAD INCOMPLETE" not in rig.console_text() and fake.locked
+    (rec,) = (rig.tmp / "raw").glob("233442_*.json")
+    snap = json.loads(rec.read_text())["snapshot_before"]
+    assert snap["channels_read_unlocked"] is False
+    assert [c["status_as_reported"] for c in snap["channels_all"]] == ["on"] * 6
+    assert [c["status"] for c in snap["channel_list"]] == [0] * 6
+    (nc,) = rig.tmp.glob("233442_*.nc")
+    with netCDF4.Dataset(nc) as ds:
+        assert len(ds["time"]) == 300
 
 
 def test_rebuild_gen3_record(rig, monkeypatch, tmp_path):

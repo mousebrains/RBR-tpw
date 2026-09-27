@@ -27,11 +27,10 @@ import numpy as np
 
 from . import solo
 from .link import Link, LoggerError
+from .lock import unlocked_if_possible
 from .ncwrite import ChannelValues, write_netcdf, write_values_netcdf
 from .rawbin import FLAG_ERROR_CODE, event_indices, reset_segments
-
-STATUS_HIDDEN = 0x01  # channelStatus bits (L3 ref; RBR's pyRSKtools)
-STATUS_NOT_STORED = 0x04
+from .solo import STATUS_HIDDEN, STATUS_NOT_STORED, channel_status
 
 
 class DecodeUnavailable(Exception):
@@ -63,32 +62,15 @@ def _iso(compact: str | None) -> str:
     return t.isoformat().replace("+00:00", "Z")
 
 
-def channel_status(value) -> int | None:
-    """`channel N ... status = X` as the STATUS_* bitfield, or None if X is not understood.
-
-    Gen3 loggers answer `on` or `off` (L3 ref 4.7.2, and RBRconcerto3 SN233442 on 2026-09-26), or the numeric
-    channelStatus bitfield that L2 loggers use (the same SN233442 answered `0` and `13` in Ruskin's logs the day
-    before, with two hidden channels it no longer lists). Per the reference, `on` means sampled and stored (derived
-    channels included in EasyParse, never in rawbin00) and `off` means neither, so `off` maps to STATUS_NOT_STORED."""
-    v = str(value).strip().lower()
-    if v in ("", "on"):
-        return 0
-    if v == "off":
-        return STATUS_NOT_STORED
-    try:
-        return int(v)
-    except ValueError:
-        return None
-
-
-def _channels(link: Link, count: int) -> list[dict]:
+def _channels(link: Link, count: int, easyparse: bool = True) -> list[dict]:
     out = []
     for i in range(1, count + 1):
         ch = link.query(f"channel {i}")
         cal = _q(link, f"calibration {i}")
         ch["index"] = i
         ch["status_as_reported"] = ch.get("status", "")
-        status = channel_status(ch["status_as_reported"])
+        derived = ch.get("derived", "").lower() == "on" or ch.get("equation", "").startswith("deri_")
+        status = channel_status(ch["status_as_reported"], stored_if_on=easyparse or not derived)
         if status is None:  # not fatal: the download is still saved; a wrong channel count shows up in the decode
             link.note(f"channel {i}: status {ch['status_as_reported']!r} not understood; treated as a stored channel")
             status = 0
@@ -148,6 +130,7 @@ class Driver:
 
     def __init__(self, fwtype: int):
         self.fwtype = fwtype
+        self.serial: int | None = None  # set once the logger is identified; lets the L2 snapshot unlock
 
     def clock_now(self, link: Link) -> str:
         raise NotImplementedError
@@ -219,7 +202,9 @@ class L2Driver(Driver):
                                "no energy estimate is made.")
 
     def snapshot(self, link: Link) -> dict:
-        snap = solo.snapshot(link)
+        # duets and concertos hide their compensation thermistor while locked; solos have one channel and no lock
+        # to speak of, and fwtype 0 is untested with `lock OFF`, so only 102/103 unlock
+        snap = solo.snapshot(link, unlock_serial=self.serial if self.fwtype in (102, 103) else None)
         snap["power"] = self._power(link, snap["power"])
         snap["channels_all"] = snap["channel_list"]
         snap["channel_list"] = [c for c in snap["channels_all"] if not c["status"] & STATUS_NOT_STORED]
@@ -273,10 +258,15 @@ class Gen3Driver(Driver):
         dep = link.query("deployment")
         snap = {"now": clock.get("datetime", ""), "clock": clock, "status": dep.get("status", ""),
                 "starttime": dep.get("starttime", ""), "endtime": dep.get("endtime", ""),
-                "sampling": _q(link, "sampling"), "channels": link.query("channels")}
-        snap["channels_all"] = _channels(link, int(snap["channels"]["count"]))
-        snap["channel_list"] = [c for c in snap["channels_all"] if not c["status"] & STATUS_NOT_STORED]
+                "sampling": _q(link, "sampling")}
         snap["memformat"] = _q(link, "memformat")
+        easyparse = snap["memformat"].get("type") == "calbin00"  # rawbin00 never stores derived channels (4.7.2)
+        # unlocked, as Ruskin reads it: locked, the logger leaves hidden channels out and answers `status = on`
+        with unlocked_if_possible(link, self.serial, clock_cmd="clock") as unlocked:
+            snap["channels"] = link.query("channels")
+            snap["channels_read_unlocked"] = unlocked
+            snap["channels_all"] = _channels(link, int(snap["channels"]["count"]), easyparse=easyparse)
+        snap["channel_list"] = [c for c in snap["channels_all"] if not c["status"] & STATUS_NOT_STORED]
         snap["dataset_meminfo"] = {str(d): self._meminfo(link, d) for d in (0, 1, 2)}
         snap["meminfo"] = snap["dataset_meminfo"]["1"]
         snap["power"] = self._power(link)

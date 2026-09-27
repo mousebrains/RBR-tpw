@@ -26,8 +26,12 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 | Gen4 (L3.5) | 120 | from RBR's command reference only; untested | untested | – |
 | Anything else | – | detected and skipped; nothing is changed | – | – |
 
-Offload only reads from the logger. Whatever the decoder does, the raw memory, the settings record and the
-serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
+Offload only reads from the logger, apart from the write-lock handshake Ruskin also does on every connection:
+`lock OFF = <key>` before the channel table is read and `lock on` after. Locked, duets, concertos and Gen3
+loggers leave their hidden channels (e.g. the pressure-compensation thermistor, which is stored in every sample
+set) out of the list and answer `status = on` instead of the numeric status; the record says whether the table
+was read unlocked (`channels_read_unlocked`). Whatever the decoder does, the raw memory, the settings record and
+the serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
 download later, e.g. after a decoder is added. `--configure` refuses any logger but fwtype 9: it erases memory,
 and the write sequence has only been checked on that model. A Gen4 logger's download keeps every dataset
 and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning names any other
