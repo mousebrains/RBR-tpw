@@ -124,7 +124,7 @@ def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.n
 
 class Driver:
     family = "?"
-    configurable = False  # --configure (writes to the logger): RBRsolo fwtype 9 (tested 2026-09-26) and 0
+    configurable = False  # --configure (writes to the logger): RBRsolo fwtype 9 and 0, both run on loggers
     energy_model = False  # power.py's RBRsolo T model applies
     l3 = False  # Gen3 `readdata` transfers
 

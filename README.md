@@ -32,10 +32,10 @@ loggers leave their hidden channels (e.g. the pressure-compensation thermistor, 
 set) out of the list and answer `status = on` instead of the numeric status; the record says whether the table
 was read unlocked (`channels_read_unlocked`). Whatever the decoder does, the raw memory, the settings record and
 the serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
-download later, e.g. after a decoder is added. `--configure` refuses any logger but the RBRsolo (fwtype 9 and 0): it erases memory,
-and the write sequence has only been checked on those models. A Gen4 logger's download keeps every dataset
-and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning names any other
-dataset or schedule that holds data.
+download later, e.g. after a decoder is added. `--configure` refuses any logger but the RBRsolo (fwtype 9 and
+0): it erases memory, and the write sequence has only been checked on those models. A Gen4 logger's download
+keeps every dataset and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning
+names any other dataset or schedule that holds data.
 
 The command sequences come from what RBR's Ruskin 2.26.1 sends each model (its serial logs), and from RBR's
 command references. Only the fwtype-9 solo has been run against real hardware so far. The fwtype-9 protocol is
