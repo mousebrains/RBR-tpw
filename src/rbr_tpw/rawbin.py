@@ -102,6 +102,14 @@ EVENT_NAMES = {  # L3 command reference rev L, section 5.3.3
 }
 RTC_RESET_EVENTS = {0x06, 0x0A, 0x0B}
 RESTART_EVENTS = {0x0A, 0x0B}  # sampling restarted on a reset clock: the next sample set is re-anchored here
+EVENT_CPU_RESET = 0x04
+# Events whose timestamp is the time of the next sample set (8-byte events carry no "affects the next sample" flag,
+# so this is by type): the time-sync marker, the restarts on a reset clock, and a CPU reset with the clock intact.
+# The last: RBRsolo SN076315 (fwtype 0), bench 2026-09-26, browned out at 2.4 V on 2026-09-23, stopped sampling,
+# and on USB power 3.5 days later wrote `CPU reset detected` (RTC still running, +5 s) and resumed. Counted from
+# the previous sync marker, the samples after it would be dated 3.5 days early. Ruskin's convention for this event
+# is unverified (no .rsk in hand has one); it is applied by analogy with 0x0A/0x0B. Not a clock-segment boundary.
+ANCHOR_EVENTS = {EVENT_TIME_SYNC, EVENT_CPU_RESET} | RESTART_EVENTS
 
 # per-reading flag bits
 FLAG_ERROR_CODE = 1  # 0xF6 error code from the logger
@@ -193,7 +201,7 @@ def decode(image: bytes, nchan: int) -> Decoded:
     """Split a memory image into sample sets and events and assign sample times.
 
     Timing: each time-sync event (type 0x01), and each "sampling restarted
-    after RTC reset" event (0x0A/0x0B), sets the time of the next sample set;
+    after RTC reset" event (0x0A/0x0B) or "CPU reset detected" event (0x04), sets the time of the next sample set;
     later sets follow at the header's sampling period. This reproduces
     Ruskin's timestamps exactly in the normal case. Times are the logger's
     clock. Anchors earlier than the deployment's enable time are on a clock
@@ -254,7 +262,7 @@ def decode(image: bytes, nchan: int) -> Decoded:
     time_ms = np.empty(nsets, np.int64)
     time_flags = np.zeros(nsets, np.uint8)
     segment = np.full(nsets, -1, np.int32)
-    anchors = [e for e in events if e.type == EVENT_TIME_SYNC or e.type in RESTART_EVENTS]
+    anchors = [e for e in events if e.type in ANCHOR_EVENTS]
     first = anchors[0].sample_index if anchors else nsets
     if first > 0:  # sets before any anchor: fall back to the programmed start
         t0 = EPOCH2000_MS + 1000 * max(hdr.start_time, hdr.logger_time)

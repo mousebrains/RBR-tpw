@@ -123,3 +123,30 @@ def test_locked_listing_is_completed_from_the_deployment_header(rig):  # noqa: F
     with netCDF4.Dataset(nc) as ds:
         assert len(ds["time"]) == 200 and "temperature03" in ds.variables and "pressure" in ds.variables
     assert "channel 3 (temp05, status 9) is in the deployment header but the logger did not list it" in text
+
+
+# --- a CPU reset with the clock intact re-anchors the samples that follow it
+
+
+def test_samples_after_a_cpu_reset_event_are_timed_from_it():
+    """RBRsolo SN076315 (bench 2026-09-26): battery down to 2.4 V, sampling stopped on 09-23, USB power 3.5 days
+    later gave `CPU reset detected` (0x04, RTC still running) and sampling resumed. Counted from the last sync
+    marker those samples would be dated 3.5 days early."""
+    import struct
+
+    from fakelogger import SYNC_S, solo_image
+
+    from rbr_tpw.crc import crc16_ccitt
+    from rbr_tpw.rawbin import EPOCH2000_MS, clock_segments, decode
+
+    n_before, gap_s, n_after = 100, 3 * 86400, 7
+    image = bytearray(solo_image(n_before, SYNC_S))
+    body = bytes([0x04, 0xF7]) + struct.pack("<I", SYNC_S + n_before // 2 + gap_s)  # 500 ms period: n/2 s of data
+    image += struct.pack(">H", crc16_ccitt(body)) + body
+    image += (0.42 * (1 << 30) * __import__("numpy").ones(n_after)).astype("<u4").tobytes()
+    d = decode(bytes(image), 1)
+    assert d.raw.shape[0] == n_before + n_after and [e.type for e in d.events] == [0x01, 0x04]
+    t_event = EPOCH2000_MS + 1000 * (SYNC_S + n_before // 2 + gap_s)
+    assert d.time_ms[n_before - 1] == EPOCH2000_MS + 1000 * SYNC_S + 500 * (n_before - 1)  # unchanged before
+    assert d.time_ms[n_before] == t_event and d.time_ms[-1] == t_event + 500 * (n_after - 1)  # re-anchored after
+    assert len(set(clock_segments(d).tolist())) == 1  # the clock was not reset: one clock segment, one skew
