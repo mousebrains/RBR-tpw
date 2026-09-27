@@ -292,7 +292,7 @@ def test_configure_refused_for_other_families(rig, monkeypatch):
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
     duet = rig.add("usbmodemD", cls=FakeDuet, n_samples=100)
     cli.run(rig.settings(deploy=DeployConfig(), assume_yes=True), once=True, port=None)
-    assert "--configure is implemented only for RBRsolo fwtype 9" in rig.console_text()
+    assert "--configure is implemented only for RBRsolo (fwtype 9 and 0)" in rig.console_text()
     assert not any(c.startswith(("stop", "enable", "memclear", "permit", "now =", "starttime =", "endtime =",
                                  "sampling mode", "powerstatus remaining =")) for c in duet.commands)
     assert [c for c in duet.commands if c.startswith("lock")] == [c for c in duet.commands

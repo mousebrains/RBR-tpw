@@ -303,11 +303,23 @@ def _header_completed_channels(image: bytes, snap: dict, warnings: list[str]) ->
     of 9; the ninth, the pressure-compensation thermistor, is stored in every sample set). The header lists them
     all, with type, status and coefficients but no equation name: a temp* channel is decoded as `tmp`, anything
     else keeps its raw readings. Hidden channels come last on every logger seen, so positions still line up."""
-    listed = list(snap.get("channels_all") or snap["channel_list"])
+    listed = [dict(c) for c in (snap.get("channels_all") or snap["channel_list"])]
     try:
         header_channels = parse_l2_header(image).fields.get("channels", [])
     except Exception:  # noqa: BLE001  (an unparseable header is reported by decode_l2 itself)
         return listed
+    # The header describes the data as it was recorded; the logger's list describes the logger now. A sensor that
+    # failed since (RBRduet SN081015, bench 2026-09-27: its compensation thermistor went from status 9, stored, to
+    # 31, not stored, unresponsive) must still be decoded as stored, or every sample set is misread.
+    for ch, hc in zip(listed, header_channels, strict=False):
+        if str(hc.get("type", "")) != str(ch.get("type", "")):
+            break  # a different channel table: leave the logger's statuses alone
+        now, then = int(ch.get("status", 0)), int(hc.get("status", 0))
+        if (now ^ then) & (0x04 | 0x01):
+            ch["status_at_offload"] = now
+            ch["status"] = then
+            warnings.append(f"channel {ch.get('index')} ({ch.get('type')}): the logger now reports status {now}, the "
+                            f"deployment header status {then}; decoded as recorded (header)")
     for hc in header_channels[len(listed):]:
         ctype = str(hc.get("type", ""))
         equation = "tmp" if ctype.startswith("temp") else ""
