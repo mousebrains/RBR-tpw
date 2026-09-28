@@ -673,7 +673,7 @@ def offload(port: str, s: Settings) -> Path | None:
             identity = driver.identity(data)
             off, nbytes = dl.segments.get(primary, (0, len(data[primary])))
             deployment = {
-                "stem": stem, "identity_dataset": driver.identity_dataset, "header_bytes": len(identity),
+                "stem": stem, "identity_dataset": driver.identity_name(data), "header_bytes": len(identity),
                 "header_sha256": sha256(identity), "tail_check": dl.tail_check, "header_changed": dl.header_changed,
                 "offload_index": held.next_index if held is not None else 0,
                 "segment": {"offset": off, "bytes": nbytes, "sha256": sha256(data[primary][off:off + nbytes])},

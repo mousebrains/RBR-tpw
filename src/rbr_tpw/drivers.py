@@ -215,6 +215,10 @@ class Driver:
         blob = data.get(self.identity_dataset, b"")
         return blob if self.identity_bytes is None else blob[: self.identity_bytes]
 
+    def identity_name(self, data: dict[str, bytes]) -> str:
+        """Which dataset (or object) the identity comes from, for the record."""
+        return self.identity_dataset
+
     def primary(self, data: dict[str, bytes]) -> str:
         """The dataset the record's `raw` and the NetCDF describe: the samples, or whatever is not empty."""
         if data.get("dataset1"):
@@ -347,7 +351,9 @@ class L2Driver(Driver):
     def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None, held: Held | None = None,
                  full: bool = False) -> Downloaded:
         """dataset 1: all of it for a new deployment or with `full`; otherwise only the bytes past the held image,
-        after the tail check (the last block of the held image is read back and compared) and the header check.
+        after the identity check: the first and the last block of the held image are read back and compared (the
+        first holds the header and the deployment's first time anchor, which equal data tails cannot vouch for),
+        and a header that changed is accepted only after the whole image has been read and verified.
 
         Only the RBRsolo's 512-byte header reads incrementally. The duet and concerto (sectioned headers) are
         read in full and checked to extend the saved image, as a concerto3 is, until the incremental path has
@@ -386,20 +392,26 @@ class L2Driver(Driver):
             return result
         if total < n_old:
             raise DeploymentMismatch(f"the logger holds {total} bytes, the deployment image {n_old}")
-        head_len = min(hl, total)
+        head_len = min(solo.CHUNK, n_old)  # the header and the start of the data held
         head = link.read_data(1, head_len, 0)
         if len(head) != head_len:
-            raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
-        n = min(solo.CHUNK, n_old)
+            raise LinkError(f"short head read: {len(head)} of {head_len} bytes")
+        n = min(solo.CHUNK, n_old - head_len)  # the end of the data held, unless the first block covered it
         tail = link.read_data(1, n, n_old - n) if n else b""
         if len(tail) != n:
             raise LinkError(f"short tail read: {len(tail)} of {n} bytes at {n_old - n}")
-        tail_check = {"offset": n_old - n, "bytes": n, "ok": True}
-        data_start = max(hl, n_old - n)
-        if tail[data_start - (n_old - n):] != old[data_start:n_old]:
-            first = next(i for i in range(data_start, n_old) if tail[i - (n_old - n)] != old[i])
-            raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}")
+        tail_check = {"head_bytes": head_len, "offset": n_old - n, "bytes": n, "ok": True}
+        for block, at in ((head, 0), (tail, n_old - n)):
+            lo = max(hl, at)
+            if block[lo - at:] != old[lo:at + len(block)]:
+                first = next(i for i in range(lo, at + len(block)) if block[i - at] != old[i])
+                raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}")
         header_changed, header_now = header_check(head)
+        if header_changed:  # never seen within a deployment: accept it only once every byte held is verified
+            link.note(f"header changed at byte(s) {header_changed}: reading the whole image to verify it")
+            result = self.download(link, snap, part_dir, sn, progress, held=held, full=True)
+            result.bytes_read += head_len + n
+            return result
         segment = b""
         if total > n_old:
             segment = solo.download(link, total, part_dir / f"{sn}.{held.stem}.{n_old}.part", progress, start=n_old)
@@ -554,9 +566,27 @@ class Gen4Driver(Driver):
 
     identity_bytes = None
 
+    def selected(self, data: dict[str, bytes]) -> str | None:
+        """The dataset write_netcdf converts (the latest; one dataset per deployment, L3.5 ref 2.1.6)."""
+        try:
+            return self.g._pick(data, None, None)
+        except ValueError:
+            return None
+
     def identity(self, data):
-        meta = sorted(k for k in data if k.endswith("/meta"))
-        return data[meta[0]] if meta else b""
+        ds = self.selected(data)
+        return data.get(f"{ds}/meta", b"") if ds else b""
+
+    def identity_name(self, data):
+        ds = self.selected(data)
+        return f"{ds}/meta" if ds else ""
+
+    def primary(self, data):
+        try:
+            ds, sch, _, _, _ = self.g.columns(data, None)
+            return f"{ds}/{sch}/data"
+        except (ValueError, KeyError):
+            return super().primary(data)
 
     def grows(self, name):  # every object but the metadata may grow
         return not name.endswith("/meta")

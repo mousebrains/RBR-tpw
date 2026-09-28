@@ -403,10 +403,12 @@ def segments_from_starts(n: int, starts: list[SegmentStart]) -> np.ndarray:
 
 
 def _starts(n: int, time_ms: np.ndarray, event_starts: list[tuple[int, int]]) -> list[SegmentStart]:
-    """Segment starts from restart events (sample index, event index) and from backward steps of the clock."""
+    """Segment starts from restart events (sample index, event index) and from backward steps of the clock. A
+    restart event after the last sample (index n) starts an empty segment: no samples yet, but an offload that
+    saw it measured its skew on the clock that restarted, so it must not time the run before it."""
     starts: dict[int, SegmentStart] = {}
     for index, k in event_starts:
-        if 0 < index < n and index not in starts:
+        if 0 < index <= n and index not in starts:
             starts[index] = SegmentStart(index, k)
     if n:
         for i in clock_runs(time_ms)[1:].tolist():
@@ -496,9 +498,9 @@ def resolve_time_arrays(
     # the earlier offload saw: its skew is the last one measured on that clock.
     by_index = {s.sample_index: s for s in starts}
     for before, v in zip(views, views[1:], strict=False):
-        if v.clock_set_before and 0 < before.samples_seen < n:
+        if v.clock_set_before and 0 < before.samples_seen <= n:
             by_index.setdefault(before.samples_seen, SegmentStart(before.samples_seen))
-    starts = [by_index[i] for i in sorted(by_index) if 0 < i < n]
+    starts = [by_index[i] for i in sorted(by_index) if 0 < i <= n]  # a start at n: an empty last segment
     bounds = [0, *[s.sample_index for s in starts], n]
     # each offload's current clock segment: the last one whose start it had seen
     current = [max([j for j, s in enumerate(starts, 1) if v.saw(s)], default=0) for v in views]

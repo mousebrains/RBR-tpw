@@ -46,18 +46,20 @@ D1. **Grow the raw image, regenerate the NetCDF.** The deployment's `.bin` is ex
     new bytes. The NetCDF is rewritten from the whole image every time, with the existing temp-then-rename
     writer. No in-place NetCDF append, no unlimited dimension: HDF5 is not crash-safe, and sample times are
     not append-only (D5).
-D2. **A deployment is identified by serial number and a tail check; the header is metadata.** The latest
-    deployment on disk for this serial number is the only candidate. The last block of the image we hold
-    (up to 68000 bytes ending at the stored offset) is read back from the logger and compared byte for
-    byte. That costs one block read (about 0.4 s) and asks the only question that matters: does the logger
-    still hold the bytes we have, at the same place. A mismatch, or a short read because the memory is now
-    smaller than our image, means a new deployment; the old files are never touched. The header is compared
-    as well, but a header that changed while the data tail matched is the same deployment with changed logger
-    state: the change is recorded (the logger's header in the record as `header_hex`) and warned about, and
-    the offload continues. The saved image keeps the header as first downloaded, so it only ever grows and
-    every record's checksum stays a checksum of a prefix of it (the logger writes its header at enable, L3
-    reference 5.3.1, so a later change is an anomaly to record, not a state to track). Mismatch fails safe:
-    at worst a full download and a new file.
+D2. **A deployment is identified by serial number and an identity check on its data.** The deployment
+    offloaded most recently for this serial number is the only candidate. The first and the last block of
+    the image we hold (up to 68000 bytes each) are read back from the logger and compared byte for byte:
+    two block reads, about 0.8 s. The first block holds the header and the deployment's first time anchor;
+    the tail alone cannot vouch for identity, since a new deployment's data can repeat the old one's tail
+    (a run of identical error words, say: PR #13 follow-up review, finding 1). A mismatch, or a short read
+    because the memory is now smaller than our image, means a new deployment; the old files are never
+    touched. A header that changed while the data matched is never seen within a deployment, so it is
+    accepted only after the whole image has been read and its data verified (as `--full-download` does);
+    then the change is recorded (the logger's header in the record as `header_hex`) and warned about. The
+    saved image keeps the header as first downloaded, so it only ever grows and every record's checksum
+    stays a checksum of a prefix of it (the logger writes its header at enable, L3 reference 5.3.1, so a
+    later change is an anomaly to record, not a state to track). Mismatch fails safe: at worst a full
+    download and a new file.
 D3. **Names stay as they are.** The deployment is named after its first offload, `<SN>_<T0>`, exactly the
     stem an offload gets today. Later offloads of the same deployment rewrite `<SN>_<T0>.nc` and extend
     `raw/<SN>_<T0>.bin`; each offload still writes its own `raw/<SN>_<Tk>.json` record and `.log`
@@ -130,15 +132,16 @@ old-format and still rebuild as before.
      The segment's `.part` file, if it survived, resumes; otherwise the segment is read again.
    - anything else (`L < R`, hash mismatch, file missing): the image is not trustworthy. Log an error
      naming the file, start a new deployment stem with a full download, leave the old files alone.
-5. Tail check (D2): `n = min(68000, R)`; read logger bytes `[R - n, R)` and compare the data part,
-   `[max(R - n, 512), R)`, with the file. A short read (`total < R`) or a difference: a different
-   deployment (erased and enabled in Ruskin or by `--configure`, or a memory we cannot explain). Log it
-   with the first differing offset, new stem, full download. Equal: the offset is confirmed against the
-   data itself. Then compare the header from step 2 with the header the logger reported at the previous
-   offload (its record's `header_hex`, else the image's): differing bytes are listed in the record as
-   `header_changed` and warned about, and the logger's header is kept as `header_hex` whenever it differs from
-   the image's. The image itself is not changed. With `R <= 512` there is no data part, and a differing
-   header is a new deployment. The comparison for settings, status and skew (Ruskin section) is made only
+5. Identity check (D2): read logger bytes `[0, h)` with `h = min(68000, R)`, and `[R - n, R)` with
+   `n = min(68000, R - h)`, and compare their data parts (past the header) with the file. A short read
+   (`total < R`) or a difference: a different deployment (erased and enabled in Ruskin or by `--configure`,
+   or a memory we cannot explain). Log it with the first differing offset, new stem, full download. Equal:
+   the offset is confirmed against the data itself. Then compare the header with the header the logger
+   reported at the previous offload (its record's `header_hex`, else the image's). If it differs, read the
+   whole memory and verify every byte of data held (as `--full-download`); if that matches, the differing
+   bytes are listed in the record as `header_changed` and warned about, and the logger's header is kept as
+   `header_hex` whenever it differs from the image's. The image itself is not changed. With `R <= 512`
+   there is no data part, and a differing header is a new deployment. The comparison for settings, status and skew (Ruskin section) is made only
    now, once the logger is known to hold this deployment.
 6. `total == R`: nothing new. Skip the download; the record, the series point and the NetCDF are still
    written (step 9 onwards).
@@ -578,3 +581,22 @@ the reviewer's reproductions and the tests below.
    UTC, or both against the host clock), with both uncertainties in the tolerance; the status line is drawn
    under the stage lock; Gen4's earlier offloads count their own samples and events. Plan test 6's two
    missing cases are added.
+
+Follow-up review (PR #13, adversarial review of 08fd3a9, 2026-09-28). All four findings reproduced;
+`tests/test_review7.py` holds the reviewer's reproductions and tests for the fixes.
+
+1. Equal data tails merged an erase-and-enable into the old deployment when the new data repeated the
+   old tail (runs of identical error words), and the changed header was taken as an anomaly. Now the
+   first block is compared as well, and a changed header is accepted only after the whole image is
+   verified (D2, step 5).
+2. A restart event after the last sample was dropped when deciding which clock each offload measured, so
+   the next skew, measured on the restarted clock, re-timed the run before it. Now such an event starts an
+   empty clock segment. This changes single-offload output too, deliberately: one offload after a
+   terminal restart no longer re-times the run before it. None of the 146 real images on hand has a
+   restart event after its last sample.
+3. Gen4 took its identity from the lexically first dataset but converted the latest, so a new dataset (a
+   new deployment) overwrote the old deployment's file. Identity, the primary image and the record's
+   `identity_dataset` now come from the dataset converted.
+4. A test's terminal-size mock broke pytest's own reporting under `-v`, so CI stopped after 86 tests on
+   every platform from 7be286e on; on Windows the fake terminal also got no status line (no ANSI on a
+   stream without a console handle). Both fixed in the tests; CI's `pytest -v tests` passes locally.

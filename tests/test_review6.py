@@ -138,7 +138,7 @@ def test_14_ruskin_stop_sync_erase_enable_then_the_new_deployment_reads_incremen
         (True, "full"), (True, "incremental"), (True, "incremental"), (False, "full"), (False, "incremental")]
     assert recs[3]["deployment"]["stem"] == recs[4]["deployment"]["stem"]
     assert {p: (rig.tmp / p if p.endswith(".nc") else rig.tmp / "raw" / p).read_bytes() for p in a_files} == a_files
-    assert all(int(c.split()[4]) >= 520 for c in _reads(fake)[2:])
+    assert _reads(fake)[0] == "read data 1 1720 0" and all(int(c.split()[4]) >= 1720 for c in _reads(fake)[1:])
 
 
 def test_6_a_reset_run_that_ended_before_offload_2_keeps_offload_1s_skew(rig, monkeypatch):

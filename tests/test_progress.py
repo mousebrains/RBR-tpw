@@ -3,6 +3,8 @@
 terminal (PLAN-incremental-offload.md, tests 17-19)."""
 
 import io
+import os
+import sys
 import threading
 
 from test_offload import fast_skew, rig  # noqa: F401  (a fixture)
@@ -19,9 +21,10 @@ class Terminal(io.StringIO):
 
 
 def test_status_line_is_drawn_in_place_and_cleared_around_output(monkeypatch):
-    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=(80, 24): type("S", (), {"columns": 21})())
+    # a real os.terminal_size: pytest itself calls get_terminal_size and unpacks it while reporting (-v)
+    monkeypatch.setattr("shutil.get_terminal_size", lambda fallback=(80, 24): os.terminal_size((21, 24)))
     out = Terminal()
-    console = Console(stream=out, input_fn=lambda q: "y", interactive=True)
+    console = Console(stream=out, input_fn=lambda q: "y", interactive=True, status=True)
     assert console.status_enabled
     console.status("downloading 31%")
     assert out.getvalue() == CLEAR + "downloading 31%"
@@ -50,7 +53,7 @@ def test_no_status_line_off_a_terminal(rig, monkeypatch):
 def test_status_line_on_a_terminal_replaces_the_progress_lines(rig, monkeypatch):
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
     out = Terminal()
-    console = Console(stream=out, input_fn=lambda q: "", interactive=False)
+    console = Console(stream=out, input_fn=lambda q: "", interactive=False, status=True)
     session_log = rig.tmp / "raw" / "tty-session.log"
     setup_logging(console, session_log)
     rig.add("usbmodem1", serial=22, n_samples=40_000, bytes_per_s=400_000)
@@ -71,7 +74,7 @@ def test_two_loggers_on_a_terminal_show_the_summary_not_a_bar(rig, monkeypatch):
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
     monkeypatch.setattr(cli, "STATUS_EVERY_S", 0.05)
     out = Terminal()
-    console = Console(stream=out, input_fn=lambda q: "", interactive=False)
+    console = Console(stream=out, input_fn=lambda q: "", interactive=False, status=True)
     session_log = rig.tmp / "raw" / "tty-session2.log"
     setup_logging(console, session_log)
     for i in (1, 2):
@@ -83,3 +86,12 @@ def test_two_loggers_on_a_terminal_show_the_summary_not_a_bar(rig, monkeypatch):
     assert CLEAR + "in progress: SN31@usbmodem1 " in text
     assert "in progress:" not in session_log.read_text()  # the 30 s summary line is not logged on a terminal
     setup_logging(Console(stream=io.StringIO()))
+
+
+def test_status_line_follows_ansi_support_by_default(monkeypatch):
+    """On a terminal the status line is on; on Windows it needs ANSI processing, which a stream without a console
+    handle cannot have (so a fake terminal gets none there: CI's Windows job, 2026-09-28)."""
+    assert Console(stream=Terminal()).status_enabled == (sys.platform != "win32")
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert not Console(stream=Terminal()).status_enabled
+    assert Console(stream=Terminal(), status=True).status_enabled

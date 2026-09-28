@@ -65,15 +65,14 @@ def test_second_offload_reads_only_the_new_bytes(rig, monkeypatch):
     run(rig)
 
     reads = _reads(fake)
-    assert reads[0] == "read data 1 512 0"  # the header
-    assert reads[1] == f"read data 1 {old_len} 0"  # the tail check: the whole (small) image
-    assert all(int(c.split()[4]) >= old_len for c in reads[2:]) and len(reads) > 2  # then only new bytes
+    assert reads[0] == f"read data 1 {old_len} 0"  # the identity check: the first block, here the whole image
+    assert all(int(c.split()[4]) >= old_len for c in reads[1:]) and len(reads) > 1  # then only new bytes
     assert [p.name for p in rig.tmp.glob("*.nc")] == [f"{stem}.nc"]
     r0, r1 = _records(rig, 100689)
     assert r0["deployment"]["stem"] == stem and r0["deployment"]["download"] == "full"
     assert r1["deployment"] == {**r1["deployment"], "stem": stem, "download": "incremental", "offload_index": 1}
     assert r1["deployment"]["segment"] == {**r1["deployment"]["segment"], "offset": old_len, "bytes": 2000}
-    assert r1["deployment"]["tail_check"] == {"offset": 0, "bytes": old_len, "ok": True}
+    assert r1["deployment"]["tail_check"] == {"head_bytes": old_len, "offset": old_len, "bytes": 0, "ok": True}
     assert (rig.tmp / "raw" / f"{stem}.bin").read_bytes() == fake.image
     assert r1["raw"]["bytes"] == len(fake.image) and r1["raw"]["file"] == f"raw/{stem}.bin"
     with netCDF4.Dataset(nc) as ds:
@@ -95,7 +94,7 @@ def test_nothing_new_still_records_the_offload(rig, monkeypatch):
     run(rig)
     fake.commands.clear()
     run(rig)
-    assert _reads(fake) == ["read data 1 512 0", f"read data 1 {len(fake.image)} 0"]
+    assert _reads(fake) == [f"read data 1 {len(fake.image)} 0"]  # the identity check only
     r0, r1 = _records(rig, 7)
     assert r1["deployment"]["segment"]["bytes"] == 0 and r1["deployment"]["download"] == "incremental"
     (nc,) = rig.tmp.glob("7_*.nc")
@@ -282,7 +281,8 @@ def test_header_change_with_the_data_intact_does_not_split_the_deployment(rig, m
     fake.grow(10)
     run(rig)
     r0, r1 = _records(rig, 14)
-    assert r1["deployment"]["stem"] == r0["deployment"]["stem"] and r1["deployment"]["download"] == "incremental"
+    # accepted only after the whole image was read and verified
+    assert r1["deployment"]["stem"] == r0["deployment"]["stem"] and r1["deployment"]["download"] == "full-verified"
     assert r1["deployment"]["header_changed"] == [32, 33, 34, 35]
     assert any("memory header changed" in w for w in r1["warnings"])
     # the saved image keeps the header as first downloaded, so every record's checksum is of a prefix
