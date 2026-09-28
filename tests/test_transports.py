@@ -115,7 +115,7 @@ def test_stop_and_resume_over_a_socket(served, tmp_path, monkeypatch):
     threading.Event().wait(0.9)
     s.stop.set()
     t.join(10)
-    part = tmp_path / "raw" / ".partial" / "77.bin.part"
+    part = tmp_path / "raw" / ".partial" / "77.new.0.part"
     assert part.exists() and (part.stat().st_size - 512) % 68_000 == 0
     s.stop.clear()
     cli._worker(port, s)

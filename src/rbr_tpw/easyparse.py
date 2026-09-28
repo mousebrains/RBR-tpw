@@ -42,6 +42,7 @@ class EasyParse:
     bad_events: int = 0  # dataset-0 records that failed the CRC or marker check (not in `events`)
     clock_resets: int = 0  # places where the timestamps jump back to the reset clock (2000-01-01)
     event_trailing_bytes: int = 0  # bytes after the last whole 16-byte record in dataset 0
+    event_offsets: list[int] = field(default_factory=list)  # byte offset in dataset 0 of each record in `events`
 
 
 def record_dtype(nchan: int) -> np.dtype:
@@ -77,10 +78,11 @@ def decode_easyparse(data1: bytes, nchan: int, data0: bytes | None = None) -> Ea
     error_codes = np.where(isnan, bits, 0).astype(np.uint32)
     with np.errstate(invalid="ignore"):  # 0xFF81xxxx error codes are signalling NaNs; they stay NaN
         values = raw_f32.astype(np.float64)
-    events, bad = decode_events(data0) if data0 is not None else ([], 0)
+    events, bad, offsets = _decode_events(data0) if data0 is not None else ([], 0, [])
     return EasyParse(time_ms=t, values=values, error_codes=error_codes, events=events,
                      trailing_bytes=len(data1) - n * size, bad_events=bad, clock_resets=int(back.size),
-                     event_trailing_bytes=len(data0) % EVENT_SIZE if data0 is not None else 0)
+                     event_trailing_bytes=len(data0) % EVENT_SIZE if data0 is not None else 0,
+                     event_offsets=offsets)
 
 
 def event_ok(rec: bytes) -> bool:
@@ -91,7 +93,12 @@ def event_ok(rec: bytes) -> bool:
 
 def decode_events(data0: bytes) -> tuple[list[tuple[int, int, int]], int]:
     """(events as (logger-clock ms, type code, payload), number of records that failed the check)."""
-    events, bad = [], 0
+    events, bad, _ = _decode_events(data0)
+    return events, bad
+
+
+def _decode_events(data0: bytes) -> tuple[list[tuple[int, int, int]], int, list[int]]:
+    events, bad, offsets = [], 0, []
     for i in range(0, len(data0) - EVENT_SIZE + 1, EVENT_SIZE):
         rec = data0[i : i + EVENT_SIZE]
         if not event_ok(rec):
@@ -99,7 +106,8 @@ def decode_events(data0: bytes) -> tuple[list[tuple[int, int, int]], int]:
             continue
         ms, payload = struct.unpack_from("<QI", rec, 4)
         events.append((int(ms), rec[2], payload))
-    return events, bad
+        offsets.append(i)
+    return events, bad, offsets
 
 
 def _cstr(b: bytes) -> str:

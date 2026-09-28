@@ -139,7 +139,7 @@ def test_failure_mid_download_keeps_transcript_and_partial(rig):
     raw = rig.tmp / "raw"
     (transcript,) = raw.glob("4242_*.log")
     assert "RX    E0104 simulated read failure" in transcript.read_text()
-    assert (raw / ".partial" / "4242.bin.part").stat().st_size == 512 + 68_000
+    assert (raw / ".partial" / "4242.new.0.part").stat().st_size == 512 + 68_000
     assert not list(rig.tmp.glob("*.nc"))
     session, console = rig.session_text(), rig.console_text()
     assert "ERROR" in session and "Traceback" in session
@@ -163,7 +163,7 @@ def test_stop_between_blocks_then_resume(rig, monkeypatch):
     s = rig.settings()
     t = threading.Thread(target=cli._worker, args=("/dev/cu.usbmodemS", s))
     t.start()
-    part = rig.tmp / "raw" / ".partial" / "77.bin.part"
+    part = rig.tmp / "raw" / ".partial" / "77.new.0.part"
     deadline = time.monotonic() + 30  # Ctrl-C once a block is on disk (a fixed 0.9 s was too short on a slow runner)
     while not (part.exists() and part.stat().st_size >= 512 + 68_000) and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -237,7 +237,7 @@ def test_ctrl_c_in_run_stops_downloads_and_returns(rig, monkeypatch):
     console = rig.console_text()
     assert "Ctrl-C: stopping" in console and "SN55@usbmodemC downloading" in console
     assert "download stopped (Ctrl-C)" in console and console.rstrip().endswith("Stopped.")
-    assert not list(rig.tmp.glob("*.nc")) and (rig.tmp / "raw" / ".partial" / "55.bin.part").exists()
+    assert not list(rig.tmp.glob("*.nc")) and (rig.tmp / "raw" / ".partial" / "55.new.0.part").exists()
 
 
 def test_bench_mix_solo0_duet_concerto3_in_parallel(rig, monkeypatch):

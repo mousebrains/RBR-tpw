@@ -148,6 +148,7 @@ class Event:
     seconds: int  # seconds since 2000-01-01
     crc_ok: bool
     sample_index: int  # index of the next sample set
+    size: int = 8  # bytes of the event record in the image
 
     @property
     def name(self) -> str:
@@ -170,6 +171,9 @@ class Decoded:
     events: list[Event] = field(default_factory=list)
     trailing_bytes: int = 0  # bytes after the last whole word or partial sample set
     bad_event_words: int = 0  # event-marker words whose record failed its CRC
+    # (n,) int64 byte offset just past each sample set's last word: an offload whose image held `b` bytes had seen
+    # sample set i iff set_end_byte[i] <= b
+    set_end_byte: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
 
     @property
     def rtc_reset(self) -> bool:
@@ -254,6 +258,7 @@ def decode(image: bytes, nchan: int) -> Decoded:
     nsets = readings.size // nchan
     trailing = 4 * (readings.size - nsets * nchan) + (len(body) - 4 * nwords)
     raw = readings[: nsets * nchan].reshape(nsets, nchan)
+    set_end_byte = set_end_bytes(hdr.length, is_reading, nchan, nsets)
 
     flags = np.zeros(raw.shape, np.uint8)
     flags[(raw >> 24) == ERROR_MARKER] |= FLAG_ERROR_CODE
@@ -277,7 +282,29 @@ def decode(image: bytes, nchan: int) -> Decoded:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK
 
     return Decoded(header=hdr, nchan=nchan, raw=raw, flags=flags, time_ms=time_ms, time_flags=time_flags,
-                   segment=segment, events=events, trailing_bytes=trailing, bad_event_words=len(bad_event_words))
+                   segment=segment, events=events, trailing_bytes=trailing, bad_event_words=len(bad_event_words),
+                   set_end_byte=set_end_byte)
+
+
+def scan_events(image: bytes, start: int = 0) -> list[tuple[int, int, int]]:
+    """The valid 8-byte event records in `image` from byte `start` on, as (offset, type, seconds since 2000),
+    without decoding the samples (a quick look at what an offload's new bytes hold). Assumes word alignment."""
+    out = []
+    lo = max(start, 0) - max(start, 0) % 4
+    body = image[lo : len(image) - (len(image) - lo) % 4]
+    words = np.frombuffer(body, "<u4")
+    i = 0
+    for i in np.flatnonzero((words >> 24) == EVENT_MARKER).tolist():
+        rec = body[4 * i : 4 * i + 8]
+        if len(rec) == 8 and _event_crc_ok(rec):
+            out.append((lo + 4 * i, rec[2], struct.unpack_from("<I", rec, 4)[0]))
+    return out
+
+
+def set_end_bytes(body_offset: int, is_reading: np.ndarray, nchan: int, nsets: int) -> np.ndarray:
+    """Byte offset just past the last word of each of the `nsets` sample sets, given which words are readings."""
+    last = np.flatnonzero(is_reading)[nchan - 1 :: nchan][:nsets]
+    return body_offset + 4 * (last.astype(np.int64) + 1)
 
 
 def tmp_equation(raw: np.ndarray, c: tuple[float, float, float, float]) -> tuple[np.ndarray, np.ndarray]:
@@ -341,88 +368,172 @@ def event_indices(time_ms: np.ndarray, event_ms: list[int]) -> list[int]:
     return out
 
 
+@dataclass
+class SegmentStart:
+    """Where a clock segment (a run of sample sets between clock restarts) begins."""
+
+    sample_index: int
+    event_index: int | None = None  # position in the event list of the restart event that starts it, if any
+
+
+@dataclass
+class OffloadView:
+    """What one offload saw of the record: the sample sets and events its image held, when it happened, and the
+    clock skew it measured (logger minus UTC, s; None when not measured)."""
+
+    samples_seen: int
+    events_seen: int
+    unix_ms: int
+    skew_s: float | None
+    clock_set_before: bool = False  # the skew jumped since the previous offload with no reset event to explain it
+
+    def saw(self, start: SegmentStart) -> bool:
+        if start.event_index is not None:
+            return start.event_index < self.events_seen
+        return start.sample_index < self.samples_seen
+
+
+def segments_from_starts(n: int, starts: list[SegmentStart]) -> np.ndarray:
+    """Per sample set, how many segment starts precede it (starts at 0 or beyond the end do not count)."""
+    seg = np.zeros(n, np.int32)
+    for s in starts:
+        if 0 < s.sample_index < n:
+            seg[s.sample_index :] += 1
+    return seg
+
+
+def _starts(n: int, time_ms: np.ndarray, event_starts: list[tuple[int, int]]) -> list[SegmentStart]:
+    """Segment starts from restart events (sample index, event index) and from backward steps of the clock."""
+    starts: dict[int, SegmentStart] = {}
+    for index, k in event_starts:
+        if 0 < index < n and index not in starts:
+            starts[index] = SegmentStart(index, k)
+    if n:
+        for i in clock_runs(time_ms)[1:].tolist():
+            starts.setdefault(int(i), SegmentStart(int(i)))
+    return [starts[i] for i in sorted(starts)]
+
+
+def reset_segment_starts(time_ms: np.ndarray, events: list[tuple[int, int, int]]) -> list[SegmentStart]:
+    """For loggers that timestamp every sample: a new clock segment after each restart event (`events` are
+    (ms, type, sample index)) or backward step of the clock."""
+    return _starts(time_ms.size, time_ms,
+                   [(index, k) for k, (_, etype, index) in enumerate(events) if etype in RESTART_EVENTS])
+
+
 def reset_segments(time_ms: np.ndarray, events: list[tuple[int, int, int]]) -> tuple[np.ndarray, np.ndarray]:
     """For loggers that timestamp every sample (Ruskin values, Gen3 EasyParse, Gen4): TFLAG_RESET_CLOCK on
     samples dated before 2001, and a new clock segment after each restart event or backward step of the clock
     (so a missing or misplaced restart event cannot join two reset runs). `events` are (ms, type, sample
     index)."""
     tflags = np.where(time_ms < RESET_CLOCK_BEFORE_MS, TFLAG_RESET_CLOCK, 0).astype(np.uint8)
-    starts = set(clock_runs(time_ms)[1:].tolist()) if time_ms.size else set()
-    starts |= {index for _, etype, index in events if etype in RESTART_EVENTS and 0 < index < time_ms.size}
-    segment = np.zeros(time_ms.size, np.int32)
-    for index in starts:
-        segment[index:] += 1
-    return tflags, segment
+    return tflags, segments_from_starts(time_ms.size, reset_segment_starts(time_ms, events))
 
 
 def resolve_times(
-    d: Decoded, skew_s: float | None, offload_unix_ms: int
+    d: Decoded, skew_s: float | None = None, offload_unix_ms: int | None = None,
+    views: list[OffloadView] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """Best-estimate UTC sample times.
 
-    Sample sets on a reset clock (TFLAG_RESET_CLOCK) in the *last* time segment
-    are shifted by the logger-minus-UTC skew measured at offload. That is only
-    valid because the clock ran unbroken from that reset to the offload; the
-    result is checked to land before the offload and after the preceding
-    samples. Reset-clock sets in earlier segments have no recoverable time and
-    are dropped (the raw image keeps them).
+    Sample sets on a reset clock (TFLAG_RESET_CLOCK) are shifted by the logger-minus-UTC skew measured at an
+    offload made while that clock ran unbroken: the latest offload whose current clock segment it was (`views`,
+    one per offload of the deployment; a single offload is `skew_s` at `offload_unix_ms`). The result is checked
+    to land before that offload, after the preceding samples and after 2001. Reset-clock sets that no offload
+    can time are dropped (the raw image keeps them).
 
-    "Segment" here means the samples between clock restarts (events 0x06/0x0A/0x0B), not between time
-    anchors: an ordinary anchor (a time sync, or a twist activation on an RBRconcerto) does not reset the
-    clock, so samples on either side of it share one clock and one correction.
+    "Segment" here means the samples between clock restarts (events 0x06/0x0A/0x0B, or a backward step of the
+    sample times), not between time anchors: an ordinary anchor (a time sync, or a twist activation on an
+    RBRconcerto) does not reset the clock, so samples on either side of it share one clock and one correction.
 
     Returns (time_ms, time_flags, keep mask, notes).
     """
-    return resolve_time_arrays(d.time_ms, d.time_flags, clock_segments(d), skew_s, offload_unix_ms)
+    return resolve_time_arrays(d.time_ms, d.time_flags, None, skew_s, offload_unix_ms, views=views,
+                               starts=clock_segment_starts(d))
+
+
+def clock_segment_starts(d: Decoded) -> list[SegmentStart]:
+    """Clock segment starts of a decoded L2 image: each RTC reset event, and each backward step of the times."""
+    return _starts(d.time_ms.size, d.time_ms,
+                   [(e.sample_index, k) for k, e in enumerate(d.events) if e.type in RTC_RESET_EVENTS])
 
 
 def clock_segments(d: Decoded) -> np.ndarray:
     """Per sample set, how many clock restarts (RTC_RESET_EVENTS, or a backward step of the sample times)
     precede it."""
-    starts = {e.sample_index for e in d.events if e.type in RTC_RESET_EVENTS and 0 < e.sample_index < d.time_ms.size}
-    if d.time_ms.size:
-        starts |= set(clock_runs(d.time_ms)[1:].tolist())
-    seg = np.zeros(d.time_ms.size, np.int32)
-    for index in starts:
-        seg[index:] += 1
-    return seg
+    return segments_from_starts(d.time_ms.size, clock_segment_starts(d))
 
 
 def resolve_time_arrays(
-    time_ms: np.ndarray, time_flags: np.ndarray, segment: np.ndarray, skew_s: float | None, offload_unix_ms: int
+    time_ms: np.ndarray, time_flags: np.ndarray, segment: np.ndarray | None, skew_s: float | None = None,
+    offload_unix_ms: int | None = None, *, views: list[OffloadView] | None = None,
+    starts: list[SegmentStart] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """resolve_times() on plain arrays: logger-clock times, TFLAG_* bits, and clock-segment numbers."""
+    """resolve_times() on plain arrays: logger-clock times, TFLAG_* bits, and either the clock-segment numbers
+    or the segment starts. One offload (`skew_s`, `offload_unix_ms`) or several (`views`)."""
     t = time_ms.copy()
     tf = time_flags.copy()
-    keep = np.ones(t.size, bool)
+    n = t.size
+    keep = np.ones(n, bool)
     notes: list[str] = []
+    if views is None:
+        views = [OffloadView(samples_seen=n, events_seen=1 << 62, unix_ms=int(offload_unix_ms or 0), skew_s=skew_s)]
+    if starts is None:  # from the segment numbers: sample-index markers only
+        starts = [SegmentStart(int(i)) for i in (np.flatnonzero(np.diff(segment) != 0) + 1)] if n > 1 else []
+    # A clock set between two offloads (a sync in Ruskin, only possible while stopped) ends every clock run at what
+    # the earlier offload saw: its skew is the last one measured on that clock.
+    by_index = {s.sample_index: s for s in starts}
+    for before, v in zip(views, views[1:], strict=False):
+        if v.clock_set_before and 0 < before.samples_seen < n:
+            by_index.setdefault(before.samples_seen, SegmentStart(before.samples_seen))
+    starts = [by_index[i] for i in sorted(by_index) if 0 < i < n]
+    bounds = [0, *[s.sample_index for s in starts], n]
+    # each offload's current clock segment: the last one whose start it had seen
+    current = [max([j for j, s in enumerate(starts, 1) if v.saw(s)], default=0) for v in views]
     reset = (tf & TFLAG_RESET_CLOCK) != 0
-    if reset.any():
-        last = segment.max()
-        fix = reset & (segment == last)
-        drop = reset & (segment != last)
-        if fix.any():
-            i0 = int(np.flatnonzero(fix)[0])
-            if skew_s is None or not math.isfinite(skew_s):
-                drop |= fix
+    dropped = 0
+    several = len(views) > 1
+    for s_idx in range(len(bounds) - 1):
+        i0, i1 = bounds[s_idx], bounds[s_idx + 1]
+        fix = np.zeros(n, bool)
+        fix[i0:i1] = reset[i0:i1]
+        if not fix.any():
+            continue
+        idx = np.flatnonzero(fix)
+        j0 = int(idx[0])
+        cands = [k for k, c in enumerate(current) if c == s_idx]
+        applied = inconsistent = False
+        for k in reversed(cands):  # the latest offload on this clock first, then fall back
+            v = views[k]
+            if v.skew_s is None or not math.isfinite(v.skew_s):
+                continue
+            shift = int(round(1000 * v.skew_s))
+            shifted = t[fix] - shift
+            prev_ok = j0 == 0 or reset[j0 - 1] or shifted[0] > t[j0 - 1]
+            # the last of these samples that offload saw must land before the offload (plus 5 s of slack)
+            seen = idx[idx < v.samples_seen]
+            seen_ok = not seen.size or int(t[seen[-1]]) - shift <= v.unix_ms + 5000
+            # still before 2001 after the shift: the skew was measured on a clock set since the reset
+            if seen_ok and prev_ok and shifted[0] >= RESET_CLOCK_BEFORE_MS:
+                t[fix] = shifted
+                tf[fix] |= TFLAG_SKEW_CORRECTED
+                notes.append(f"{int(fix.sum())} samples after a clock reset were re-timed by subtracting the "
+                             f"offload clock skew ({v.skew_s:+.3f} s"
+                             + (f", offload {k + 1} of {len(views)})" if several else ")"))
+                applied = True
+                break
+            inconsistent = True
+        if not applied:
+            keep &= ~fix
+            dropped += int(fix.sum())
+            if inconsistent:
+                notes.append(f"{int(fix.sum())} samples after a clock reset dropped: correcting them with the "
+                             "offload skew does not give a consistent time")
+            elif cands:
                 notes.append(f"{int(fix.sum())} samples after a clock reset dropped: no clock skew was measured")
-            else:
-                shifted = t[fix] - int(round(1000 * skew_s))
-                prev_ok = i0 == 0 or reset[i0 - 1] or shifted[0] > t[i0 - 1]
-                # still before 2001 after the shift: the skew was measured on a clock set since the reset
-                if shifted[-1] <= offload_unix_ms + 5000 and prev_ok and shifted[0] >= RESET_CLOCK_BEFORE_MS:
-                    t[fix] = shifted
-                    tf[fix] |= TFLAG_SKEW_CORRECTED
-                    notes.append(f"{int(fix.sum())} samples after a clock reset were re-timed by subtracting the "
-                                 f"offload clock skew ({skew_s:+.3f} s)")
-                else:
-                    drop |= fix
-                    notes.append(f"{int(fix.sum())} samples after a clock reset dropped: correcting them with the "
-                                 "offload skew does not give a consistent time")
-        if drop.any():
-            keep &= ~drop
-            notes.append(f"{int(drop.sum())} samples on a reset clock with no recoverable time are omitted "
-                         "(still present in the raw file)")
+    if dropped:
+        notes.append(f"{dropped} samples on a reset clock with no recoverable time are omitted "
+                     "(still present in the raw file)")
     tk = t[keep]
     bad = np.flatnonzero(np.diff(tk) <= 0) if tk.size > 1 else []
     if len(bad):  # a CF time coordinate must be strictly monotonic: do not publish duplicate or reversed times

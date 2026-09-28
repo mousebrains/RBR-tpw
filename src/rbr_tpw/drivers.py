@@ -21,20 +21,54 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from . import solo
-from .link import Link, LoggerError
+from .link import Link, LinkError, LoggerError
 from .lock import unlocked_if_possible
-from .ncwrite import ChannelValues, write_netcdf, write_values_netcdf
+from .ncwrite import ChannelValues, records_of, write_netcdf, write_values_netcdf
 from .rawbin import FLAG_ERROR_CODE, event_indices, reset_segments
 from .solo import STATUS_HIDDEN, STATUS_NOT_STORED, channel_status
 
 
 class DecodeUnavailable(Exception):
     """No decoder for this memory yet. The raw download is saved; `rbr-offload --rebuild` can convert it later."""
+
+
+class DeploymentMismatch(Exception):
+    """The logger does not hold the deployment on disk: erased and enabled again (Ruskin or --configure), or a
+    memory that cannot be explained. The offload starts a new deployment with a full download. `downloaded` is
+    set when a full read was made before the mismatch was found, so it need not be repeated."""
+
+    def __init__(self, reason: str, downloaded: Downloaded | None = None):
+        super().__init__(reason)
+        self.downloaded = downloaded
+
+
+@dataclass
+class Held:
+    """A deployment's raw datasets on disk, verified against its latest record by the caller."""
+
+    stem: str
+    data: dict[str, bytes]
+
+
+@dataclass
+class Downloaded:
+    """What one offload produced: every dataset complete (held bytes plus new), and what was read."""
+
+    data: dict[str, bytes]
+    segments: dict[str, tuple[int, int]]  # dataset -> (offset, bytes) read from the logger at this offload
+    kind: str  # full | incremental | full-verified
+    tail_check: dict | None = None
+    header_changed: list[int] = field(default_factory=list)  # identity-header byte offsets that changed
+
+    @property
+    def new_bytes(self) -> int:
+        return sum(n for _, n in self.segments.values())
 
 
 def _q(link: Link, cmd: str) -> dict:
@@ -91,11 +125,15 @@ def _no_energy(pwr: dict, comment: str) -> dict:
 
 
 def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.ndarray,
-                      events: list[tuple[int, int, int]], record: dict, path: Path, values_comment: str,
-                      flag_comment: str, channels: list[dict] | None = None) -> tuple[list[str], np.ndarray]:
+                      events: list[tuple[int, int, int]], record: dict | list[dict], path: Path,
+                      values_comment: str, flag_comment: str, channels: list[dict] | None = None,
+                      seen: list[tuple[int, int]] | None = None) -> tuple[list[str], np.ndarray]:
     """NetCDF from engineering values the logger stored with a timestamp per sample (Gen3 EasyParse, Gen4).
     `events` are (logger-clock ms, type, payload). `channels` describe the columns of `values` in order
-    (default: the snapshot's channel_list)."""
+    (default: the snapshot's channel_list). `record` is one offload record or the deployment's records in
+    order; `seen[k]` = (sample sets, events) offload k's image held."""
+    records = records_of(record)
+    record = records[-1]
     snap = record["snapshot_before"]
     chans = snap["channel_list"] if channels is None else channels
     if values.shape[1] != len(chans):
@@ -117,9 +155,10 @@ def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.n
                                  attrs=attrs, hidden=bool(c["status"] & STATUS_HIDDEN)))
     deployment = {"deployment_start_time": _iso(snap.get("starttime")),
                   "deployment_end_time": _iso(snap.get("endtime"))}
-    return write_values_netcdf(time_ms, tflags, segment, cvs, ev, record, path,
+    return write_values_netcdf(time_ms, tflags, segment, cvs, ev, records, path,
                                period_ms=int(snap.get("sampling", {}).get("period", 0) or 0), deployment=deployment,
-                               values_comment=values_comment, flag_comment=flag_comment)
+                               values_comment=values_comment, flag_comment=flag_comment, seen=seen,
+                               event_payloads=[int(e[2]) for e in events])
 
 
 class Driver:
@@ -155,7 +194,52 @@ class Driver:
     def bytes_per_sample(self, snap: dict) -> int | None:
         return None
 
-    def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None) -> dict[str, bytes]:
+    identity_dataset = "dataset1"  # the dataset (or its first bytes) that names a deployment
+    identity_bytes: int | None = 512  # how many of its bytes; None = all of it
+    growing = ("dataset1",)  # datasets a deployment extends; the others are rewritten whole at each offload
+
+    def identity(self, data: dict[str, bytes]) -> bytes:
+        blob = data.get(self.identity_dataset, b"")
+        return blob if self.identity_bytes is None else blob[: self.identity_bytes]
+
+    def primary(self, data: dict[str, bytes]) -> str:
+        """The dataset the record's `raw` and the NetCDF describe: the samples, or whatever is not empty."""
+        if data.get("dataset1"):
+            return "dataset1"
+        names = [k for k, v in data.items() if v]
+        return next((k for k in names if k.endswith("/data")), next(iter(names), ""))
+
+    def grows(self, name: str) -> bool:
+        """Does a deployment extend this dataset (as against rewriting it whole at each offload)?"""
+        return name in self.growing
+
+    def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None, held: Held | None = None,
+                 full: bool = False) -> Downloaded:
+        """Every dataset, whole. With `held`, the deployment on disk, the new image must extend it (each growing
+        dataset starts with the old bytes, the identity dataset is unchanged), else DeploymentMismatch."""
+        data = self._download_all(link, snap, part_dir, sn, progress)
+        segments = {k: (0, len(v)) for k, v in data.items()}
+        if held is None:
+            return Downloaded(data, segments, "full")
+        reason = self.growth_mismatch(held.data, data)
+        result = Downloaded(data, segments, "full-verified")
+        if reason:
+            raise DeploymentMismatch(reason, result)
+        return result
+
+    def growth_mismatch(self, old: dict[str, bytes], new: dict[str, bytes]) -> str | None:
+        if self.identity(old) != self.identity(new):
+            return f"the {self.identity_dataset} header differs"
+        for name, blob in old.items():
+            if name not in new:
+                return f"{name} is no longer on the logger"
+            if self.grows(name) and not new[name].startswith(blob):
+                first = next((i for i, (a, b) in enumerate(zip(blob, new[name], strict=False)) if a != b),
+                             min(len(blob), len(new[name])))
+                return f"{name} does not extend the deployment image (first difference at byte {first})"
+        return None
+
+    def _download_all(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None) -> dict[str, bytes]:
         plan = self.datasets(snap)
         grand = sum(n for _, _, n in plan)
         out: dict[str, bytes] = {}
@@ -220,13 +304,65 @@ class L2Driver(Driver):
         return [("dataset1", 1, int(snap["meminfo"]["used"]))]
 
     def part_name(self, sn: str, number: int) -> str:
-        return f"{sn}.bin.part"  # the name rbr-offload has always used, so older partial downloads resume
+        return f"{sn}.new.0.part"  # a new deployment, from byte 0
 
     def bytes_per_sample(self, snap: dict) -> int | None:
         return 4 * len(snap["channel_list"])
 
+    def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None, held: Held | None = None,
+                 full: bool = False) -> Downloaded:
+        """dataset 1: all of it for a new deployment or with `full`; otherwise only the bytes past the held image,
+        after the tail check (the last block of the held image is read back and compared) and the header
+        check (a changed header is refreshed and reported, unless there is no data to check it against)."""
+        total = int(snap["meminfo"]["used"])
+        if held is None or full:
+            image = solo.download(link, total, part_dir / self.part_name(sn, 1), progress) if total > 0 else b""
+            if held is None:
+                return Downloaded({"dataset1": image}, {"dataset1": (0, len(image))}, "full")
+            old = held.data.get("dataset1", b"")
+            n_old = len(old)
+            result = Downloaded({"dataset1": image}, {"dataset1": (n_old, max(0, len(image) - n_old))},
+                                "full-verified")
+            if len(image) < n_old:
+                raise DeploymentMismatch(f"the logger holds {len(image)} bytes, the deployment image {n_old}",
+                                         result)
+            data_start = min(512, n_old)
+            if image[data_start:n_old] != old[data_start:n_old]:
+                first = next(i for i in range(data_start, n_old) if image[i] != old[i])
+                raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}", result)
+            result.header_changed = [i for i in range(data_start) if image[i] != old[i]]
+            if result.header_changed and n_old <= 512:
+                raise DeploymentMismatch("the header differs and there is no data to check", result)
+            return result
+        old = held.data.get("dataset1", b"")
+        n_old = len(old)
+        if total < n_old:
+            raise DeploymentMismatch(f"the logger holds {total} bytes, the deployment image {n_old}")
+        head_len = min(512, total)
+        head = link.read_data(1, head_len, 0)
+        if len(head) != head_len:
+            raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
+        n = min(solo.CHUNK, n_old)
+        tail = link.read_data(1, n, n_old - n) if n else b""
+        if len(tail) != n:
+            raise LinkError(f"short tail read: {len(tail)} of {n} bytes at {n_old - n}")
+        data_start = min(512, n_old)
+        tail_check = {"offset": n_old - n, "bytes": n, "ok": True}
+        if tail[data_start - (n_old - n):] != old[data_start:n_old]:
+            first = next(i for i in range(data_start, n_old) if tail[i - (n_old - n)] != old[i])
+            raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}")
+        header_changed = [i for i in range(data_start) if head[i] != old[i]]
+        if header_changed and n_old <= 512:
+            raise DeploymentMismatch("the header differs and there is no data to check")
+        segment = b""
+        if total > n_old:
+            segment = solo.download(link, total, part_dir / f"{sn}.{held.stem}.{n_old}.part", progress, start=n_old)
+        image = (head[:data_start] + old[data_start:] if header_changed else old) + segment
+        return Downloaded({"dataset1": image}, {"dataset1": (n_old, len(segment))}, "incremental",
+                          tail_check=tail_check, header_changed=header_changed)
+
     def write_netcdf(self, data, record, path):
-        fmt = (record["snapshot_before"].get("memformat") or {}).get("type", "rawbin00")
+        fmt = (records_of(record)[-1]["snapshot_before"].get("memformat") or {}).get("type", "rawbin00")
         if fmt != "rawbin00":
             raise DecodeUnavailable(f"memory format {fmt!r} is not decoded yet (only rawbin00)")
         _, warnings, t_ms = write_netcdf(data["dataset1"], record, path)
@@ -236,6 +372,9 @@ class L2Driver(Driver):
 class Gen3Driver(Driver):
     family = "Gen3"
     l3 = True
+    identity_dataset = "dataset2"  # the deployment header
+    identity_bytes = None
+    growing = ("dataset1", "dataset0")  # samples and events both grow; the header is rewritten
 
     def clock_now(self, link: Link) -> str:
         return link.query("clock")["datetime"]
@@ -295,6 +434,8 @@ class Gen3Driver(Driver):
         return None
 
     def write_netcdf(self, data, record, path):
+        records = records_of(record)
+        record = records[-1]
         fmt = (record["snapshot_before"].get("memformat") or {}).get("type", "")
         if fmt != "calbin00":
             raise DecodeUnavailable(f"Gen3 memory format {fmt!r} is not decoded yet (only EasyParse, calbin00)")
@@ -304,8 +445,18 @@ class Gen3Driver(Driver):
             raise DecodeUnavailable("the EasyParse decoder is not installed yet") from err
         # dataset 1 may be absent: events but no samples (a gated logger never activated). Live, download() gives
         # b""; --rebuild only has the datasets the record lists, which are the non-empty ones.
-        ep = decode_easyparse(data.get("dataset1", b""), len(record["snapshot_before"]["channel_list"]),
-                              data.get("dataset0") or None)
+        nchan = len(record["snapshot_before"]["channel_list"])
+        ep = decode_easyparse(data.get("dataset1", b""), nchan, data.get("dataset0") or None)
+        # what each earlier offload's image held: dataset 1 records are 8 + 4 * nchan bytes, events 16
+        seen = []
+        for rec in records:
+            ds = rec.get("datasets") or {}
+            if rec is record or not ds:
+                seen.append((ep.time_ms.size, len(ep.events)))
+            else:
+                b1 = int((ds.get("dataset1") or {}).get("bytes", 0) or 0)
+                b0 = int((ds.get("dataset0") or {}).get("bytes", 0) or 0)
+                seen.append((b1 // (8 + 4 * nchan), sum(1 for o in ep.event_offsets if o + 16 <= b0)))
         warns = []
         if ep.trailing_bytes:
             warns.append(f"{ep.trailing_bytes} trailing bytes in dataset 1 were ignored")
@@ -318,10 +469,10 @@ class Gen3Driver(Driver):
         # a copy: the caller's record already went to the JSON file, and it prints what is new in the result
         record = {**record, "warnings": [*record.get("warnings", []), *warns]}
         return write_engineering(
-            ep.time_ms, ep.values, ep.error_codes, ep.events, record, path,
+            ep.time_ms, ep.values, ep.error_codes, ep.events, [*records[:-1], record], path,
             values_comment="Engineering value as stored by the logger (Gen3 EasyParse, L3 command reference 5.2).",
             flag_comment="logger_error_code: the logger stored a NaN error code (L3 ref 5.2.1) for this reading. "
-                         "conversion_out_of_range is not used.")
+                         "conversion_out_of_range is not used.", seen=seen)
 
 
 class Gen4Driver(Driver):
@@ -355,13 +506,31 @@ class Gen4Driver(Driver):
     def part_files(self, part_dir: Path, sn: str) -> list[Path]:
         return sorted(part_dir.glob(f"{sn}__*.part"))
 
-    def download(self, link, snap, part_dir, sn, progress=None):
+    identity_bytes = None
+
+    def identity(self, data):
+        meta = sorted(k for k in data if k.endswith("/meta"))
+        return data[meta[0]] if meta else b""
+
+    def grows(self, name):  # every object but the metadata may grow
+        return not name.endswith("/meta")
+
+    def _download_all(self, link, snap, part_dir, sn, progress=None):
         return self.g.download(link, part_dir, sn, progress)
 
     def write_netcdf(self, data, record, path):
+        records = records_of(record)
+        record = records[-1]
         snap = record["snapshot_before"]
         ds, sch, cols, _, _ = self.g.columns(data, snap)
         time_ms, values, error_codes, events = self.g.decode(data, snap, ds, sch)
+        # earlier offloads' images: fixed-size records, so sample sets scale with the data object's bytes; the
+        # events object is not split per offload (Gen4 is untested on a logger)
+        latest = int(((record.get("datasets") or {}).get(f"{ds}/{sch}/data") or {}).get("bytes", 0) or 0)
+        seen = []
+        for rec in records:
+            b = int(((rec.get("datasets") or {}).get(f"{ds}/{sch}/data") or {}).get("bytes", 0) or 0)
+            seen.append((time_ms.size * b // latest if latest and rec is not record else time_ms.size, len(events)))
         # the columns as the dataset's own metadata describes them, not the logger's current channel list
         channels = [{"index": c["index"], "type": c.get("type", ""), "label": c.get("label", ""),
                      "userunits": c.get("userunits", ""), "status": STATUS_HIDDEN if c.get("hidden") else 0,
@@ -373,11 +542,11 @@ class Gen4Driver(Driver):
                  f"{', '.join(others)} (saved in raw/)"] if others else []
         record = {**record, "warnings": [*record.get("warnings", []), *warns],
                   "raw": (record.get("datasets") or {}).get(f"{ds}/{sch}/data", record.get("raw"))}
-        return write_engineering(time_ms, values, error_codes, events, record, path,
+        return write_engineering(time_ms, values, error_codes, events, [*records[:-1], record], path,
                                  values_comment="Engineering value as stored by the logger (Gen4, L3.5 reference "
                                                 "section 4.2; decoder untested on a real logger).",
                                  flag_comment="logger_error_code: the logger stored a NaN error code for this reading.",
-                                 channels=channels)
+                                 channels=channels, seen=seen)
 
 
 def driver_for(fwtype: int) -> Driver | None:

@@ -46,6 +46,7 @@ from .rawbin import (
     Decoded,
     Event,
     Header,
+    set_end_bytes,
 )
 
 RATIO_SCALE = float(1 << 30)
@@ -298,7 +299,8 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
         etype, seconds = rec[2], struct.unpack_from("<I", rec, 4)[0]
         ms = struct.unpack_from("<H", rec, 8)[0] if marker != 0xF7 else 0
         index = readings_before // nstored
-        events.append(Event(offset=hdr.length + b, type=etype, seconds=seconds, crc_ok=True, sample_index=index))
+        events.append(Event(offset=hdr.length + b, type=etype, seconds=seconds, crc_ok=True, sample_index=index,
+                            size=size))
         anchors_next = bool(rec[11] & 1) if marker == 0xF3 else etype in ANCHOR_EVENTS  # 0xF3 carries the flag
         if anchors_next:
             anchors.append((index, EPOCH2000_MS + 1000 * seconds + ms, seconds))
@@ -308,6 +310,7 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
     nsets = readings.size // nstored
     trailing = 4 * (readings.size - nsets * nstored) + (len(body) - 4 * nwords)
     raw = readings[: nsets * nstored].reshape(nsets, nstored)
+    set_end_byte = set_end_bytes(hdr.length, is_reading, nstored, nsets)
     flags = np.zeros(raw.shape, np.uint8)
     flags[(raw >> 24) == ERROR_MARKER] |= 1  # rawbin.FLAG_ERROR_CODE
 
@@ -327,4 +330,4 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK
     return Decoded(header=hdr, nchan=nstored, raw=raw, flags=flags, time_ms=time_ms, time_flags=time_flags,
                    segment=segment, events=events, trailing_bytes=trailing,
-                   bad_event_words=bad_markers)
+                   bad_event_words=bad_markers, set_end_byte=set_end_byte)

@@ -121,6 +121,12 @@ def test_solo_ruskin_values_route(tmp_path):
     assert r.route == "values" and r.samples == 10
     with netCDF4.Dataset(tmp_path / "s.nc") as nc:
         assert "temperature_raw" not in nc.variables
+        # the same layout as an offload: one point on the offload series (an .rsk is one download), with
+        # Ruskin's drift as the skew versus the host and no battery or memory state
+        nc.set_auto_mask(False)
+        assert len(nc["offload_time"]) == 1 and nc["clock_skew_vs_host"][0] == 0.0
+        assert np.isnan(nc["battery_voltage"][0]) and nc["memory_used"][0] == 0
+        assert nc.history.count("\n") == 1 and "converted from s.rsk by rbr-rsk2nc" in nc.history
 
 
 CONCERTO = [

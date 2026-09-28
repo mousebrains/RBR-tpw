@@ -32,10 +32,12 @@ from serial.tools import list_ports
 from . import __version__
 from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure, validate
 from .console import DEVICE, Console, setup_logging
-from .drivers import DecodeUnavailable, Driver, driver_for
+from .drivers import DecodeUnavailable, DeploymentMismatch, Downloaded, Driver, Held, driver_for
 from .hostclock import ntp_offset, timing_critical
 from .link import Link, LinkError
+from .ncwrite import skew_vs_utc
 from .power import remaining
+from .rawbin import event_name, scan_events
 from .solo import RUSKIN_LOW_VOLTAGE_V, identify, measure_clock_skew, sha256
 
 log = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ class Settings:
     assume_yes: bool = False
     console: Console = field(default_factory=Console)
     session_log: Path | None = None
+    full_download: bool = False  # read the whole memory even when the deployment is on disk (and verify it)
     stop: threading.Event = field(default_factory=threading.Event)  # Ctrl-C
     configured: set[str] = field(default_factory=set)  # serial numbers configured this session (never twice)
     configure_failed: set[str] = field(default_factory=set)  # serial numbers whose configure failed this session
@@ -83,25 +86,48 @@ class Settings:
     failed: list[str] = field(default_factory=list)  # loggers whose offload or NetCDF failed this session
 
 
-_stages: dict[str, tuple[str, str]] = {}  # port -> (device label, what its worker is doing)
+_stages: dict[str, tuple[str, str, str]] = {}  # port -> (device label, what its worker is doing, the detail shown)
 _stages_lock = threading.Lock()
+_status_console: Console | None = None  # the terminal's status line, while run() is on a terminal
 _not_ready: dict[str, str] = {}  # port -> why its logger must not be deployed (configure failed or not logging)
 _failed: dict[str, str] = {}  # port -> why its offload is incomplete (no download, or no NetCDF when one was due)
 
 
-def _stage(port: str, what: str | None):
+def _stage(port: str, what: str | None, detail: str | None = None):
+    """What this logger's worker is doing, for the summaries and the status line (`detail`: the fuller text
+    the status line shows while this is the only logger, e.g. the download bar)."""
     with _stages_lock:
         if what is None:
             _stages.pop(port, None)
         else:
-            _stages[port] = (DEVICE.get(), what)
-    if what is not None:
+            _stages[port] = (DEVICE.get(), what, detail or what)
+    if what is not None and detail is None:
         log.debug("stage: %s", what)
+    _refresh_status()
 
 
 def _stage_summary() -> str:
     with _stages_lock:
-        return "; ".join(f"{dev} {what}" for dev, what in sorted(_stages.values())) or "none"
+        return "; ".join(f"{dev} {what}" for dev, what, _ in sorted(_stages.values())) or "none"
+
+
+def _status_enabled() -> bool:
+    return _status_console is not None and _status_console.status_enabled
+
+
+def _refresh_status():
+    """The terminal's status line: one logger's stage in full, or the summary when several are in progress."""
+    if not _status_enabled():
+        return
+    with _stages_lock:
+        stages = sorted(_stages.values())
+    if not stages:
+        _status_console.status(None)
+    elif len(stages) == 1:
+        dev, _, detail = stages[0]
+        _status_console.status(f"[{dev}] {detail}")
+    else:
+        _status_console.status("in progress: " + "; ".join(f"{dev} {what}" for dev, what, _ in stages))
 
 
 def _port_name(port: str) -> str:
@@ -221,18 +247,27 @@ def alarm(lines: list[str], s: Settings):
         log.debug("alarm acknowledged")
 
 
+BAR_WIDTH = 24
+
+
 def _progress_logger(s: Settings, port: str):
-    """download() progress callback: a log line every 10%; raises Stopped after a block once Ctrl-C was hit."""
+    """download() progress callback: the status line's bar on a terminal, a log line every 10% (at DEBUG on a
+    terminal, where the bar shows it; INFO otherwise); raises Stopped after a block once Ctrl-C was hit."""
     next_pct = [10.0]
 
     def progress(done: int, total: int, rate: float):
         pct = 100 * done / total
-        _stage(port, f"downloading {pct:.0f}%")
+        eta = (total - done) / rate if rate > 0 else math.inf
+        eta_s = f"{int(eta // 60)}:{int(eta % 60):02d}" if math.isfinite(eta) else "?"
+        k = int(BAR_WIDTH * done / total)
+        bar = "=" * k + (">" if k < BAR_WIDTH else "") + " " * max(BAR_WIDTH - k - 1, 0)
+        _stage(port, f"downloading {pct:.0f}%",
+               f"downloading {done / 1e6:.2f} of {total / 1e6:.2f} MB [{bar}] {pct:3.0f}%  {rate / 1e3:.0f} kB/s  "
+               f"{eta_s} left")
         if pct >= next_pct[0] or done == total:
-            eta = (total - done) / rate if rate > 0 else math.inf
-            eta_s = f"{int(eta // 60)}:{int(eta % 60):02d}" if math.isfinite(eta) else "?"
-            log.info("downloaded %.2f of %.2f MB (%.0f%%), %.1f kB/s, %s left",
-                     done / 1e6, total / 1e6, pct, rate / 1e3, eta_s)
+            log.log(logging.DEBUG if _status_enabled() else logging.INFO,
+                    "downloaded %.2f of %.2f MB (%.0f%%), %.1f kB/s, %s left",
+                    done / 1e6, total / 1e6, pct, rate / 1e3, eta_s)
             next_pct[0] = (pct // 10 + 1) * 10
         if s.stop.is_set() and done < total:
             raise Stopped()
@@ -247,6 +282,134 @@ def _write_bytes(path: Path, data: bytes):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _store_dataset(path: Path, blob: bytes, offset: int, header_changed: list[int]):
+    """Save a dataset: whole (atomically) for a new file or a full read, else by appending the bytes past
+    `offset` to the deployment's file, and refreshing its header bytes when the logger's changed."""
+    if offset == 0 or not path.exists() or path.stat().st_size != offset:
+        _write_bytes(path, blob)
+        return
+    with open(path, "r+b") as f:
+        f.seek(offset)
+        f.write(blob[offset:])
+        if header_changed:
+            n = max(header_changed) + 1
+            f.seek(0)
+            f.write(blob[:n])
+        f.flush()
+        os.fsync(f.fileno())
+
+
+@dataclass
+class Deployment:
+    """A deployment already on disk: its stem, its offload records in order, and its verified raw datasets."""
+
+    stem: str
+    records: list[dict]
+    data: dict[str, bytes]
+
+    @property
+    def latest(self) -> dict:
+        return self.records[-1]
+
+    @property
+    def next_index(self) -> int:
+        return int(self.latest["deployment"].get("offload_index", len(self.records) - 1)) + 1
+
+
+def _find_deployment(rawdir: Path, sn: str) -> Deployment | None:
+    """The latest deployment of this logger on disk, its raw files checked against its latest record. None if
+    there is none, or the files cannot be trusted: a new deployment then starts and nothing on disk is touched."""
+    by_stem: dict[str, list[tuple[tuple, dict]]] = {}
+    for p in sorted(rawdir.glob(f"{sn}_*.json")):
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        dep = rec.get("deployment") if isinstance(rec, dict) else None
+        if not isinstance(dep, dict) or not dep.get("stem"):
+            continue
+        key = (int(dep.get("offload_index", 0) or 0), str(rec.get("offload_started", "")))
+        by_stem.setdefault(str(dep["stem"]), []).append((key, rec))
+    if not by_stem:
+        return None
+    stem, entries = max(by_stem.items(), key=lambda kv: max(e[0] for e in kv[1]))
+    entries.sort(key=lambda e: e[0])
+    records = [rec for _, rec in entries]
+    latest = records[-1]
+    datasets = latest.get("datasets") or ({"dataset1": latest["raw"]} if latest.get("raw") else {})
+    data: dict[str, bytes] = {}
+    for name, info in datasets.items():
+        path = rawdir / Path(str(info.get("file", ""))).name
+        want, want_sha = int(info.get("bytes", 0) or 0), str(info.get("sha256", ""))
+        if not path.is_file():
+            log.error("deployment %s: %s is missing; starting a new deployment (nothing on disk is changed)",
+                      stem, path.name)
+            return None
+        blob = path.read_bytes()
+        if len(blob) != want or sha256(blob) != want_sha:
+            if len(blob) > want and sha256(blob[:want]) == want_sha:
+                log.warning("deployment %s: %s holds %d bytes past its record (an interrupted offload); "
+                            "truncating it to %d", stem, path.name, len(blob) - want, want)
+                with open(path, "r+b") as f:
+                    f.truncate(want)
+                    f.flush()
+                    os.fsync(f.fileno())
+                blob = blob[:want]
+            else:
+                log.error("deployment %s: %s does not match its record (%d bytes, expected %d%s); starting a new "
+                          "deployment (nothing on disk is changed)", stem, path.name, len(blob), want,
+                          "" if len(blob) != want else ", checksum differs")
+                return None
+        data[name] = blob
+    log.debug("deployment %s on disk: %d record(s), %s", stem, len(records),
+              ", ".join(f"{k} {len(v)} B" for k, v in data.items()))
+    return Deployment(stem, records, data)
+
+
+def _changes_since(ident: dict, snap: dict, skew: dict, ntp: dict, previous: dict) -> list[str]:
+    """What differs from the deployment's previous offload record: settings, status, and a clock skew that
+    jumped more than drift allows (the clock was set or reset in between)."""
+    out = []
+    pid, psnap = previous.get("id") or {}, previous.get("snapshot_before") or {}
+    if str(pid.get("version", "")) != str(ident.get("version", "")):
+        out.append(f"firmware version {pid.get('version')} -> {ident.get('version')}")
+    for key in ("mode", "period"):
+        a, b = (psnap.get("sampling") or {}).get(key), (snap.get("sampling") or {}).get(key)
+        if str(a) != str(b):
+            out.append(f"sampling {key} {a} -> {b}")
+    for key in ("starttime", "endtime"):
+        if str(psnap.get(key, "")) != str(snap.get(key, "")):
+            out.append(f"{key} {psnap.get(key)} -> {snap.get(key)}")
+    fmt_a = (psnap.get("memformat") or {}).get("type", "")
+    fmt_b = (snap.get("memformat") or {}).get("type", "")
+    if fmt_a != fmt_b:
+        out.append(f"memory format {fmt_a} -> {fmt_b}")
+
+    def table(sn):
+        return [(str(c.get("type")), int(c.get("status", 0) or 0), json.dumps(c.get("coefficients", {}), sort_keys=True,
+                                                                              default=str))
+                for c in sn.get("channels_all") or sn.get("channel_list") or []]
+
+    if table(psnap) != table(snap):
+        out.append("channel table (types, statuses or calibration coefficients)")
+    pstatus = (previous.get("after") or {}).get("status") or psnap.get("status")
+    if str(pstatus) != str(snap.get("status")):
+        out.append(f"status {pstatus} -> {snap.get('status')}")
+    prev_skew = skew_vs_utc(previous)
+    now_skew = skew_vs_utc({"clock_skew": skew, "host_ntp": ntp})
+    if prev_skew is not None and now_skew is not None and math.isfinite(prev_skew) and math.isfinite(now_skew):
+        try:
+            elapsed = (utcnow() - dt.datetime.fromisoformat(previous["offload_started"].replace("Z", "+00:00"))
+                       ).total_seconds()
+        except (KeyError, ValueError):
+            elapsed = 0.0
+        tol = 2.0 + 50e-6 * max(elapsed, 0.0)
+        if abs(now_skew - prev_skew) > tol:
+            out.append(f"clock skew {prev_skew:+.3f} s -> {now_skew:+.3f} s ({elapsed / 86400:.1f} days apart, "
+                       f"beyond {tol:.1f} s): the clock was set or reset in between")
+    return out
 
 
 def _write_json(path: Path, obj):
@@ -418,8 +581,9 @@ def offload(port: str, s: Settings) -> Path | None:
         ident = identify(link)
         sn = ident["serial"]
         DEVICE.set(f"SN{sn}@{_port_name(port)}")
-        stem = f"{sn}_{tag}"
-        link.start_transcript(rawdir / f"{stem}.log")
+        rec_stem = f"{sn}_{tag}"  # this offload's record and transcript; the deployment's files may be older
+        stem = rec_stem
+        link.start_transcript(rawdir / f"{rec_stem}.log")
         log.info("%s SN%s, firmware %s, fwtype %s on %s", ident["model"], sn, ident["version"], ident["fwtype"], port)
         log.debug("serial transcript: %s", link.transcript_path)
         driver = driver_for(ident["fwtype"])
@@ -458,28 +622,71 @@ def offload(port: str, s: Settings) -> Path | None:
         log.debug("settings: %s", json.dumps(snap, default=str))
         plan = driver.datasets(snap)
         total = sum(n for _, _, n in plan)
-        log.info("status %s, sampling %s %s ms, %d bytes to download%s", snap["status"],
+        log.info("status %s, sampling %s %s ms, %d bytes in memory%s", snap["status"],
                  snap["sampling"].get("mode"), snap["sampling"].get("period"), total,
                  "" if len(plan) == 1 else " (" + ", ".join(f"{name} {n}" for name, _, n in plan) + ")")
 
         part_dir = rawdir / ".partial"
-        data: dict[str, bytes] = {}
+        held = _find_deployment(rawdir, sn) if total > 0 else None
+        warnings = []
+        if held is not None:
+            for change in _changes_since(ident, snap, skew, ntp, held.latest):
+                warnings.append(f"since the previous offload of deployment {held.stem}: {change}")
+        dl: Downloaded | None = None
         if total > 0:
             if s.stop.is_set():
                 raise Stopped()
             _stage(port, "downloading")
-            data = driver.download(link, snap, part_dir, sn, _progress_logger(s, port))
+            prog = _progress_logger(s, port)
+            if held is not None:
+                try:
+                    dl = driver.download(link, snap, part_dir, sn, prog, held=Held(held.stem, held.data),
+                                         full=s.full_download)
+                except DeploymentMismatch as err:
+                    log.warning("SN%s: the logger does not hold deployment %s (%s): starting a new deployment; "
+                                "the old files are left as they are", sn, held.stem, err)
+                    warnings.append(f"not deployment {held.stem}: {err}; new deployment")
+                    held = None
+                    if err.downloaded is not None:  # a full read was made: no need to repeat it
+                        dl = err.downloaded
+                        dl.kind, dl.tail_check, dl.header_changed = "full", None, []
+                        dl.segments = {k: (0, len(v)) for k, v in dl.data.items()}
+            if dl is None:
+                dl = driver.download(link, snap, part_dir, sn, prog, full=s.full_download)
         after = driver.after(link)
         log.debug("after download: %s", after)
 
+        data: dict[str, bytes] = dl.data if dl is not None else {}
+        stem = held.stem if held is not None else rec_stem
         datasets = {}
         for name, blob in data.items():
             if not blob:
                 continue
             fname = f"{stem}.bin" if list(data) == ["dataset1"] else f"{stem}_{name.replace('/', '_')}.bin"
-            _write_bytes(rawdir / fname, blob)
-            datasets[name] = {"file": f"raw/{fname}", "bytes": len(blob), "sha256": sha256(blob)}
-        warnings = []
+            off, nbytes = dl.segments.get(name, (0, len(blob)))
+            _store_dataset(rawdir / fname, blob, off, dl.header_changed if name == driver.identity_dataset else [])
+            datasets[name] = {"file": f"raw/{fname}", "bytes": len(blob), "sha256": sha256(blob), "offset": off,
+                              "segment_bytes": nbytes}
+        deployment = None
+        if datasets:
+            primary = driver.primary(data)
+            identity = driver.identity(data)
+            off, nbytes = dl.segments.get(primary, (0, len(data[primary])))
+            deployment = {
+                "stem": stem, "identity_dataset": driver.identity_dataset, "header_bytes": len(identity),
+                "header_sha256": sha256(identity), "tail_check": dl.tail_check, "header_changed": dl.header_changed,
+                "offload_index": held.next_index if held is not None else 0,
+                "segment": {"offset": off, "bytes": nbytes, "sha256": sha256(data[primary][off:off + nbytes])},
+                "image_bytes": len(data[primary]), "image_sha256": datasets[primary]["sha256"],
+                "download": dl.kind,
+            }
+            if dl.header_changed:
+                warnings.append(f"the memory header changed since the previous offload at byte(s) "
+                                f"{', '.join(map(str, dl.header_changed))}; refreshed in the saved image")
+            if dl.kind == "incremental" and driver.family == "L2" and nbytes:
+                new_events = scan_events(data[primary], off)
+                if new_events:
+                    warnings.append("events in the new data: " + ", ".join(event_name(t) for _, t, _ in new_events))
         if skew.get("n") and abs(skew["skew_vs_host_s"]) > 60:
             warnings.append(f"clock skew {skew['skew_vs_host_s']:+.1f} s exceeds 60 s "
                             "(clock reset, or set to local time instead of UTC?)")
@@ -510,17 +717,27 @@ def offload(port: str, s: Settings) -> Path | None:
             "remaining_time": rem,
             "bytes_per_sample": driver.bytes_per_sample(snap),
             "thresholds": vars(s.thresholds),
+            "deployment": deployment,
             "raw": datasets.get("dataset1") or next((v for k, v in datasets.items() if k.endswith("/data")), None)
             or next(iter(datasets.values()), None),
             "datasets": datasets,
-            "transcript": f"raw/{stem}.log",
+            "transcript": f"raw/{rec_stem}.log",
             "session_log": f"raw/{s.session_log.name}" if s.session_log else None,
             "warnings": warnings,
         }
-        _write_json(rawdir / f"{stem}.json", record)  # saved before anything is written to the logger
-        log.debug("wrote %s", rawdir / f"{stem}.json")
+        _write_json(rawdir / f"{rec_stem}.json", record)  # saved before anything is written to the logger
+        log.debug("wrote %s", rawdir / f"{rec_stem}.json")
         for f in driver.part_files(part_dir, sn) if part_dir.is_dir() else []:  # only now: all is saved
             f.unlink(missing_ok=True)
+        if deployment is not None:
+            if dl.kind == "incremental":
+                log.info("incremental: %d new bytes from offset %d (deployment %s, offload %d)", dl.new_bytes,
+                         deployment["segment"]["offset"], stem, deployment["offload_index"])
+            elif dl.kind == "full-verified":
+                log.info("full download, verified against deployment %s: %d new bytes (offload %d)", stem,
+                         dl.new_bytes, deployment["offload_index"])
+            else:
+                log.info("new deployment %s: %d bytes", stem, deployment["image_bytes"])
         mem, pwr = after["meminfo"], after["power"]
         energy = (f", energy counter {pwr['energy_remaining_J']:.0f} J of {pwr['energy_nominal_J']:.0f} J nominal"
                   if math.isfinite(pwr.get("energy_remaining_J", math.nan)) else "")
@@ -537,23 +754,24 @@ def offload(port: str, s: Settings) -> Path | None:
         if s.deploy is not None:
             note = f"{total} bytes, saved to raw/{stem}*.bin" if datasets else "already empty"
             logged = int(after["meminfo"].get("used", 0) or 0) - int((snap.get("meminfo") or {}).get("used", 0) or 0)
-            if logged > 0:  # still logging during the download: these came after the snapshot and are not saved
-                note += f"; {logged} bytes logged since the download began are NOT saved"
+            if logged > 0:  # still logging during the download: these came after the snapshot and the erase loses them
+                note += f"; {logged} bytes logged since the download began are NOT saved (the erase removes them)"
             report = _configure_step(link, s, snap, ntp, sn, note, driver)
-            _write_json(rawdir / f"{stem}_configure.json", report)
-            log.debug("wrote %s", rawdir / f"{stem}_configure.json")
+            _write_json(rawdir / f"{rec_stem}_configure.json", report)
+            log.debug("wrote %s", rawdir / f"{rec_stem}_configure.json")
 
     if not datasets:
         log.info("logger memory is empty; no NetCDF written")
         return None
     _stage(port, "writing NetCDF")
     nc_path = s.outdir / f"{stem}.nc"
+    records = [*(held.records if held is not None else []), record]
     try:  # on the main thread: see console.Console.run_in_main
-        all_warnings, t_ms = s.console.run_in_main(driver.write_netcdf, data, record, nc_path)
+        all_warnings, t_ms = s.console.run_in_main(driver.write_netcdf, data, records, nc_path)
     except Exception as err:
         how = "no decoder yet" if isinstance(err, DecodeUnavailable) else f"{type(err).__name__}"
         log.warning("NetCDF not written (%s: %s). The download is saved; convert it later with: "
-                    "rbr-offload %s --rebuild %s", how, err, s.outdir, rawdir / f"{stem}.json")
+                    "rbr-offload %s --rebuild %s", how, err, s.outdir, rawdir / f"{rec_stem}.json")
         if not isinstance(err, DecodeUnavailable):  # no decoder yet: the saved download is the intended result
             _failed[port] = f"download saved, but NetCDF not written ({how}: {err})"
         log.debug("NetCDF traceback", exc_info=True)
@@ -608,10 +826,24 @@ def _worker(port: str, s: Settings):
 
 def run(s: Settings, once: bool, port: str | None):
     """Watch for loggers and give each its own worker thread. Main thread; answers the workers' questions."""
+    global _status_console
     workers: dict[str, threading.Thread] = {}
     finished: set[str] = set()  # ports whose worker ended, until they are unplugged
     announced = ruskin_warned = started_any = False
     last_status = last_new = time.monotonic()  # last_new: a worker started or ended (--once grace)
+    with _stages_lock:
+        _stages.clear()  # this run owns the stage table
+    _status_console = s.console
+    try:
+        _run(s, once, port, workers, finished, announced, ruskin_warned, started_any, last_status, last_new)
+    finally:
+        if s.console.status_enabled:
+            s.console.status(None)
+        _status_console = None
+
+
+def _run(s: Settings, once: bool, port: str | None, workers, finished, announced, ruskin_warned, started_any,
+         last_status, last_new):
     try:
         while True:
             present = _present(port)
@@ -644,8 +876,8 @@ def run(s: Settings, once: bool, port: str | None):
             if not workers and not announced:
                 log.info("Waiting for an RBR logger on USB (Ctrl-C to quit)...")
                 announced = True
-            if len(workers) > 1 and time.monotonic() - last_status >= STATUS_EVERY_S:
-                log.info("in progress: %s", _stage_summary())
+            if len(workers) > 1 and time.monotonic() - last_status >= STATUS_EVERY_S and not _status_enabled():
+                log.info("in progress: %s", _stage_summary())  # on a terminal the status line shows this
                 last_status = time.monotonic()
             s.console.serve(POLL_S)
     except KeyboardInterrupt:
@@ -674,7 +906,7 @@ def _shutdown(s: Settings, workers: dict[str, threading.Thread]):
         # run_in_main() with its NetCDF write queued would otherwise leave the exit status 0 (issue #9 item 4).
         with _stages_lock:
             interrupted = list(_stages.values())
-        for dev, what in interrupted:
+        for dev, what, _ in interrupted:
             if not any(f.startswith(f"{dev}:") for f in s.failed):
                 s.failed.append(f"{dev}: interrupted (Ctrl-C twice) while {what}")
             if what == "configuring" and not any(r.startswith(f"{dev}:") for r in s.not_ready):
@@ -687,8 +919,10 @@ class RebuildError(Exception):
     pass
 
 
-def _rebuild(rec_path: Path, outdir: Path):
-    """NetCDF from one saved offload record (raw/SN_time.json) and its raw files."""
+def _rebuild(rec_path: Path, outdir: Path, done: set[str] | None = None):
+    """NetCDF from one saved offload record (raw/SN_time.json) and its raw files. A record of a deployment
+    (several offloads) rebuilds the deployment's file from all of its records; `done` skips a stem rebuilt
+    already in this run."""
     record = json.loads(rec_path.read_text())
     if not isinstance(record, dict) or "fwtype" not in (record.get("id") or {}):
         kind = "a configure report" if isinstance(record, dict) and "steps" in record else "not an offload record"
@@ -697,11 +931,53 @@ def _rebuild(rec_path: Path, outdir: Path):
     driver = driver_for(int(record["id"]["fwtype"]))
     if driver is None:
         raise RebuildError(f"fwtype {record['id']['fwtype']} is not supported")
-    data = {}
-    datasets = record.get("datasets") or ({"dataset1": record["raw"]} if record.get("raw") else {})
-    if not datasets:
+    if not (record.get("datasets") or record.get("raw")):
         log.warning("%s: the logger's memory was empty at this offload; nothing to rebuild", rec_path)
         return
+    data = _raw_files(rec_path, record, prefix_ok=True)  # its own files, checked (a prefix once the deployment grew)
+    dep = record.get("deployment")
+    records = [record]
+    stem = rec_path.stem
+    if isinstance(dep, dict) and dep.get("stem"):
+        stem = str(dep["stem"])
+        if done is not None and stem in done:
+            log.info("%s: deployment %s was rebuilt already in this run", rec_path.name, stem)
+            return
+        by_index: dict[tuple, dict] = {}
+        for p in sorted(rec_path.parent.glob(f"{record['id']['serial']}_*.json")):
+            if p.resolve() == rec_path.resolve():
+                continue
+            try:
+                r = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            d = r.get("deployment") if isinstance(r, dict) else None
+            if isinstance(d, dict) and d.get("stem") == stem:
+                by_index.setdefault((int(d.get("offload_index", 0) or 0), str(r.get("offload_started", ""))), r)
+        by_index[(int(dep.get("offload_index", 0) or 0), str(record.get("offload_started", "")))] = record
+        records = [by_index[k] for k in sorted(by_index)]
+        if records[-1] is not record:
+            data = _raw_files(rec_path, records[-1])
+        log.info("deployment %s: %d offload record(s)", stem, len(records))
+    nc_path = outdir / f"{stem}.nc"
+    try:
+        warnings, _ = driver.write_netcdf(data, records, nc_path)
+    except DecodeUnavailable as err:  # the saved download is all there is for now: not a failure
+        log.warning("%s: not written: %s", rec_path, err)
+        return
+    if done is not None:
+        done.add(stem)
+    for w in warnings:
+        if w not in records[-1].get("warnings", []):
+            log.warning("%s: %s", rec_path.name, w)
+    log.info("wrote %s", nc_path)
+
+
+def _raw_files(rec_path: Path, record: dict, prefix_ok: bool = False) -> dict[str, bytes]:
+    """The datasets a record names, read and checked against its checksums. With `prefix_ok`, a file that has
+    grown since (an earlier record of a deployment) passes when the bytes the record names still match."""
+    data = {}
+    datasets = record.get("datasets") or ({"dataset1": record["raw"]} if record.get("raw") else {})
     roots = [rec_path.parent.parent.resolve(), rec_path.parent.resolve()]
     for name, info in datasets.items():
         rel = Path(info["file"])
@@ -715,19 +991,13 @@ def _rebuild(rec_path: Path, outdir: Path):
         if found is None:
             raise RebuildError(f"{info['file']} not found (looked in {', '.join(map(str, where))})")
         blob = found.read_bytes()
+        want = int(info.get("bytes", len(blob)) or 0)
+        if prefix_ok and len(blob) > want:
+            blob = blob[:want]
         if sha256(blob) != info["sha256"]:
             raise RebuildError(f"{info['file']} checksum does not match the record")
         data[name] = blob
-    nc_path = outdir / (rec_path.stem + ".nc")
-    try:
-        warnings, _ = driver.write_netcdf(data, record, nc_path)
-    except DecodeUnavailable as err:  # the saved download is all there is for now: not a failure
-        log.warning("%s: not written: %s", rec_path, err)
-        return
-    for w in warnings:
-        if w not in record.get("warnings", []):
-            log.warning("%s: %s", rec_path.name, w)
-    log.info("wrote %s", nc_path)
+    return data
 
 
 def main(argv=None):
@@ -743,6 +1013,9 @@ def main(argv=None):
     ap.add_argument("--no-ntp", action="store_true", help="skip the NTP query; skew is then relative to the host")
     ap.add_argument("--rebuild", nargs="+", type=Path, metavar="RECORD.json",
                     help="regenerate NetCDF from saved raw/*.json + .bin (no logger needed), then exit")
+    ap.add_argument("--full-download", action="store_true",
+                    help="read the whole memory even when the deployment is already on disk, and verify that "
+                         "the memory extends the saved image (default: read only the new bytes)")
     t = ap.add_argument_group("alarms (loud warning at offload and after configure)")
     t.add_argument("--min-voltage", type=float, metavar="V",
                    help="alarm if the internal battery reads below V volts (default 3.3)")
@@ -812,9 +1085,10 @@ def main(argv=None):
     if args.rebuild:
         setup_logging(console)
         failed = []
+        done: set[str] = set()
         for rec_path in args.rebuild:
             try:
-                _rebuild(rec_path, args.outdir)
+                _rebuild(rec_path, args.outdir, done)
             except (RebuildError, OSError, ValueError, KeyError) as err:  # report it, and go on to the next
                 why = str(err) if isinstance(err, RebuildError) else f"{type(err).__name__}: {err}"
                 log.error("%s: NOT rebuilt: %s", rec_path, why)
@@ -828,7 +1102,8 @@ def main(argv=None):
     session_log = rawdir / f"rbr-offload_{utcnow():%Y%m%dT%H%M%SZ}.log"
     setup_logging(console, session_log)
     s = Settings(outdir=args.outdir, ntp_server=None if args.no_ntp else args.ntp_server, deploy=deploy,
-                 thresholds=thresholds, assume_yes=args.yes, console=console, session_log=session_log)
+                 thresholds=thresholds, assume_yes=args.yes, console=console, session_log=session_log,
+                 full_download=args.full_download)
     log.debug("rbr-tpw %s; Python %s; pyserial %s; %s %s; argv %s", __version__, platform.python_version(),
               serial.__version__, platform.system(), platform.release(), sys.argv)
     log.debug("settings: thresholds %s; deploy %s; ntp %s; port %s; once %s; yes %s", vars(thresholds),

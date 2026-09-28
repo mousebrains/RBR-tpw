@@ -23,6 +23,12 @@ MEMORY_SIZE = 132_120_576
 SYNC_S = 843_696_000  # 2026-09-25T00:00:00Z in seconds since 2000
 
 
+def solo_event(etype: int, seconds: int) -> bytes:
+    """An 8-byte L2 event record: <crc16 BE of bytes 2..7><type><0xF7><uint32 LE seconds since 2000>."""
+    body = bytes([etype, 0xF7]) + struct.pack("<I", seconds)
+    return struct.pack(">H", crc16_ccitt(body)) + body
+
+
 def solo_image(n: int, sync_s: int = SYNC_S, serial: int = 100689, period_ms: int = 500, nchan: int = 1) -> bytes:
     """L2 rawbin memory: 512-byte header, a time-sync event at `sync_s` (s since 2000), n sample sets."""
     hdr = bytearray(b"\xff" * 512)
@@ -244,6 +250,27 @@ class FakeSolo(FakePort):
         self.serial, self.fwtype = serial, fwtype
         self.image = solo_image(n_samples, SYNC_S, serial)
         self.datasets = {1: self.image}
+        self.status = "logging"  # what `status` answers; a test sets "stopped" after appending the 0x02 event
+        self.endtime = "20991231235959"
+
+    def set_image(self, image: bytes):
+        """Replace the memory (bytes are immutable: both names must be rebound)."""
+        self.image = image
+        self.datasets[1] = image
+
+    def grow(self, n_samples: int, seed: int = 0):
+        """The logger keeps logging: `n_samples` more readings after what is there."""
+        rng = np.random.default_rng(seed + len(self.image))
+        more = (0x2000_0000 + rng.integers(0, 0x0100_0000, n_samples)).astype("<u4").tobytes()
+        self.set_image(self.image + more)
+
+    def append_event(self, etype: int, seconds: int):
+        """An 8-byte event record, as the logger writes one (e.g. 0x02 when stopped)."""
+        self.set_image(self.image + solo_event(etype, seconds))
+
+    def erase_and_enable(self, sync_s: int):
+        """What Ruskin's enable does to the memory: a fresh header (new enable time) and sync marker, no data."""
+        self.set_image(solo_image(0, sync_s, self.serial))
 
     def replies(self):
         used = len(self.image)
@@ -255,9 +282,9 @@ class FakeSolo(FakePort):
             "id": f"id model = RBRsolo, version = {'1.110' if self.fwtype == 0 else '1.000'}, "
                   f"serial = {self.serial}, fwtype = {self.fwtype}",
             "now": f"now = {self.now():%Y%m%d%H%M%S}",
-            "status": "status = logging",
+            "status": f"status = {self.status}",
             "starttime": "starttime = 20000101000010",
-            "endtime": "endtime = 20991231235959",
+            "endtime": f"endtime = {self.endtime}",
             "sampling": sampling,
             "channels": "channels count = 1, latency = 100, readtime = 350, minperiod = 550",
             "channel 1": "channel 1 type = temp02, equation = tmp, factoryunits = C, userunits = C, module = 1, "
