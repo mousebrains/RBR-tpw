@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from . import solo
+from .equations import is_sectioned_header, parse_l2_header
 from .link import Link, LinkError, LoggerError
 from .lock import unlocked_if_possible
 from .ncwrite import ChannelValues, records_of, write_netcdf, write_values_netcdf
@@ -50,25 +52,36 @@ class DeploymentMismatch(Exception):
 
 @dataclass
 class Held:
-    """A deployment's raw datasets on disk, verified against its latest record by the caller."""
+    """A deployment's raw datasets on disk, verified against its latest record by the caller, and the header
+    the logger reported at the latest offload when that differs from the saved image's (None: the same)."""
 
     stem: str
     data: dict[str, bytes]
+    header: bytes | None = None
 
 
 @dataclass
 class Downloaded:
-    """What one offload produced: every dataset complete (held bytes plus new), and what was read."""
+    """What one offload produced: every dataset complete (held bytes plus new), and what was read.
+
+    The saved image only ever grows. A header the logger reports differently from the saved image's is not
+    written into it: the logger writes its header at enable (L3 reference 5.3.1), so a change is an anomaly to
+    record, and rewriting it would break every earlier record's checksum. It is kept in `header_now`."""
 
     data: dict[str, bytes]
-    segments: dict[str, tuple[int, int]]  # dataset -> (offset, bytes) read from the logger at this offload
+    segments: dict[str, tuple[int, int]]  # dataset -> (offset, bytes) appended (offset 0: written whole)
     kind: str  # full | incremental | full-verified
+    new_bytes: int = 0  # bytes the deployment grew by at this offload
+    bytes_read: int = 0  # bytes read from the logger (header and tail checks, or the full image, included)
     tail_check: dict | None = None
-    header_changed: list[int] = field(default_factory=list)  # identity-header byte offsets that changed
+    header_changed: list[int] = field(default_factory=list)  # header byte offsets changed since the previous offload
+    header_now: bytes | None = None  # the logger's header, when it differs from the saved image's
 
-    @property
-    def new_bytes(self) -> int:
-        return sum(n for _, n in self.segments.values())
+
+def as_full(result: Downloaded) -> Downloaded:
+    """A full read made before a mismatch was found, recast as a new deployment's download."""
+    return Downloaded(result.data, {k: (0, len(v)) for k, v in result.data.items()}, "full",
+                      new_bytes=sum(len(v) for v in result.data.values()), bytes_read=result.bytes_read)
 
 
 def _q(link: Link, cmd: str) -> dict:
@@ -218,11 +231,16 @@ class Driver:
         """Every dataset, whole. With `held`, the deployment on disk, the new image must extend it (each growing
         dataset starts with the old bytes, the identity dataset is unchanged), else DeploymentMismatch."""
         data = self._download_all(link, snap, part_dir, sn, progress)
-        segments = {k: (0, len(v)) for k, v in data.items()}
+        read = sum(len(v) for v in data.values())
         if held is None:
-            return Downloaded(data, segments, "full")
+            return Downloaded(data, {k: (0, len(v)) for k, v in data.items()}, "full", new_bytes=read,
+                              bytes_read=read)
+        # a growing dataset is appended past what was held; the others are written whole
+        segments = {k: (len(held.data[k]), len(v) - len(held.data[k])) if self.grows(k) and k in held.data
+                    and len(v) >= len(held.data[k]) else (0, len(v)) for k, v in data.items()}
+        grew = sum(n for k, (o, n) in segments.items() if o or (self.grows(k) and k not in held.data))
+        result = Downloaded(data, segments, "full-verified", new_bytes=grew, bytes_read=read)
         reason = self.growth_mismatch(held.data, data)
-        result = Downloaded(data, segments, "full-verified")
         if reason:
             raise DeploymentMismatch(reason, result)
         return result
@@ -309,36 +327,66 @@ class L2Driver(Driver):
     def bytes_per_sample(self, snap: dict) -> int | None:
         return 4 * len(snap["channel_list"])
 
+    @staticmethod
+    def header_length(image: bytes) -> int:
+        """The memory header's own length: 512 on the RBRsolo (fwtypes 0 and 9, 111 of 111 .rsk images); a
+        sectioned header on the duet and concerto has its own, not a multiple of 4 (715, 939, 1037 seen)."""
+        if len(image) < 64:
+            return len(image)
+        if is_sectioned_header(image):
+            try:
+                return int(parse_l2_header(image).length)
+            except Exception:  # noqa: BLE001  (unparseable: treat the whole image as header, so it is compared)
+                return len(image)
+        return min(512, len(image))
+
+    def identity(self, data):
+        blob = data.get("dataset1", b"")
+        return blob[: self.header_length(blob)]
+
     def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None, held: Held | None = None,
                  full: bool = False) -> Downloaded:
         """dataset 1: all of it for a new deployment or with `full`; otherwise only the bytes past the held image,
-        after the tail check (the last block of the held image is read back and compared) and the header
-        check (a changed header is refreshed and reported, unless there is no data to check it against)."""
+        after the tail check (the last block of the held image is read back and compared) and the header check.
+
+        Only the RBRsolo's 512-byte header reads incrementally. The duet and concerto (sectioned headers) are
+        read in full and checked to extend the saved image, as a concerto3 is, until the incremental path has
+        run on one (their .rsk downloads are append-only: 1 duet and 3 concerto pairs, 2026-09-28)."""
         total = int(snap["meminfo"]["used"])
+        old = held.data.get("dataset1", b"") if held is not None else b""
+        if held is not None and is_sectioned_header(old):
+            return super().download(link, snap, part_dir, sn, progress, held=held, full=full)
+        n_old = len(old)
+        hl = self.header_length(old) if old else 512
+        prev_header = held.header if held is not None and held.header is not None else old[:hl]
+
+        def header_check(now: bytes) -> tuple[list[int], bytes | None]:
+            changed = [i for i in range(min(hl, len(now), len(prev_header))) if now[i] != prev_header[i]]
+            if changed and n_old <= hl:
+                raise DeploymentMismatch("the header differs and there is no data to check")
+            return changed, (now[:hl] if now[:hl] != old[:hl] else None)
+
         if held is None or full:
             image = solo.download(link, total, part_dir / self.part_name(sn, 1), progress) if total > 0 else b""
             if held is None:
-                return Downloaded({"dataset1": image}, {"dataset1": (0, len(image))}, "full")
-            old = held.data.get("dataset1", b"")
-            n_old = len(old)
-            result = Downloaded({"dataset1": image}, {"dataset1": (n_old, max(0, len(image) - n_old))},
-                                "full-verified")
+                return Downloaded({"dataset1": image}, {"dataset1": (0, len(image))}, "full", new_bytes=len(image),
+                                  bytes_read=len(image))
+            result = Downloaded({"dataset1": old + image[n_old:]}, {"dataset1": (n_old, max(0, len(image) - n_old))},
+                                "full-verified", new_bytes=max(0, len(image) - n_old), bytes_read=len(image))
+            fresh = Downloaded({"dataset1": image}, {}, "full", bytes_read=len(image))  # if it is another deployment
             if len(image) < n_old:
-                raise DeploymentMismatch(f"the logger holds {len(image)} bytes, the deployment image {n_old}",
-                                         result)
-            data_start = min(512, n_old)
-            if image[data_start:n_old] != old[data_start:n_old]:
-                first = next(i for i in range(data_start, n_old) if image[i] != old[i])
-                raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}", result)
-            result.header_changed = [i for i in range(data_start) if image[i] != old[i]]
-            if result.header_changed and n_old <= 512:
-                raise DeploymentMismatch("the header differs and there is no data to check", result)
+                raise DeploymentMismatch(f"the logger holds {len(image)} bytes, the deployment image {n_old}", fresh)
+            if image[hl:n_old] != old[hl:n_old]:
+                first = next(i for i in range(hl, n_old) if image[i] != old[i])
+                raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}", fresh)
+            try:
+                result.header_changed, result.header_now = header_check(image)
+            except DeploymentMismatch as err:
+                raise DeploymentMismatch(str(err), fresh) from None
             return result
-        old = held.data.get("dataset1", b"")
-        n_old = len(old)
         if total < n_old:
             raise DeploymentMismatch(f"the logger holds {total} bytes, the deployment image {n_old}")
-        head_len = min(512, total)
+        head_len = min(hl, total)
         head = link.read_data(1, head_len, 0)
         if len(head) != head_len:
             raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
@@ -346,20 +394,18 @@ class L2Driver(Driver):
         tail = link.read_data(1, n, n_old - n) if n else b""
         if len(tail) != n:
             raise LinkError(f"short tail read: {len(tail)} of {n} bytes at {n_old - n}")
-        data_start = min(512, n_old)
         tail_check = {"offset": n_old - n, "bytes": n, "ok": True}
+        data_start = max(hl, n_old - n)
         if tail[data_start - (n_old - n):] != old[data_start:n_old]:
             first = next(i for i in range(data_start, n_old) if tail[i - (n_old - n)] != old[i])
             raise DeploymentMismatch(f"memory differs from the deployment image at byte {first}")
-        header_changed = [i for i in range(data_start) if head[i] != old[i]]
-        if header_changed and n_old <= 512:
-            raise DeploymentMismatch("the header differs and there is no data to check")
+        header_changed, header_now = header_check(head)
         segment = b""
         if total > n_old:
             segment = solo.download(link, total, part_dir / f"{sn}.{held.stem}.{n_old}.part", progress, start=n_old)
-        image = (head[:data_start] + old[data_start:] if header_changed else old) + segment
-        return Downloaded({"dataset1": image}, {"dataset1": (n_old, len(segment))}, "incremental",
-                          tail_check=tail_check, header_changed=header_changed)
+        return Downloaded({"dataset1": old + segment}, {"dataset1": (n_old, len(segment))}, "incremental",
+                          new_bytes=len(segment), bytes_read=head_len + n + len(segment), tail_check=tail_check,
+                          header_changed=header_changed, header_now=header_now)
 
     def write_netcdf(self, data, record, path):
         fmt = (records_of(record)[-1]["snapshot_before"].get("memformat") or {}).get("type", "rawbin00")
@@ -522,15 +568,28 @@ class Gen4Driver(Driver):
         records = records_of(record)
         record = records[-1]
         snap = record["snapshot_before"]
-        ds, sch, cols, _, _ = self.g.columns(data, snap)
+        ds, sch, cols, meta, fmt = self.g.columns(data, snap)
         time_ms, values, error_codes, events = self.g.decode(data, snap, ds, sch)
-        # earlier offloads' images: fixed-size records, so sample sets scale with the data object's bytes; the
-        # events object is not split per offload (Gen4 is untested on a logger)
-        latest = int(((record.get("datasets") or {}).get(f"{ds}/{sch}/data") or {}).get("bytes", 0) or 0)
+        # what each earlier offload's objects held: fixed-size sample records, and the events (of this schedule)
+        # that ended within its events object
+        rec_size = 8 + np.dtype(fmt).itemsize * len(cols)
+        bit = 1 << (next(x["index"] for x in meta.schedules if x["label"] == sch) - 1)
+        ev_ends, ev, pos = [], data.get(f"{ds}/events", b""), 0
+        while pos + 24 <= len(ev):
+            _, mask, size = struct.unpack_from("<QIH", ev, pos)
+            step = size if size >= 24 else 24
+            if mask == 0 or mask & bit:
+                ev_ends.append(pos + step)
+            pos += step
         seen = []
         for rec in records:
-            b = int(((rec.get("datasets") or {}).get(f"{ds}/{sch}/data") or {}).get("bytes", 0) or 0)
-            seen.append((time_ms.size * b // latest if latest and rec is not record else time_ms.size, len(events)))
+            objs = rec.get("datasets") or {}
+            if rec is record or not objs:
+                seen.append((time_ms.size, len(events)))
+                continue
+            b_data = int((objs.get(f"{ds}/{sch}/data") or {}).get("bytes", 0) or 0)
+            b_ev = int((objs.get(f"{ds}/events") or {}).get("bytes", 0) or 0)
+            seen.append((min(b_data // rec_size, time_ms.size), sum(1 for e in ev_ends if e <= b_ev)))
         # the columns as the dataset's own metadata describes them, not the logger's current channel list
         channels = [{"index": c["index"], "type": c.get("type", ""), "label": c.get("label", ""),
                      "userunits": c.get("userunits", ""), "status": STATUS_HIDDEN if c.get("hidden") else 0,

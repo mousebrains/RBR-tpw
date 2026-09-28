@@ -108,11 +108,12 @@ Before reading incrementally the tool checks that the logger still holds the dep
 back the last block of the saved image (up to 68000 bytes) and compares it byte for byte, and it compares
 the memory header. A memory that differs, or is shorter, is a different deployment (erased and enabled
 again, in Ruskin or by `--configure`): a new deployment starts with a full download and the old files are
-left alone. A header that changed while the data matched (a status word, say) is refreshed in the saved
-image and reported. `--full-download` reads the whole memory anyway and verifies that it extends the saved
-image, which is the way to check the incremental path on a bench. RBRsolos, duets and concertos read
-incrementally; a concerto³ (and Gen4) is read in full each time and checked the same way, until the
-incremental path has been seen to work on one.
+left alone. A header that changed while the data matched (a status word, say) is reported, and the
+logger's header is kept in the record; the saved image keeps the header as first downloaded, so it only
+ever grows and every record's checksum describes a prefix of it. `--full-download` reads the whole memory
+anyway and verifies that it extends the saved image, which is the way to check the incremental path on a
+bench. RBRsolos (fwtypes 0 and 9) read incrementally. Duets, concertos, concerto³s and Gen4 loggers are read
+in full each time and checked the same way, until the incremental path has been seen to work on one.
 
 Plugging the logger into Ruskin between offloads is safe: a stop appends an event and is reported; a clock
 sync is only possible while stopped, is detected as a jump in the skew, and never applies to samples
@@ -121,10 +122,11 @@ previous offload is a warning in the record and the NetCDF. The tool never write
 offload.
 
 The NetCDF's global attributes describe the latest offload. Along the `offload_time` dimension the same
-quantities are kept for every offload of the deployment: bytes held and read, sample sets, battery voltage
-and energy counter, memory used and remaining, clock skew and its uncertainty, NTP offset, remaining
-sampling time, status, power source, port and tool version, plus `clock_set_detected` and
-`header_changed`. `history` has one line per offload. On a concerto³ the logger's own energy-used markers
+quantities are kept for every offload of the deployment: bytes held, added and read, sample sets, battery
+voltage and energy counter, memory used and remaining, clock skew and its uncertainty, NTP offset,
+remaining sampling time, status, power source, port and tool version, plus `clock_set_detected` and
+`header_changed`. `history` has one line per offload. Samples re-timed after a clock reset are listed in the
+`time_correction` table: each run's sample range, the offload whose skew was applied, and that skew. On a concerto³ the logger's own energy-used markers
 (event 0x27, written at enable and about every 34 h) are decoded into `energy_used_marker` (J) from the
 `event_payload`.
 
@@ -137,7 +139,7 @@ For each logger this writes:
 |---|---|
 | `SN_<T0>.nc` | the deployment's CF-1.13 NetCDF, `T0` its first offload: `time`, one variable per channel (e.g. `temperature`, degree_Celsius), the raw readings, quality flags, the logger's own timestamps (`logger_time`), the event list, and the per-offload series along `offload_time` |
 | `raw/SN_<T0>.bin` | the logger memory exactly as downloaded, extended by each offload (a concerto³: `_dataset0`, `_dataset1`, `_dataset2`) |
-| `raw/SN_<Tk>.json` | one record per offload `k`: logger settings, calibration, clock skew, NTP offset, memory and battery state, and under `deployment` the stem, the bytes read (`segment`), the image size and checksum, the tail check and any header change |
+| `raw/SN_<Tk>.json` | one record per offload `k`: logger settings, calibration, clock skew, NTP offset, memory and battery state, and under `deployment` the stem, the bytes added (`segment`) and read, the image size and checksum, the tail check and any header change |
 | `raw/SN_<Tk>.log` | serial transcript of offload `k`: every command, reply, discarded byte, timeout and retry, with UTC ms timestamps. It is written as it happens, so it survives a failure, and it is named by port (`raw/<UTC>_usbmodem….log`) until the logger reports its serial number. |
 | `raw/SN_<Tk>_configure.json` | with `--configure`: each step and the values read back |
 | `raw/.partial/SN.<T0>.<offset>.part` | a segment being downloaded (`SN.new.0.part` for a new deployment); it resumes on reconnect and is removed once the record is written |

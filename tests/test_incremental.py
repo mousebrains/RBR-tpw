@@ -84,7 +84,7 @@ def test_second_offload_reads_only_the_new_bytes(rig, monkeypatch):
         assert list(ds["offload_image_bytes"][:]) == [old_len, len(fake.image)]
         assert list(ds["logger_status"][:]) == ["logging", "logging"]
         assert ds["battery_voltage"][:].tolist() == [3.634, 3.634]
-        assert ds.history.count("\n") == 2 and "offload 1 from usbmodem1, incremental, 2000 bytes read" in ds.history
+        assert ds.history.count("\n") == 2 and "offload 1 from usbmodem1, incremental, 2000 bytes added" in ds.history
     assert "incremental: 2000 new bytes from offset" in rig.console_text()
     assert not list((rig.tmp / "raw" / ".partial").glob("*")) if (rig.tmp / "raw" / ".partial").is_dir() else True
 
@@ -272,7 +272,7 @@ def test_rebuild_a_deployment_from_any_of_its_records(rig, monkeypatch, tmp_path
         assert len(ds["time"]) == 1100 and len(ds["offload_time"]) == 2
 
 
-def test_header_change_with_the_data_intact_is_refreshed_not_split(rig, monkeypatch):
+def test_header_change_with_the_data_intact_does_not_split_the_deployment(rig, monkeypatch):
     _no_skew(monkeypatch)
     fake = rig.add("usbmodem1", serial=14, n_samples=1000)
     run(rig)
@@ -282,10 +282,12 @@ def test_header_change_with_the_data_intact_is_refreshed_not_split(rig, monkeypa
     fake.grow(10)
     run(rig)
     r0, r1 = _records(rig, 14)
-    assert r1["deployment"]["stem"] == r0["deployment"]["stem"]
+    assert r1["deployment"]["stem"] == r0["deployment"]["stem"] and r1["deployment"]["download"] == "incremental"
     assert r1["deployment"]["header_changed"] == [32, 33, 34, 35]
     assert any("memory header changed" in w for w in r1["warnings"])
-    assert (rig.tmp / "raw" / f"{r0['deployment']['stem']}.bin").read_bytes() == fake.image
+    # the saved image keeps the header as first downloaded, so every record's checksum is of a prefix
+    saved = (rig.tmp / "raw" / f"{r0['deployment']['stem']}.bin").read_bytes()
+    assert saved[512:] == fake.image[512:] and saved.startswith(bytes(bytearray(fake.image[:32]))) is True
 
 
 def test_settings_change_is_reported(rig, monkeypatch):

@@ -430,17 +430,29 @@ def reset_segments(time_ms: np.ndarray, events: list[tuple[int, int, int]]) -> t
     return tflags, segments_from_starts(time_ms.size, reset_segment_starts(time_ms, events))
 
 
+@dataclass
+class TimeCorrection:
+    """One run of reset-clock sample sets re-timed with one offload's skew: sample sets [start, end) of the
+    record, the offload (index into the views) and the skew subtracted (s)."""
+
+    start: int
+    end: int
+    offload: int
+    skew_s: float
+
+
 def resolve_times(
     d: Decoded, skew_s: float | None = None, offload_unix_ms: int | None = None,
-    views: list[OffloadView] | None = None,
+    views: list[OffloadView] | None = None, corrections: list[TimeCorrection] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """Best-estimate UTC sample times.
 
     Sample sets on a reset clock (TFLAG_RESET_CLOCK) are shifted by the logger-minus-UTC skew measured at an
     offload made while that clock ran unbroken: the latest offload whose current clock segment it was (`views`,
     one per offload of the deployment; a single offload is `skew_s` at `offload_unix_ms`). The result is checked
-    to land before that offload, after the preceding samples and after 2001. Reset-clock sets that no offload
-    can time are dropped (the raw image keeps them).
+    to land before that offload, after the last sample kept before it (whatever its flag, so two runs corrected
+    by different offloads cannot overlap: the later is dropped) and after 2001. Reset-clock sets that no offload
+    can time are dropped (the raw image keeps them). Each correction applied is appended to `corrections`.
 
     "Segment" here means the samples between clock restarts (events 0x06/0x0A/0x0B, or a backward step of the
     sample times), not between time anchors: an ordinary anchor (a time sync, or a twist activation on an
@@ -449,7 +461,7 @@ def resolve_times(
     Returns (time_ms, time_flags, keep mask, notes).
     """
     return resolve_time_arrays(d.time_ms, d.time_flags, None, skew_s, offload_unix_ms, views=views,
-                               starts=clock_segment_starts(d))
+                               starts=clock_segment_starts(d), corrections=corrections)
 
 
 def clock_segment_starts(d: Decoded) -> list[SegmentStart]:
@@ -467,7 +479,7 @@ def clock_segments(d: Decoded) -> np.ndarray:
 def resolve_time_arrays(
     time_ms: np.ndarray, time_flags: np.ndarray, segment: np.ndarray | None, skew_s: float | None = None,
     offload_unix_ms: int | None = None, *, views: list[OffloadView] | None = None,
-    starts: list[SegmentStart] | None = None,
+    starts: list[SegmentStart] | None = None, corrections: list[TimeCorrection] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """resolve_times() on plain arrays: logger-clock times, TFLAG_* bits, and either the clock-segment numbers
     or the segment starts. One offload (`skew_s`, `offload_unix_ms`) or several (`views`)."""
@@ -501,6 +513,9 @@ def resolve_time_arrays(
             continue
         idx = np.flatnonzero(fix)
         j0 = int(idx[0])
+        # the last sample kept before this run, reset-flagged or not (an earlier run may have been corrected)
+        before = np.flatnonzero(keep[:j0])
+        last_kept = int(before[-1]) if before.size else None
         cands = [k for k, c in enumerate(current) if c == s_idx]
         applied = inconsistent = False
         for k in reversed(cands):  # the latest offload on this clock first, then fall back
@@ -509,7 +524,7 @@ def resolve_time_arrays(
                 continue
             shift = int(round(1000 * v.skew_s))
             shifted = t[fix] - shift
-            prev_ok = j0 == 0 or reset[j0 - 1] or shifted[0] > t[j0 - 1]
+            prev_ok = last_kept is None or shifted[0] > t[last_kept]
             # the last of these samples that offload saw must land before the offload (plus 5 s of slack)
             seen = idx[idx < v.samples_seen]
             seen_ok = not seen.size or int(t[seen[-1]]) - shift <= v.unix_ms + 5000
@@ -517,6 +532,8 @@ def resolve_time_arrays(
             if seen_ok and prev_ok and shifted[0] >= RESET_CLOCK_BEFORE_MS:
                 t[fix] = shifted
                 tf[fix] |= TFLAG_SKEW_CORRECTED
+                if corrections is not None:
+                    corrections.append(TimeCorrection(j0, int(idx[-1]) + 1, k, float(v.skew_s)))
                 notes.append(f"{int(fix.sum())} samples after a clock reset were re-timed by subtracting the "
                              f"offload clock skew ({v.skew_s:+.3f} s"
                              + (f", offload {k + 1} of {len(views)})" if several else ")"))

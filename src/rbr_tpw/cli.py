@@ -32,10 +32,10 @@ from serial.tools import list_ports
 from . import __version__
 from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure, validate
 from .console import DEVICE, Console, setup_logging
-from .drivers import DecodeUnavailable, DeploymentMismatch, Downloaded, Driver, Held, driver_for
+from .drivers import DecodeUnavailable, DeploymentMismatch, Downloaded, Driver, Held, as_full, driver_for
 from .hostclock import ntp_offset, timing_critical
 from .link import Link, LinkError
-from .ncwrite import skew_vs_utc
+from .ncwrite import skew_jump
 from .power import remaining
 from .rawbin import event_name, scan_events
 from .solo import RUSKIN_LOW_VOLTAGE_V, identify, measure_clock_skew, sha256
@@ -119,15 +119,15 @@ def _refresh_status():
     """The terminal's status line: one logger's stage in full, or the summary when several are in progress."""
     if not _status_enabled():
         return
-    with _stages_lock:
-        stages = sorted(_stages.values())
-    if not stages:
-        _status_console.status(None)
-    elif len(stages) == 1:
-        dev, _, detail = stages[0]
-        _status_console.status(f"[{dev}] {detail}")
-    else:
-        _status_console.status("in progress: " + "; ".join(f"{dev} {what}" for dev, what, _ in stages))
+    with _stages_lock:  # drawn under the lock, so two workers cannot draw their snapshots out of order
+        stages = sorted(_stages.values())  # (Console never takes _stages_lock: no lock-order cycle)
+        if not stages:
+            _status_console.status(None)
+        elif len(stages) == 1:
+            dev, _, detail = stages[0]
+            _status_console.status(f"[{dev}] {detail}")
+        else:
+            _status_console.status("in progress: " + "; ".join(f"{dev} {what}" for dev, what, _ in stages))
 
 
 def _port_name(port: str) -> str:
@@ -284,19 +284,16 @@ def _write_bytes(path: Path, data: bytes):
     os.replace(tmp, path)
 
 
-def _store_dataset(path: Path, blob: bytes, offset: int, header_changed: list[int]):
-    """Save a dataset: whole (atomically) for a new file or a full read, else by appending the bytes past
-    `offset` to the deployment's file, and refreshing its header bytes when the logger's changed."""
+def _store_dataset(path: Path, blob: bytes, offset: int):
+    """Save a dataset: whole (atomically) for a new file, else by appending the bytes past `offset` to the
+    deployment's file. A deployment's file is never rewritten in place, so every earlier record's checksum
+    still describes a prefix of it."""
     if offset == 0 or not path.exists() or path.stat().st_size != offset:
         _write_bytes(path, blob)
         return
     with open(path, "r+b") as f:
         f.seek(offset)
         f.write(blob[offset:])
-        if header_changed:
-            n = max(header_changed) + 1
-            f.seek(0)
-            f.write(blob[:n])
         f.flush()
         os.fsync(f.fileno())
 
@@ -334,7 +331,8 @@ def _find_deployment(rawdir: Path, sn: str) -> Deployment | None:
         by_stem.setdefault(str(dep["stem"]), []).append((key, rec))
     if not by_stem:
         return None
-    stem, entries = max(by_stem.items(), key=lambda kv: max(e[0] for e in kv[1]))
+    # the deployment offloaded most recently (offload_index counts within a deployment, not across them)
+    stem, entries = max(by_stem.items(), key=lambda kv: (max(e[0][1] for e in kv[1]), kv[0]))
     entries.sort(key=lambda e: e[0])
     records = [rec for _, rec in entries]
     latest = records[-1]
@@ -368,6 +366,15 @@ def _find_deployment(rawdir: Path, sn: str) -> Deployment | None:
     return Deployment(stem, records, data)
 
 
+def _header_seen(held: Deployment) -> bytes | None:
+    """The header the logger reported at the deployment's latest offload, if it differed from the saved image's."""
+    hx = (held.latest.get("deployment") or {}).get("header_hex")
+    try:
+        return bytes.fromhex(hx) if hx else None
+    except ValueError:
+        return None
+
+
 def _changes_since(ident: dict, snap: dict, skew: dict, ntp: dict, previous: dict) -> list[str]:
     """What differs from the deployment's previous offload record: settings, status, and a clock skew that
     jumped more than drift allows (the clock was set or reset in between)."""
@@ -397,18 +404,13 @@ def _changes_since(ident: dict, snap: dict, skew: dict, ntp: dict, previous: dic
     pstatus = (previous.get("after") or {}).get("status") or psnap.get("status")
     if str(pstatus) != str(snap.get("status")):
         out.append(f"status {pstatus} -> {snap.get('status')}")
-    prev_skew = skew_vs_utc(previous)
-    now_skew = skew_vs_utc({"clock_skew": skew, "host_ntp": ntp})
-    if prev_skew is not None and now_skew is not None and math.isfinite(prev_skew) and math.isfinite(now_skew):
-        try:
-            elapsed = (utcnow() - dt.datetime.fromisoformat(previous["offload_started"].replace("Z", "+00:00"))
-                       ).total_seconds()
-        except (KeyError, ValueError):
-            elapsed = 0.0
-        tol = 2.0 + 50e-6 * max(elapsed, 0.0)
-        if abs(now_skew - prev_skew) > tol:
-            out.append(f"clock skew {prev_skew:+.3f} s -> {now_skew:+.3f} s ({elapsed / 86400:.1f} days apart, "
-                       f"beyond {tol:.1f} s): the clock was set or reset in between")
+    try:
+        jump = skew_jump(previous, {"clock_skew": skew, "host_ntp": ntp, "offload_started": iso(utcnow())})
+    except (KeyError, ValueError):
+        jump = None
+    if jump is not None and abs(jump[0]) > jump[1]:
+        out.append(f"clock skew changed by {jump[0]:+.3f} s in {jump[2]:.1f} days (beyond {jump[1]:.1f} s): the "
+                   "clock was set or reset in between")
     return out
 
 
@@ -629,9 +631,6 @@ def offload(port: str, s: Settings) -> Path | None:
         part_dir = rawdir / ".partial"
         held = _find_deployment(rawdir, sn) if total > 0 else None
         warnings = []
-        if held is not None:
-            for change in _changes_since(ident, snap, skew, ntp, held.latest):
-                warnings.append(f"since the previous offload of deployment {held.stem}: {change}")
         dl: Downloaded | None = None
         if total > 0:
             if s.stop.is_set():
@@ -640,19 +639,20 @@ def offload(port: str, s: Settings) -> Path | None:
             prog = _progress_logger(s, port)
             if held is not None:
                 try:
-                    dl = driver.download(link, snap, part_dir, sn, prog, held=Held(held.stem, held.data),
-                                         full=s.full_download)
+                    dl = driver.download(link, snap, part_dir, sn, prog,
+                                         held=Held(held.stem, held.data, _header_seen(held)), full=s.full_download)
                 except DeploymentMismatch as err:
                     log.warning("SN%s: the logger does not hold deployment %s (%s): starting a new deployment; "
                                 "the old files are left as they are", sn, held.stem, err)
                     warnings.append(f"not deployment {held.stem}: {err}; new deployment")
                     held = None
                     if err.downloaded is not None:  # a full read was made: no need to repeat it
-                        dl = err.downloaded
-                        dl.kind, dl.tail_check, dl.header_changed = "full", None, []
-                        dl.segments = {k: (0, len(v)) for k, v in dl.data.items()}
+                        dl = as_full(err.downloaded)
             if dl is None:
                 dl = driver.download(link, snap, part_dir, sn, prog, full=s.full_download)
+        if held is not None:  # only now is it known to be the same deployment
+            for change in _changes_since(ident, snap, skew, ntp, held.latest):
+                warnings.append(f"since the previous offload of deployment {held.stem}: {change}")
         after = driver.after(link)
         log.debug("after download: %s", after)
 
@@ -664,7 +664,7 @@ def offload(port: str, s: Settings) -> Path | None:
                 continue
             fname = f"{stem}.bin" if list(data) == ["dataset1"] else f"{stem}_{name.replace('/', '_')}.bin"
             off, nbytes = dl.segments.get(name, (0, len(blob)))
-            _store_dataset(rawdir / fname, blob, off, dl.header_changed if name == driver.identity_dataset else [])
+            _store_dataset(rawdir / fname, blob, off)
             datasets[name] = {"file": f"raw/{fname}", "bytes": len(blob), "sha256": sha256(blob), "offset": off,
                               "segment_bytes": nbytes}
         deployment = None
@@ -678,11 +678,14 @@ def offload(port: str, s: Settings) -> Path | None:
                 "offload_index": held.next_index if held is not None else 0,
                 "segment": {"offset": off, "bytes": nbytes, "sha256": sha256(data[primary][off:off + nbytes])},
                 "image_bytes": len(data[primary]), "image_sha256": datasets[primary]["sha256"],
-                "download": dl.kind,
+                "bytes_read": dl.bytes_read, "download": dl.kind,
             }
+            if dl.header_now is not None:  # the logger's header differs from the saved image's: keep it here
+                deployment["header_hex"] = dl.header_now.hex()
             if dl.header_changed:
                 warnings.append(f"the memory header changed since the previous offload at byte(s) "
-                                f"{', '.join(map(str, dl.header_changed))}; refreshed in the saved image")
+                                f"{', '.join(map(str, dl.header_changed))}; the saved image keeps the header as "
+                                "first downloaded, and this record holds the logger's (deployment.header_hex)")
             if dl.kind == "incremental" and driver.family == "L2" and nbytes:
                 new_events = scan_events(data[primary], off)
                 if new_events:
@@ -734,8 +737,8 @@ def offload(port: str, s: Settings) -> Path | None:
                 log.info("incremental: %d new bytes from offset %d (deployment %s, offload %d)", dl.new_bytes,
                          deployment["segment"]["offset"], stem, deployment["offload_index"])
             elif dl.kind == "full-verified":
-                log.info("full download, verified against deployment %s: %d new bytes (offload %d)", stem,
-                         dl.new_bytes, deployment["offload_index"])
+                log.info("full download, verified against deployment %s: %d new bytes (%d bytes read, offload %d)",
+                         stem, dl.new_bytes, dl.bytes_read, deployment["offload_index"])
             else:
                 log.info("new deployment %s: %d bytes", stem, deployment["image_bytes"])
         mem, pwr = after["meminfo"], after["power"]
@@ -957,7 +960,7 @@ def _rebuild(rec_path: Path, outdir: Path, done: set[str] | None = None):
         by_index[(int(dep.get("offload_index", 0) or 0), str(record.get("offload_started", "")))] = record
         records = [by_index[k] for k in sorted(by_index)]
         if records[-1] is not record:
-            data = _raw_files(rec_path, records[-1])
+            data = _raw_files(rec_path, records[-1], prefix_ok=True)  # a crash may have left bytes past it
         log.info("deployment %s: %d offload record(s)", stem, len(records))
     nc_path = outdir / f"{stem}.nc"
     try:

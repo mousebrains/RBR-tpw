@@ -34,6 +34,7 @@ from .rawbin import (
     TFLAG_SKEW_CORRECTED,
     Decoded,
     OffloadView,
+    TimeCorrection,
     decode,
     event_name,
     reset_segment_starts,
@@ -63,9 +64,10 @@ SOLO_BATTERY_COMMENT = ("From `powerstatus` after the download. battery_voltage_
                         "2.26.1 behaviour, not from RBR documentation.")
 
 TIME_COMMENT = ("Logger clock, except samples flagged time_corrected_by_offload_skew in time_flag (taken after a "
-                "clock reset), which are logger clock minus the clock skew measured at offload (clock_skew_s, or "
-                "clock_skew_vs_host_s when the host clock was not referenced to UTC). Not otherwise corrected for "
-                "clock skew.")
+                "clock reset), which are logger clock minus the clock skew measured at an offload of this "
+                "deployment made while that clock ran: time_correction_offload names the offload for each re-timed "
+                "run (an index along offload_time; its skew is clock_skew there, or clock_skew_vs_host when the "
+                "host clock was not referenced to UTC). Not otherwise corrected for clock skew.")
 
 
 def _iso(ms: int) -> str:
@@ -110,21 +112,39 @@ SKEW_JUMP_S = 2.0  # a skew change between offloads beyond this plus the drift a
 SKEW_DRIFT_PPM = 50.0
 
 
+def skew_jump(previous: dict, record: dict) -> tuple[float, float, float] | None:
+    """(skew change s, tolerance s, days apart) between two offload records' clock skews, or None when they
+    cannot be compared: a skew not measured, or one against UTC and the other against the host clock (their
+    difference would be the host clock's offset, not the logger's). The tolerance is SKEW_JUMP_S plus
+    SKEW_DRIFT_PPM of the time between them plus both measurements' uncertainties."""
+    def skew_of(rec):
+        sk, ntp = rec.get("clock_skew") or {}, rec.get("host_ntp") or {}
+        if not sk.get("n"):
+            return None
+        s = skew_vs_utc(rec)
+        if s is None or not math.isfinite(s):
+            return None
+        unc = _num(sk.get("uncertainty_s"), 0.0) + (_num(ntp.get("uncertainty_s"), 0.0) if ntp.get("offset_s")
+                                                    is not None else 0.0)
+        return s, ntp.get("offset_s") is not None, unc if math.isfinite(unc) else 0.0
+    a, b = skew_of(previous), skew_of(record)
+    if a is None or b is None or a[1] != b[1]:
+        return None
+    dt_s = max(0.0, (_offload_ms(record) - _offload_ms(previous)) / 1000)
+    return b[0] - a[0], SKEW_JUMP_S + SKEW_DRIFT_PPM * 1e-6 * dt_s + a[2] + b[2], dt_s / 86400
+
+
 def offload_views(records: list[dict], seen: list[tuple[int, int]], reset_between) -> list[OffloadView]:
     """One OffloadView per record. `seen[k]` = (sample sets, events) offload k's image held; `reset_between(a, b)`
     says whether a clock-reset event sits among events a..b-1, which explains a skew jump."""
     views: list[OffloadView] = []
-    prev = None
-    for rec, (samples, events) in zip(records, seen, strict=True):
-        unix_ms, skew = _offload_ms(rec), skew_vs_utc(rec)
+    for k, (rec, (samples, events)) in enumerate(zip(records, seen, strict=True)):
         clock_set = False
-        if (prev is not None and skew is not None and prev.skew_s is not None and math.isfinite(skew)
-                and math.isfinite(prev.skew_s)):
-            tol = SKEW_JUMP_S + SKEW_DRIFT_PPM * 1e-6 * max(0, unix_ms - prev.unix_ms) / 1000
-            clock_set = abs(skew - prev.skew_s) > tol and not reset_between(prev.events_seen, events)
-        v = OffloadView(samples, events, unix_ms, skew, clock_set)
-        views.append(v)
-        prev = v
+        if k:
+            jump = skew_jump(records[k - 1], rec)
+            clock_set = (jump is not None and abs(jump[0]) > jump[1]
+                         and not reset_between(views[-1].events_seen, events))
+        views.append(OffloadView(samples, events, _offload_ms(rec), skew_vs_utc(rec), clock_set))
     return views
 
 
@@ -296,7 +316,10 @@ def _offload_series(nc: netCDF4.Dataset, records: list[dict], views: list[Offloa
     var("offload_image_bytes", "i8", held, long_name="bytes of logger memory held after this offload", units="byte")
     var("offload_segment_bytes", "i8", [int((d.get("segment") or {}).get("bytes", h)) for d, h in
                                         zip(dep, held, strict=True)],
-        long_name="bytes read from the logger at this offload", units="byte")
+        long_name="bytes added to the saved memory image at this offload", units="byte")
+    var("offload_bytes_read", "i8", [int(d.get("bytes_read", (d.get("segment") or {}).get("bytes", h)))
+                                     for d, h in zip(dep, held, strict=True)],
+        long_name="bytes read from the logger at this offload (checks and full reads included)", units="byte")
     var("offload_samples", "i8", [v.samples_seen for v in views],
         long_name="sample sets held after this offload", units="1")
     var("battery_voltage", "f8", [_num(p.get("battery_voltage_V")) for p in pwr], units="V",
@@ -327,7 +350,9 @@ def _offload_series(nc: netCDF4.Dataset, records: list[dict], views: list[Offloa
         comment=f"1 when the skew changed by more than {SKEW_JUMP_S:g} s plus {SKEW_DRIFT_PPM:g} ppm of the "
                 "elapsed time since the previous offload, with no clock-reset event in the new data to explain it.")
     var("header_changed", "i4", [len(d.get("header_changed") or []) for d in dep], units="1",
-        long_name="memory header bytes that changed since the previous offload")
+        long_name="memory header bytes that changed since the previous offload",
+        comment="The saved image keeps the header as first downloaded (the logger writes it at enable); the "
+                "record of an offload that saw a different header keeps that header as header_hex.")
     _string_variable(nc, "logger_status", [a.get("status") or s.get("status") or "" for a, s in
                                            zip(after, snap, strict=True)], "logger status after the offload")
     _string_variable(nc, "power_source", [p.get("source") or "" for p in pwr], "power source at offload")
@@ -339,6 +364,26 @@ def _offload_series(nc: netCDF4.Dataset, records: list[dict], views: list[Offloa
 def _port_name(port) -> str:
     """A short port name, as the console shows it: usbmodem101, ttyACM0, COM3."""
     return (str(port or "?")).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].removeprefix("cu.")
+
+
+def _correction_variables(nc: netCDF4.Dataset, corrections: list[TimeCorrection], keep: np.ndarray):
+    """Which offload's skew re-timed each run of reset-clock samples (provenance for time_flag bit 4)."""
+    nc.createDimension("time_correction", len(corrections))
+    specs = [("time_correction_start_index", "i8", "index along time of the first sample of the re-timed run"),
+             ("time_correction_end_index", "i8", "index along time just past the last sample of the re-timed run"),
+             ("time_correction_offload", "i4", "index along offload_time of the offload whose skew was subtracted")]
+    out = {}
+    for name, dtype, long in specs:
+        out[name] = nc.createVariable(name, dtype, ("time_correction",))
+        out[name].setncatts({"long_name": long, "units": "1"})
+    sk = nc.createVariable("time_correction_skew", "f8", ("time_correction",))
+    sk.setncatts({"long_name": "clock skew subtracted from the logger clock for the run (logger minus UTC)",
+                  "units": "s"})
+    if corrections:
+        out["time_correction_start_index"][:] = _kept_index(keep, [c.start for c in corrections])
+        out["time_correction_end_index"][:] = _kept_index(keep, [c.end for c in corrections])
+        out["time_correction_offload"][:] = [c.offload for c in corrections]
+        sk[:] = [c.skew_s for c in corrections]
 
 
 def _kept_index(keep: np.ndarray, sample_index: list[int]) -> list[int]:
@@ -372,7 +417,8 @@ def write_netcdf(image: bytes, record: dict | list[dict], path: Path) -> tuple[D
     d.time_flags[d.time_ms < RESET_CLOCK_BEFORE_MS] |= TFLAG_RESET_CLOCK
     views = offload_views(records, _l2_seen(records, d),
                           lambda a, b: any(e.type in RTC_RESET_EVENTS for e in d.events[a:b]))
-    t_utc, tflags, keep, notes = resolve_times(d, views=views)
+    corrections: list[TimeCorrection] = []
+    t_utc, tflags, keep, notes = resolve_times(d, views=views, corrections=corrections)
     if d.rtc_reset:
         warnings.append("logger real-time clock was reset during this deployment (power loss)")
     warnings.extend(notes)
@@ -457,6 +503,7 @@ def write_netcdf(image: bytes, record: dict | list[dict], path: Path) -> tuple[D
         _event_variables(nc, [e.unix_ms for e in d.events], [e.type for e in d.events],
                          _kept_index(keep, [e.sample_index for e in d.events]))
         _offload_series(nc, records, views)
+        _correction_variables(nc, corrections, keep)
         hdr = d.header
         deployment = {"deployment_enabled_logger_time": _s2000_iso(hdr.logger_time),
                       "deployment_start_time": _s2000_iso(hdr.start_time),
@@ -558,8 +605,10 @@ def write_values_netcdf(time_ms: np.ndarray, time_flags: np.ndarray, segment: np
     if seen is None:
         seen = [(time_ms.size, len(events))] * len(records)
     views = offload_views(records, seen, lambda a, b: any(e[1] in RESTART_EVENTS for e in events[a:b]))
+    corrections: list[TimeCorrection] = []
     t_utc, tflags, keep, notes = resolve_time_arrays(time_ms, time_flags, segment, views=views,
-                                                     starts=reset_segment_starts(time_ms, events))
+                                                     starts=reset_segment_starts(time_ms, events),
+                                                     corrections=corrections)
     rtc_reset = bool((time_flags & TFLAG_RESET_CLOCK).any())
     if rtc_reset:
         warnings.append("logger real-time clock had been reset (power loss): sample times start at 2000-01-01")
@@ -597,6 +646,7 @@ def write_values_netcdf(time_ms: np.ndarray, time_flags: np.ndarray, segment: np
         _event_variables(nc, [e[0] for e in events], [e[1] for e in events],
                          _kept_index(keep, [e[2] for e in events]), payloads=event_payloads)
         _offload_series(nc, records, views)
+        _correction_variables(nc, corrections, keep)
         nc.setncatts(_global_attributes(records, warnings, t_utc[keep], period_ms=period_ms, nchan=len(channels),
                                         rtc_reset=rtc_reset, deployment=deployment))
     return warnings, t_utc[keep]
@@ -634,8 +684,8 @@ def _history(records: list[dict], raw_name: str, now: str) -> str:
         if dep:
             seg = dep.get("segment") or {}
             lines.append(f"{rec['offload_started']} rbr-tpw {ver}: offload {dep.get('offload_index', k)} from {port}, "
-                         f"{dep.get('download', '?')}, {seg.get('bytes', '?')} bytes read, "
-                         f"{dep.get('image_bytes', '?')} held")
+                         f"{dep.get('download', '?')}, {seg.get('bytes', '?')} bytes added, "
+                         f"{dep.get('bytes_read', seg.get('bytes', '?'))} read, {dep.get('image_bytes', '?')} held")
         else:
             lines.append(f"{rec['offload_started']} rbr-tpw {ver}: offloaded from {port}")
     lines.append(f"{now} rbr-tpw {__version__}: NetCDF written from {raw_name}")

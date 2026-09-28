@@ -1,12 +1,13 @@
 # Plan: incremental offload and one growing NetCDF per deployment
 
-**Implemented 2026-09-28 on branch `incremental-offload` (P1-P4, P6; P5 bench validation pending). Departures from
-the text below are listed in NOTES.md, "Incremental offload implemented".**
+**Implemented 2026-09-28 on branch `incremental-offload` (PR #13; P1-P4 and P6; P5 bench validation pending),
+then revised for the PR's review. Where the implementation departs from the text below, the text has been
+corrected and the change is listed in "Departures and review corrections" near the end.**
 
 Draft 2026-09-27, revised through four self-review passes (recorded at the end; each finding names the
 change it caused, and the text above the reviews is the revised version). The fourth pass, 2026-09-28, is
 for Pat's point that the logger may be plugged into Ruskin and stopped, synced, erased or enabled between
-offloads. Not implemented.
+offloads.
 
 ## Goal
 
@@ -20,7 +21,13 @@ offload reads only the bytes the logger has added since the last one, from a sto
 - Every later download of the same deployment is a byte-for-byte extension of the earlier one: 12 of 12
   consecutive pairs of SN100689 images (fwtype 9, 2026-09-25/26). The 512-byte header is identical within a
   deployment in all 12 pairs and differs across every erase (6 of 6), at bytes 12-14 (enable time) and
-  504-511. One logger, one firmware type: duets, concertos, Gen3 and Gen4 are unverified.
+  504-511. One logger, one firmware type. Ruskin's `.rsk` files add more (2026-09-28, grouped by serial and
+  header): repeat downloads of one deployment are byte-for-byte extensions for fwtype 0 (12 of 12 pairs), 9
+  (16/16), the duet (1/1) and the concerto (3/3). The concerto³'s samples extend in 4 of 4 pairs; one of its
+  pairs lost the events dataset only because that Ruskin download (over Wi-Fi) was incomplete: the logger
+  reported 224 bytes of events, up from 112, and 74.6 MB of samples, of which the file kept 21.3 MB. Gen4 is
+  unverified. Header lengths: 512 bytes on both solos (111 of 111 images); sectioned on the duet (715) and
+  concerto (939, 1037), not multiples of 4.
 - `read data 1 <size> <offset>` (L2), `readdata` (Gen3) and `download` (Gen4) all take a byte offset, and
   `Link.read_data` already does. The resume code in `solo.download` already compares the first 512 bytes.
 - Decode plus NetCDF write is seconds; the download is minutes (184 kB/s measured, 132 MB memory).
@@ -44,11 +51,13 @@ D2. **A deployment is identified by serial number and a tail check; the header i
     (up to 68000 bytes ending at the stored offset) is read back from the logger and compared byte for
     byte. That costs one block read (about 0.4 s) and asks the only question that matters: does the logger
     still hold the bytes we have, at the same place. A mismatch, or a short read because the memory is now
-    smaller than our image, means a new deployment; the old files are never touched. The 512-byte header is
-    compared as well, but a header that changed while the data tail matched is the same deployment with
-    changed logger state: the image's header bytes are refreshed from the logger, the change is recorded
-    and warned about, and the offload continues. Mismatch fails safe: at worst a full download and a new
-    file.
+    smaller than our image, means a new deployment; the old files are never touched. The header is compared
+    as well, but a header that changed while the data tail matched is the same deployment with changed logger
+    state: the change is recorded (the logger's header in the record as `header_hex`) and warned about, and
+    the offload continues. The saved image keeps the header as first downloaded, so it only ever grows and
+    every record's checksum stays a checksum of a prefix of it (the logger writes its header at enable, L3
+    reference 5.3.1, so a later change is an anomaly to record, not a state to track). Mismatch fails safe:
+    at worst a full download and a new file.
 D3. **Names stay as they are.** The deployment is named after its first offload, `<SN>_<T0>`, exactly the
     stem an offload gets today. Later offloads of the same deployment rewrite `<SN>_<T0>.nc` and extend
     `raw/<SN>_<T0>.bin`; each offload still writes its own `raw/<SN>_<Tk>.json` record and `.log`
@@ -63,9 +72,11 @@ D5. **One clock skew per clock segment, chosen from all offloads of the deployme
 D6. **Global attributes stay and the series is added.** The attributes keep meaning "state at the latest
     offload", so `rbr-rsk2nc` output and anything reading the attributes is unchanged. The new `offload`
     dimension carries the same quantities per offload.
-D7. **Incremental reads for L2 first.** Gen3 and Gen4 get the growing file from the start but keep a full
-    download each time, and the driver checks that the new image extends the old one. That check is the
-    evidence needed to enable incremental reads there, and it costs nothing (the download happens anyway).
+D7. **Incremental reads for the RBRsolo first** (fwtypes 0 and 9: the 512-byte header). The duet and
+    concerto (sectioned headers of their own length), Gen3 and Gen4 get the growing file from the start but
+    keep a full download each time, and the driver checks that the new image extends the old one. That check
+    is the evidence needed to enable incremental reads there, and it costs nothing (the download happens
+    anyway).
 D8. **Not in this plan:** a per-logger file across deployments, a drift model that interpolates the skew
     along the deployment, adopting old-format records as a deployment's start. Reasons in "Deferred".
 
@@ -109,7 +120,8 @@ old-format and still rebuild as before.
 1. Identify, NTP, clock skew, snapshot: unchanged. `total = meminfo used` at the snapshot.
 2. Read the header: the first `min(512, total)` bytes (the read `solo.download` already makes).
 3. Find the deployment: load `raw/<SN>_*.json`, keep the records with a `deployment` key, group by `stem`,
-   take the stem with the highest `offload_index` (ties: latest `offload_started`). Its latest record
+   take the stem offloaded most recently (the latest `offload_started` among its records; `offload_index`
+   counts within a deployment, so it cannot rank deployments against each other). Its latest record
    gives `R = image_bytes`, `H = image_sha256` and the previous header. No record: new deployment,
    `stem = <SN>_<now>`, `R = 0`, go to step 7.
 4. Check the image on disk, `L = size of raw/<stem>.bin`:
@@ -122,9 +134,12 @@ old-format and still rebuild as before.
    `[max(R - n, 512), R)`, with the file. A short read (`total < R`) or a difference: a different
    deployment (erased and enabled in Ruskin or by `--configure`, or a memory we cannot explain). Log it
    with the first differing offset, new stem, full download. Equal: the offset is confirmed against the
-   data itself. Then compare the header from step 2 with the image's first 512 bytes: differing bytes are
-   refreshed in the image, listed in the record as `header_changed`, and warned about. With `R <= 512`
-   there is no data part, and a differing header is a new deployment.
+   data itself. Then compare the header from step 2 with the header the logger reported at the previous
+   offload (its record's `header_hex`, else the image's): differing bytes are listed in the record as
+   `header_changed` and warned about, and the logger's header is kept as `header_hex` whenever it differs from
+   the image's. The image itself is not changed. With `R <= 512` there is no data part, and a differing
+   header is a new deployment. The comparison for settings, status and skew (Ruskin section) is made only
+   now, once the logger is known to hold this deployment.
 6. `total == R`: nothing new. Skip the download; the record, the series point and the NetCDF are still
    written (step 9 onwards).
 7. Download bytes `R..total` into `.partial/<SN>.<T0>.<R>.part`, resuming if it exists (a `.part` with any
@@ -258,10 +273,11 @@ Global attributes are computed from the latest record as today (D6). `time_cover
 ## Rebuild
 
 `--rebuild RECORD.json`: a record with a `deployment` key rebuilds `<stem>.nc` from the deployment's raw
-files and all records of that stem on disk, in `offload_index` order. The latest record's hashes are
-verified against the files (for Gen3 the event and header datasets are rewritten each offload, so earlier
-records' hashes no longer describe the files); earlier records contribute their skew, their health values
-and their `image_bytes`, which must be non-decreasing along the sequence. Several records of one stem on
+files and all records of that stem on disk, in `offload_index` order. The given record's own files and the
+latest record's are verified, each as a prefix of the file (bytes a crash left past the latest record are
+ignored; the next offload truncates them); earlier records contribute their skew, their health values and
+their `image_bytes`. A Gen3 header dataset that differed would have been a new deployment, so its hashes too
+describe the files. Several records of one stem on
 the command line rebuild it once. Old-format records rebuild `<record stem>.nc` from their own `.bin` as
 now.
 
@@ -367,8 +383,9 @@ and that download is repeated.
     skew; the run keeps offload 1's skew; samples logged between offload 1 and the stop are dropped with
     the note; `clock_set_detected` is 1 on the second point.
 14. Stop, sync, `memclear`, `enable`: new stem, old files byte-identical.
-15. Header changed with the data tail intact (a fake that rewrites a header word): same stem, header
-    refreshed in the image, `header_changed` in the record, warning in `history`.
+15. Header changed with the data tail intact (a fake that rewrites a header word): same stem, the image
+    unchanged, `header_changed` and `header_hex` in the record, warning in `history`; the next offload does
+    not report it again.
 16. Settings changed between offloads (end time): warning naming the setting; the deployment continues.
 17. Progress meter, `Console` with a stream whose `isatty()` is true: the status line is drawn with `\r`, a
     `write()` while it is up clears it and redraws it after the line, `ask()` clears it before the prompt,
@@ -451,9 +468,11 @@ Effort, a guess: P1 1 d, P2 1.5 d, P3 0.5 d, P4 0.5 d, P5 0.5 d bench plus waiti
   offloads, a segment may continue after the offload that corrects it, so its last sample legitimately
   lands after that offload. Change: the check uses the last sample the offload saw.
 - F2.3 Two adjacent corrected segments can overlap, which today would make the final monotonic check refuse
-  the whole file, and for a growing file that would block a deployment's NetCDF for good. Change: a
-  two-sided per-segment check that drops the offending segment with a note; the final check stays as the
-  guard.
+  the whole file, and for a growing file that would block a deployment's NetCDF for good. Change: each run
+  is compared with the last sample kept before it, whatever its flag, and a run that would land before it
+  (overlap) is dropped with a note; the final check stays as the guard. (As first implemented, the check
+  was skipped when the preceding sample was itself reset-flagged, which let two corrected runs overlap:
+  PR #13 review, finding 2.)
 - F2.4 Which candidate when several offloads sit in one clock segment: the latest, for the reasons now
   written under "Why the latest candidate". A hypothesis, stated as one: drift of the order of a second a
   day is common for logger RTCs, so the choice matters at the seconds level over weeks, and the series is
@@ -517,3 +536,45 @@ Effort, a guess: P1 1 d, P2 1.5 d, P3 0.5 d, P4 0.5 d, P5 0.5 d bench plus waiti
 - F5.5 Windows: `\r` and clear-to-end-of-line need ANSI processing, which `_enable_windows_ansi` already
   turns on for `color`; `status_enabled` follows `color`. Unverified on a real Windows console, as the
   colour path is.
+
+## Departures and review corrections
+
+Where the implementation differs from the first draft of this plan (the text above has been corrected):
+
+- A later 0x01 time-sync marker is **not** a clock-run boundary. A sync needs a stop, and no samples follow a
+  stop without an erase, so the rule could only split a reset run a logger had marked on its own and drop
+  the earlier part. The skew-jump boundary between offloads covers the sync.
+- The series dimension is `offload_time`, a coordinate variable, with `offload_segment_bytes` (bytes added)
+  and `offload_bytes_read` (bytes read, checks and full reads included).
+- Partial files: `<SN>.new.0.part` for a new deployment, `<SN>.<stem>.<offset>.part` for a segment.
+- `event_payload` is uint64 (Gen4 events carry an 8-byte word); `energy_used_marker` decodes 0x27/0x28
+  payloads that fit in 32 bits.
+- The new-event warning is L2 only.
+
+Review of the implementation (PR #13, adversarial review of 7be286e, 2026-09-28). Every finding was checked
+(reproduced by a test, or confirmed in the code and data) before it was fixed; `tests/test_review6.py` holds
+the reviewer's reproductions and the tests below.
+
+1. The deployment was chosen by the highest `offload_index` across stems, so after a re-deploy the old
+   deployment won every time and incremental reads stopped for good. Now the most recently offloaded stem
+   (step 3). Tested through Ruskin's own stop, sync, erase, enable sequence (plan test 14 as written).
+2. Two reset runs corrected by different offloads could overlap and block the NetCDF for good. Now each
+   run is compared with the last kept sample (F2.3). Single-offload behaviour is unchanged: 19,653 random
+   inputs against `main`, identical arrays in all 15,289 that return, through both call paths.
+3. Refreshing the header in the saved image broke earlier records' checksums (their rebuilds failed, and a
+   crash could orphan the image). Now the image only grows and the logger's header goes in the record (D2,
+   step 5). `--rebuild` also tolerates bytes a crash left past the latest record.
+4. Incremental reads were on for the duet and concerto with the solo's 512-byte header assumed; their
+   headers are 715 to 1037 bytes and not word-aligned. Now only the solo reads incrementally; the duet and
+   concerto read in full and verify growth, with the identity header at its real length (D7). Plan test 11
+   added (a duet, and `set_end_byte` through `decode_l2`). The growth evidence for them and fwtype 0 is now
+   in "Evidence", from the `.rsk` files.
+5. The `time` comment named only the latest offload's skew. Now a `time_correction` table records, per
+   re-timed run, its sample range, the offload whose skew was applied, and that skew; the comment points to
+   it.
+6. Also fixed: settings and status changes are compared only once the logger is known to hold the
+   deployment (they leaked into a new one's warnings); a full download reports the growth as new bytes, and
+   the bytes read separately; skew jumps are compared only between skews on the same reference (both against
+   UTC, or both against the host clock), with both uncertainties in the tolerance; the status line is drawn
+   under the stage lock; Gen4's earlier offloads count their own samples and events. Plan test 6's two
+   missing cases are added.

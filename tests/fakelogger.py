@@ -306,13 +306,25 @@ class FakeSoloWritable(FakeSolo):
 
     E2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
 
-    def __init__(self, port: str, **kw):
+    def __init__(self, port: str, memory_follows: bool = False, **kw):
+        """`memory_follows`: the memory changes as the logger's does, for tests of what an offload finds after
+        Ruskin's (or --configure's) writes: `stop` appends a 0x02 event, `memclear` empties it, `enable` writes a
+        fresh header and time-sync marker. Off, only `used` changes (0 after memclear, 512 after enable)."""
         super().__init__(port, **kw)
+        self.memory_follows = memory_follows
         self.state = {"status": "logging", "starttime": "20000101000010", "endtime": "20991231235959",
                       "sampling": "mode = continuous, period = 500", "remaining": "1ACDF88", "used": len(self.image)}
         self.locked = True
         self.challenge: dt.datetime | None = None  # the last `now` reply, whole seconds
         self.offset_s = 0.0  # written by `now = X`: logger clock minus host clock
+
+    def _s2000(self) -> int:
+        return int((self.now() - self.E2000).total_seconds())
+
+    def set_image(self, image: bytes):
+        super().set_image(image)
+        if hasattr(self, "state"):
+            self.state["used"] = len(image)
 
     def now(self) -> dt.datetime:
         return super().now() + dt.timedelta(seconds=self.offset_s)
@@ -362,6 +374,8 @@ class FakeSoloWritable(FakeSolo):
             if st["status"] not in ("logging", "pending"):
                 return self._reply(f"E0406 stop = {st['status']}")
             st["status"] = "stopped"
+            if self.memory_follows:
+                self.append_event(0x02, self._s2000())
             return self._reply("stop = stopped")
         if cmd.startswith("now = "):
             t = dt.datetime.strptime(cmd[6:], "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC)
@@ -381,6 +395,8 @@ class FakeSoloWritable(FakeSolo):
             return self._reply("permit = memclear")
         if cmd == "memclear":
             st["used"] = 0
+            if self.memory_follows:
+                self.set_image(b"")
             with self._lock:
                 self._out += b"Ready: "  # no reply line, only the prompt
             return
@@ -388,6 +404,8 @@ class FakeSoloWritable(FakeSolo):
             if st["used"]:
                 return self._reply("E0402 memory not empty, erase first")
             st["used"] = 512
+            if self.memory_follows:
+                self.set_image(solo_image(0, self._s2000(), self.serial))
             st["status"] = "logging" if st["starttime"] <= f"{self.now():%Y%m%d%H%M%S}" else "pending"
             return self._reply("E0401 , enable = logging" if st["status"] == "logging" else "enable = pending")
         return self._reply("E0102 invalid command")
@@ -409,6 +427,12 @@ class FakeDuet(FakePort):
         self.image = l2_sectioned_image(n_samples, [("temp12", 0, self.TEMP), ("pres21", 0, self.PRES),
                                                     ("temp05", 9, self.COMP)], serial)
         self.datasets = {1: self.image}
+
+    def grow(self, n_samples: int):
+        """The duet keeps logging: `n_samples` more sets of 3 signed readings (R in (0.40, 0.46))."""
+        readings = (np.linspace(0.40, 0.45, n_samples)[:, None] + 0.01 * np.arange(3)) * (1 << 30)
+        self.image = self.image + readings.astype("<i4").tobytes()
+        self.datasets[1] = self.image
 
     def replies(self):
         r = self._replies()
