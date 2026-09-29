@@ -197,31 +197,37 @@ def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clo
     }
 
 
-def download(link: Link, total: int, part_path: Path, progress=None, dataset: int = 1, l3: bool = False) -> bytes:
-    """Read `total` bytes of `dataset` (Gen3 `readdata` if l3), appending to `part_path` so an
-    interrupted download of the same deployment resumes where it stopped.
+def download(link: Link, total: int, part_path: Path, progress=None, dataset: int = 1, l3: bool = False,
+             start: int = 0) -> bytes:
+    """Read bytes `start`..`total` of `dataset` (Gen3 `readdata` if l3), appending to `part_path` so an
+    interrupted download of the same deployment resumes where it stopped. Returns the bytes from `start`.
 
-    A partial file is reused only if its header bytes match the logger's
-    current header (same deployment).
+    From 0, a partial file is reused only if its header bytes match the logger's current header (same
+    deployment). From `start` > 0 the caller has established the deployment (drivers.L2Driver.download's tail
+    check), and the partial file holds the segment's bytes only.
     """
-    head_len = min(512, total)
-    head = link.read_data(dataset, head_len, 0, l3=l3)
-    if len(head) != head_len:  # it is written at offset 0 and the next block read from head_len
-        raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
-    if part_path.exists():
-        with open(part_path, "rb") as f:
-            old_head = f.read(head_len)
-        if old_head != head:
-            link.note(f"partial file {part_path.name} is from a different deployment; restarting")
-            part_path.unlink()
-        else:
-            link.note(f"resuming from {part_path.stat().st_size} bytes in {part_path.name}")
+    head_len = min(512, total) if start == 0 else 0
+    if start == 0:
+        head = link.read_data(dataset, head_len, 0, l3=l3)
+        if len(head) != head_len:  # it is written at offset 0 and the next block read from head_len
+            raise LinkError(f"short header read: {len(head)} of {head_len} bytes")
+        if part_path.exists():
+            with open(part_path, "rb") as f:
+                old_head = f.read(head_len)
+            if old_head != head:
+                link.note(f"partial file {part_path.name} is from a different deployment; restarting")
+                part_path.unlink()
+            else:
+                link.note(f"resuming from {part_path.stat().st_size} bytes in {part_path.name}")
+    elif part_path.exists():
+        link.note(f"resuming from {start + part_path.stat().st_size} bytes in {part_path.name}")
     part_path.parent.mkdir(parents=True, exist_ok=True)
     with open(part_path, "ab") as f:
-        offset = f.tell()
+        offset = start + f.tell()
         if offset > total:  # logger memory shrank?  (should not happen without an erase)
-            raise RuntimeError(f"partial file ({offset} B) is longer than logger memory ({total} B)")
-        if offset == 0:
+            raise RuntimeError(f"partial file ({offset - start} B from {start}) is longer than logger memory "
+                               f"({total} B)")
+        if start == 0 and offset == 0:
             f.write(head)
             offset = head_len
         t0, b0 = time.monotonic(), offset
@@ -236,11 +242,11 @@ def download(link: Link, total: int, part_path: Path, progress=None, dataset: in
             os.fsync(f.fileno())
             offset += n
             if progress:
-                progress(offset, total, (offset - b0) / max(time.monotonic() - t0, 1e-6))
-    image = part_path.read_bytes()
-    if len(image) != total:
-        raise RuntimeError(f"downloaded {len(image)} bytes, expected {total}")
-    return image
+                progress(offset - start, total - start, (offset - b0) / max(time.monotonic() - t0, 1e-6))
+    data = part_path.read_bytes()
+    if len(data) != total - start:
+        raise RuntimeError(f"downloaded {len(data)} bytes, expected {total - start}")
+    return data
 
 
 def sha256(data: bytes) -> str:

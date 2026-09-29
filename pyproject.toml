@@ -1,6 +1,6 @@
 [project]
 name = "rbr-tpw"
-version = "0.1.0"
+version = "0.2.0"
 description = "Command-line offload and setup of RBR loggers: CRC-checked download to CF NetCDF, clock skew, memory and battery state, configure and enable; Ruskin .rsk to NetCDF conversion"
 readme = "README.md"
 authors = [

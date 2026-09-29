@@ -5,9 +5,10 @@ Command-line offload and setup of RBR oceanographic loggers, without the Ruskin 
 Plug in a logger and `rbr-offload`:
 
 1. measures the logger's clock skew against UTC to a few milliseconds,
-2. downloads its memory, CRC-checked and resumable,
-3. writes a CF-1.13 NetCDF file, with the serial number, clock skew, and memory and battery state as global
-   attributes,
+2. downloads its memory, CRC-checked and resumable; on a later offload of the same deployment, only the
+   bytes logged since the last one,
+3. writes one CF-1.13 NetCDF file per deployment, regenerated at each offload: the serial number, clock
+   skew, and memory and battery state as global attributes, and the same per offload as a time series,
 4. optionally sets the clock, resets the battery counter, erases memory, and re-enables logging with a new
    schedule,
 5. tells you to unplug it, then waits for the next logger.
@@ -70,8 +71,10 @@ rbr-offload /path/to/data --once     # the logger(s) connected now (or the first
 ```
 
 Each logger gets its own worker, so four loggers on a hub download at the same time. Console lines are
-tagged with the logger, e.g. `[SN100689@usbmodem101]`. Progress is shown every 10%, and "done with …:
-disconnect the logger" tells you when a logger can be unplugged. Two steps depend on the computer's clock to
+tagged with the logger, e.g. `[SN100689@usbmodem101]`. On a terminal a status line at the bottom shows what
+the logger's worker is doing, with a bar, rate and time left during the download (with several loggers, a
+one-line summary); off a terminal, progress is logged every 10%, and the session log always has those lines.
+"done with …: disconnect the logger" tells you when a logger can be unplugged. Two steps depend on the computer's clock to
 the millisecond: the clock-skew measurement and `--configure`'s clock set. They run one logger at a time,
 which staggers the start of each download by about 4 s. Questions (`--configure`'s "configure SN…?" and
 alarm acknowledgements) are asked one at a time, naming the logger. Other output waits until you answer.
@@ -92,23 +95,65 @@ So that a script can tell, `rbr-offload` exits with status bits set:
 
 A run where both happen exits with 3.
 
+### One file per deployment
+
+A deployment is one enable of the logger: everything it logs until its memory is erased. The first offload
+of a deployment downloads the whole memory and names the deployment's files after itself, `SN_<UTC>`. Each
+later offload of the same deployment reads only the bytes logged since, appends them to the saved memory
+image, and regenerates the deployment's NetCDF from the whole image, so the file grows forwards and every
+offload's clock skew is used to time the samples it saw. Nothing is appended to the NetCDF itself; it is
+rewritten (temp file and rename) every time.
+
+Before reading incrementally the tool checks that the logger still holds the deployment on disk: it reads
+back the first and the last block of the saved image (up to 68000 bytes each) and compares them byte for
+byte, and it compares the memory header. A memory that differs, or is shorter, is a different deployment
+(erased and enabled again, in Ruskin or by `--configure`): a new deployment starts with a full download and
+the old files are left alone. A header that changed while the data matched (a status word, say) triggers a
+full read that verifies every byte held; if it matches, the change is reported and the logger's header is
+kept in the record. The saved image keeps the header as first downloaded, so it only ever grows and every
+record's checksum describes a prefix of it. `--full-download` reads the whole memory
+anyway and verifies that it extends the saved image, which is the way to check the incremental path on a
+bench. RBRsolos (fwtypes 0 and 9) read incrementally. Duets, concertos, concerto³s and Gen4 loggers are read
+in full each time and checked the same way, until the incremental path has been seen to work on one.
+
+Plugging the logger into Ruskin between offloads is safe: a stop appends an event and is reported; a clock
+sync is only possible while stopped, is detected as a jump in the skew, and never applies to samples
+logged before it; an erase and enable starts a new deployment. Any setting or status that changed since the
+previous offload is a warning in the record and the NetCDF. The tool never writes to the logger during an
+offload.
+
+The NetCDF's global attributes describe the latest offload. Along the `offload_time` dimension the same
+quantities are kept for every offload of the deployment: bytes held, added and read, sample sets, battery
+voltage and energy counter, memory used and remaining, clock skew and its uncertainty, NTP offset,
+remaining sampling time, status, power source, port and tool version, plus `clock_set_detected` and
+`header_changed`. `history` has one line per offload. Samples re-timed after a clock reset are listed in the
+`time_correction` table: each run's sample range, the offload whose skew was applied, and that skew. On a concerto³ the logger's own energy-used markers
+(event 0x27, written at enable and about every 34 h) are decoded into `energy_used_marker` (J) from the
+`event_payload`.
+
+Records written by rbr-tpw 0.1 have no deployment information; the first offload with 0.2 starts a new
+deployment with a full download, once per logger.
+
 For each logger this writes:
 
 | File | Contents |
 |---|---|
-| `SN_YYYYMMDDTHHMMSSZ.nc` | CF-1.13 NetCDF: `time`, one variable per channel (e.g. `temperature`, degree_Celsius), the raw readings, quality flags, the logger's own timestamps (`logger_time`), and the event list |
-| `raw/SN_….bin` | the logger memory exactly as downloaded |
-| `raw/SN_….json` | logger settings, calibration, clock skew, NTP offset, memory and battery state |
-| `raw/SN_….log` | serial transcript: every command, reply, discarded byte, timeout and retry, with UTC ms timestamps. It is written as it happens, so it survives a failure, and it is named by port (`raw/<UTC>_usbmodem….log`) until the logger reports its serial number. |
-| `raw/SN_…_configure.json` | with `--configure`: each step and the values read back |
+| `SN_<T0>.nc` | the deployment's CF-1.13 NetCDF, `T0` its first offload: `time`, one variable per channel (e.g. `temperature`, degree_Celsius), the raw readings, quality flags, the logger's own timestamps (`logger_time`), the event list, and the per-offload series along `offload_time` |
+| `raw/SN_<T0>.bin` | the logger memory exactly as downloaded, extended by each offload (a concerto³: `_dataset0`, `_dataset1`, `_dataset2`) |
+| `raw/SN_<Tk>.json` | one record per offload `k`: logger settings, calibration, clock skew, NTP offset, memory and battery state, and under `deployment` the stem, the bytes added (`segment`) and read, the image size and checksum, the identity check (`tail_check`: the first and last blocks compared) and any header change |
+| `raw/SN_<Tk>.log` | serial transcript of offload `k`: every command, reply, discarded byte, timeout and retry, with UTC ms timestamps. It is written as it happens, so it survives a failure, and it is named by port (`raw/<UTC>_usbmodem….log`) until the logger reports its serial number. |
+| `raw/SN_<Tk>_configure.json` | with `--configure`: each step and the values read back |
+| `raw/.partial/SN.<T0>.<offset>.part` | a segment being downloaded (`SN.new.0.part` for a new deployment); it resumes on reconnect and is removed once the record is written |
 
 Each run also writes `raw/rbr-offload_<UTC>.log`, the session log. It has every step of every logger, the
 serial traffic, prompts and answers, and full error tracebacks, with UTC ms timestamps and the thread and
 logger on each line. The console shows only the summary lines.
 
 `rbr-offload DIR --rebuild DIR/raw/*.json` regenerates the NetCDF files from the raw files without the
-logger, e.g. after a decoder fix. Configure reports (`*_configure.json`) are skipped. A record that can't be
-converted is reported and the others are still done; the exit status is then 1.
+logger, e.g. after a decoder fix. A record that belongs to a deployment rebuilds the deployment's file from
+all of its records (once, however many of them are given). Configure reports (`*_configure.json`) are
+skipped. A record that can't be converted is reported and the others are still done; the exit status is
+then 1.
 
 ## Convert Ruskin .rsk files
 

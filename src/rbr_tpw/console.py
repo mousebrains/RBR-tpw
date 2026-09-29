@@ -8,6 +8,9 @@
 - Console owns the terminal. Only the main thread reads the keyboard: worker threads call ask() and
   wait while the main thread answers in serve(). Output from other threads is held back while a
   question is on screen, so it cannot split the prompt.
+- status() keeps one transient line at the bottom of a terminal (the progress meter), rewritten in
+  place; every ordinary write clears it first and redraws it after, and a prompt clears it. Off a
+  terminal it is never drawn.
 - run_in_main() runs a function on the main thread, also inside serve(). NetCDF files are written
   this way. netCDF4 releases the interpreter lock around its HDF5 calls, so two threads could be in
   HDF5 at once. netCDF-C also silences HDF5's error printing only for the thread that loaded it: an
@@ -21,6 +24,7 @@ import contextvars
 import logging
 import queue
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -83,16 +87,22 @@ class _Call:
 class Console:
     """The terminal: log lines from any thread; questions answered on the main thread."""
 
-    def __init__(self, stream=None, input_fn=input, interactive: bool | None = None, color: bool | None = None):
+    CLEAR = "\r\033[2K"  # carriage return, erase the line
+
+    def __init__(self, stream=None, input_fn=input, interactive: bool | None = None, color: bool | None = None,
+                 status: bool | None = None):
         self.stream = stream or sys.stdout
         self.input_fn = input_fn
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.color = (hasattr(self.stream, "isatty") and self.stream.isatty()) if color is None else color
         if self.color and sys.platform == "win32":
             self.color = _enable_windows_ansi(self.stream)
+        # the status line needs the same thing colour does: a terminal that takes ANSI escapes
+        self.status_enabled = self.color if status is None else status
         self.stop = threading.Event()  # set on Ctrl-C: pending and later questions get "" (= no)
         self._lock = threading.Lock()
         self._held: list[str] | None = None
+        self._status: str | None = None  # the status line as drawn (None: not drawn)
         self._jobs: queue.Queue[_Question | _Call] = queue.Queue()
 
     def write(self, text: str):
@@ -100,8 +110,31 @@ class Console:
             if self._held is not None:
                 self._held.append(text)
                 return
+            if self._status is not None:
+                self.stream.write(self.CLEAR)
             self.stream.write(text + "\n")
+            if self._status is not None:
+                self.stream.write(self._status)
             self.stream.flush()
+
+    def status(self, text: str | None):
+        """Draw `text` as the transient status line (None: clear it). Any thread; nothing off a terminal."""
+        if not self.status_enabled:
+            return
+        with self._lock:
+            if text is not None:
+                width = max(shutil.get_terminal_size((80, 24)).columns - 1, 10)
+                text = printable(text)[:width]
+            if self._held is not None:  # a question is on screen: drawn again once it is answered
+                self._status = text
+                return
+            self._draw(text)
+
+    def _draw(self, text: str | None):
+        if self._status is not None or text is not None:
+            self.stream.write(self.CLEAR + (text or ""))
+            self.stream.flush()
+        self._status = text
 
     def ask(self, question: str) -> str:
         """Ask the operator and return the answer; "" at end of input or once stopping. Any thread."""
@@ -159,6 +192,9 @@ class Console:
     def _answer(self, q: _Question):
         with self._lock:
             self._held = []
+            if self._status is not None:  # never type over the status line
+                self.stream.write(self.CLEAR)
+                self.stream.flush()
         try:
             q.answer = self.input_fn(q.text)
         except EOFError:
@@ -167,8 +203,12 @@ class Console:
             q.done.set()
             with self._lock:
                 held, self._held = self._held or [], None
+                status, self._status = self._status, None
             for line in held:
                 self.write(line)
+            if status is not None:
+                with self._lock:
+                    self._draw(status)
 
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
