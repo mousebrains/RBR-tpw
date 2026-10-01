@@ -19,11 +19,11 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 
 | Logger | `id fwtype` | Offload (read-only) | NetCDF | Configure |
 |---|---|---|---|---|
-| RBRsolo T, firmware 1.000 | 9 | yes, tested on a logger | yes | yes |
+| RBRsolo T, firmware 1.000 | 9 | yes, tested on 18 loggers | yes | yes |
 | RBRsolo T, firmware 1.110 | 0 | yes, tested on 13 loggers | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | yes, tested on a logger (same sequence as fwtype 9; no energy counter, so no `--fresh-battery`) |
-| RBRduet (L2) | 102 | yes | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
-| RBRconcerto (L2) | 103 | yes | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
-| RBRconcerto³ and other Gen3 (L3) | 104 | yes | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
+| RBRduet (L2) | 102 | yes, tested on 3 loggers | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
+| RBRconcerto (L2) | 103 | yes, tested on 2 loggers | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
+| RBRconcerto³ and other Gen3 (L3) | 104 | yes, tested on 2 concerto³s | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
 | Gen4 (L3.5) | 120 | from RBR's command reference only; untested | untested | – |
 | Anything else | – | detected and skipped; nothing is changed | – | – |
 
@@ -39,8 +39,9 @@ keeps every dataset and schedule, but its NetCDF holds only the latest dataset's
 names any other dataset or schedule that holds data.
 
 The command sequences come from what RBR's Ruskin 2.26.1 sends each model (its serial logs), and from RBR's
-command references. Only the fwtype-9 solo has been run against real hardware so far. The fwtype-9 protocol is
-not in RBR's published references; it was worked out on a real logger and checked against Ruskin's own output.
+command references. Offload has been run on real loggers of every model in the table except Gen4. The fwtype-9
+protocol is not in RBR's published references; it was worked out on a real logger and checked against Ruskin's
+own output.
 
 Ruskin `.rsk` files from any RBR logger can be converted to the same NetCDF format; see
 [Convert Ruskin .rsk files](#convert-ruskin-rsk-files).
@@ -70,7 +71,8 @@ rbr-offload /path/to/data --once     # the logger(s) connected now (or the first
                                      # is still being recognized)
 ```
 
-Each logger gets its own worker, so four loggers on a hub download at the same time. Console lines are
+Each logger gets its own worker, so four loggers on a hub download at the same time (tried with two real loggers
+on a hub at once; the download rates matched those seen one at a time). Console lines are
 tagged with the logger, e.g. `[SN100689@usbmodem101]`. On a terminal a status line at the bottom shows what
 the logger's worker is doing, with a bar, rate and time left during the download (with several loggers, a
 one-line summary); off a terminal, progress is logged every 10%, and the session log always has those lines.
@@ -113,7 +115,9 @@ full read that verifies every byte held; if it matches, the change is reported a
 kept in the record. The saved image keeps the header as first downloaded, so it only ever grows and every
 record's checksum describes a prefix of it. `--full-download` reads the whole memory
 anyway and verifies that it extends the saved image, which is the way to check the incremental path on a
-bench. RBRsolos (fwtypes 0 and 9) read incrementally. Duets, concertos, concerto³s and Gen4 loggers are read
+bench. RBRsolos (fwtypes 0 and 9) read incrementally; on a real fwtype-0 solo a full offload, an incremental one
+(the 136 kB identity check plus 1.7 kB of new data) and a `--full-download` that verified the saved image gave one
+file with an unbroken 500 ms time axis. Duets, concertos, concerto³s and Gen4 loggers are read
 in full each time and checked the same way, until the incremental path has been seen to work on one.
 
 Plugging the logger into Ruskin between offloads is safe: a stop appends an event and is reported; a clock

@@ -1,6 +1,8 @@
 # Plan: incremental offload and one growing NetCDF per deployment
 
-**Implemented 2026-09-28 on branch `incremental-offload` (PR #13; P1-P4 and P6; P5 bench validation pending),
+**Implemented 2026-09-28 on branch `incremental-offload` (PR #13; P1-P4 and P6; P5 bench validation partly done
+2026-10-01 on a real fwtype-0 solo: full → incremental → `--full-download` verified; still open: across a
+`--configure`, the Ruskin matrix, fwtype 9),
 then revised for the PR's review. Where the implementation departs from the text below, the text has been
 corrected and the change is listed in "Departures and review corrections" near the end.**
 
