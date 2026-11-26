@@ -44,7 +44,7 @@ import yaml
 
 from .link import Link, LinkError, LoggerError, parse_pairs
 from .lock import Session, unlock_key  # noqa: F401  (re-exported: the tests import unlock_key from here)
-from .solo import DROP_DRAIN_S, NOMINAL_BATTERY_J, measure_clock_skew, memory, power
+from .solo import NOMINAL_BATTERY_J, measure_clock_skew, memory, power
 
 FAR_FUTURE = "20991231235959"  # Ruskin's "no end time"
 PAST = "20000101000000"  # start time in the past = start as soon as enabled
@@ -57,6 +57,7 @@ TWIST = (103, 104)  # models with twist activation here
 # Ready to deploy after an enable: logging, waiting for its start time, or waiting for its gate (a twist-gated
 # RBRconcerto that is twisted off answers `enable = gated` and `status = gated`, Ruskin's logs 2026-09-11..16)
 READY_STATUSES = ("logging", "pending", "gated")
+LOST_REPLY_DRAIN_S = 0.3  # after a write with no reply: discard a late one before reading the setting back
 ENABLE_TIMEOUT_S = 60.0  # `enable erasememory = true` answered in 0.4-0.6 s (Ruskin's logs); erasing may take longer
 
 
@@ -229,7 +230,7 @@ def set_clock(link: Link, ntp_offset_s: float | None, tolerance_s: float, attemp
             if pace_s is None:
                 raise
             link.note(f"no reply to the clock write ({err}); measuring the clock to see whether it took")
-            link._drain(DROP_DRAIN_S)
+            link._drain(LOST_REPLY_DRAIN_S)
             r = None
         if r is not None and stamp not in r:
             raise ConfigError(f"clock set: unexpected reply {r!r}")
@@ -465,7 +466,7 @@ def _confirmed(link: Link, s: Session, cmd: str, confirm, expect: str | None = N
         raise
     except LinkError as err:
         link.note(f"no reply to {cmd!r} ({err}); reading it back")
-        link._drain(DROP_DRAIN_S)
+        link._drain(LOST_REPLY_DRAIN_S)
         if confirm():
             link.note(f"{cmd!r} took effect; its reply was lost")
             return ""
@@ -507,7 +508,7 @@ def _apply_l2(link, serial, cfg, ntp_offset_s, log, timing, step, start, end, pe
                 except LoggerError:
                     raise
                 except LinkError as err:
-                    link._drain(DROP_DRAIN_S)
+                    link._drain(LOST_REPLY_DRAIN_S)
                     r = "settings offsetfromutc = " + link.query("settings").get("offsetfromutc", "?")
                     if not _offset_nonzero(parse_pairs(r).get("offsetfromutc", "?")) or attempt == 2:
                         link.note(f"no reply to the offsetfromutc write ({err}); it reads back {r!r}")
@@ -582,7 +583,7 @@ def _apply_l2(link, serial, cfg, ntp_offset_s, log, timing, step, start, end, pe
                 except LoggerError:
                     raise
                 except LinkError as err:
-                    link._drain(DROP_DRAIN_S)
+                    link._drain(LOST_REPLY_DRAIN_S)
                     if memory(link).get("used", -1) == 0 or attempt == 2:
                         link.note(f"no prompt after memclear ({err}); memory now {memory(link)}")
                         break
@@ -704,7 +705,7 @@ def _apply_gen3(link, serial, cfg, ntp_offset_s, log, timing, step, start, end, 
             except LoggerError:
                 raise
             except LinkError as err:
-                link._drain(DROP_DRAIN_S)
+                link._drain(LOST_REPLY_DRAIN_S)
                 r = f"memclear (no reply: {err})"
             used = _used(link, 104)
             step("erase", seconds=round(time.monotonic() - t0, 1), used=used, reply=r, command="memclear")
@@ -725,7 +726,7 @@ def _enable(link: Link, s: Session, cmd: str, used_before: int, fwtype: int = 10
         try:
             return _warn_ok(link, cmd, timeout=ENABLE_TIMEOUT_S)
         except LinkError as err:  # LoggerError is answered inside _warn_ok
-            link._drain(DROP_DRAIN_S)
+            link._drain(LOST_REPLY_DRAIN_S)
             status = _status(link, fwtype)
             used = _used(link, fwtype)
             erased = "erasememory" not in cmd or used < used_before or used_before == 0

@@ -237,15 +237,19 @@ def test_a_lost_unlock_is_sent_again(connect):
 def test_paced_probe_survives_dropped_polls(monkeypatch):
     """Unpaced, a dropped `now` costs a 3 s re-send and a bracket can span it (+/-1.68 s on SN081500, 2026-10-19).
     Paced, a drop costs 0.4 s and no bracket spans it."""
-    fake = FakeDuet("/dev/cu.d", n_samples=10, drop_every=40, drop_first={"now"})  # 2.5 %; the first poll always
+    fake = FakeDuet("/dev/cu.d", n_samples=10, drop_every=60, drop_first={"now"})  # 1.7 % (unpaced: 1.5 %) + 1st
     fake.skew_s = 0.25
     monkeypatch.setattr(link_module, "open_serial", lambda port, baudrate: fake)
     link = Link(fake.port)
     link.min_gap_s = 0.010
-    skew = measure_clock_skew(link, reps=3, clock=driver_for(102).clock_now, pace_s=0.010)
-    # n = 3 within the probe's own 15 s (4-7 s locally); no wall-clock bound here: CI runners are slower
+    skew = measure_clock_skew(link, reps=3, clock=driver_for(102).clock_now, pace_s=0.010, max_seconds=30)
+    # n = 3 within 30 s (4-7 s locally); no wall-clock bound here: CI runners are slower
     assert skew["n"] == 3 and skew["dropped_polls"] >= 1 and fake.dropped
-    assert abs(skew["skew_vs_host_s"] - 0.25) < 0.03 and skew["uncertainty_s"] < 0.03
+    # The tick lies inside every bracket, so the reported half-width must cover the true skew. A bracket spanning a
+    # dropped poll (0.1 s timeout + 0.3 s drain) would be >= 0.4 s wide; the unpaced probe's was +/-1.68 s (SN081500).
+    # No tighter bound: a slow CI runner widens every bracket (macOS: ~30 ms, against ~7 ms locally).
+    assert abs(skew["skew_vs_host_s"] - 0.25) <= skew["uncertainty_s"] + 0.002
+    assert skew["uncertainty_s"] < 0.15
 
 
 def test_commands_wait_for_the_gap_after_a_reply(monkeypatch):

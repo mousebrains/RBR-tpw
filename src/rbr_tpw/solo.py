@@ -160,7 +160,10 @@ def _now(link: Link, timeout: float | None = None, retries: int | None = None) -
 
 
 POLL_TIMEOUT_S = 0.1  # a paced poll's wait for its reply (`now` answers in 1-25 ms)
-DROP_DRAIN_S = 0.3  # after a dropped poll: discard a late reply before the next poll
+# After a dropped poll: discard a late reply before the next poll. `now` replies take 1-25 ms and a dropped command
+# gets no reply at all, so 0.1 s of quiet is ample; 0.3 s made each drop cost 0.4 s of polling and, at a 2.5 % drop
+# rate, left a 15 s probe with n = 1 now and then (simulated, 2026-11-26).
+DROP_DRAIN_S = 0.1
 
 
 def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clock=None,
