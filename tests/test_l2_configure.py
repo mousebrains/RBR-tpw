@@ -246,10 +246,10 @@ def test_paced_probe_survives_dropped_polls(monkeypatch):
     # n = 3 within 30 s (4-7 s locally); no wall-clock bound here: CI runners are slower
     assert skew["n"] == 3 and skew["dropped_polls"] >= 1 and fake.dropped
     # The tick lies inside every bracket, so the reported half-width must cover the true skew. A bracket spanning a
-    # dropped poll (0.1 s timeout + 0.3 s drain) would be >= 0.4 s wide; the unpaced probe's was +/-1.68 s (SN081500).
-    # No tighter bound: a slow CI runner widens every bracket (macOS: ~30 ms, against ~7 ms locally).
+    # dropped poll (0.1 s timeout + 0.1 s drain) would be >= 0.2 s wide, a half-width >= 0.1 s; the unpaced probe's was
+    # +/-1.68 s (SN081500). Slow CI runners widen every bracket (macOS: ~30 ms half-width, against ~7 ms locally).
     assert abs(skew["skew_vs_host_s"] - 0.25) <= skew["uncertainty_s"] + 0.002
-    assert skew["uncertainty_s"] < 0.15
+    assert skew["uncertainty_s"] < 0.09
 
 
 def test_commands_wait_for_the_gap_after_a_reply(monkeypatch):
