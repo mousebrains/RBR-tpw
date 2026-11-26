@@ -22,7 +22,9 @@ Memory layout (established 2026-09-25 on 16 duet/concerto .rsk files, Ruskin 2.2
     (4*N bytes, N at byte 10, byte 11 bit 0 = "the next sample set takes this event's time", section
     5.3.3). Each event's CRC-16/CCITT covers its bytes 2..end, stored big-endian in bytes 0-1.
   - Sample sets are timed from the last time-anchoring event (0xF3 with bit 0 set; 0xF5/0xF7 time sync or
-    restart) plus n * period. This reproduces Ruskin's timestamps exactly, including twist-activation gaps.
+    restart) plus n periods (rawbin.sample_offsets_ms: a sub-second period is an exact rate). This reproduces
+    Ruskin's timestamps exactly on the 17 .rsk files checked, including twist-activation gaps (none of them at a
+    period that does not divide 1000 ms).
   - Ruskin's values are reproduced to <1e-13 only with Ruskin's coefficient values: the float32 coefficient
     printed as its shortest decimal and read back as a double (ruskin_coefficient()). The exact float32
     values differ by up to ~4e-6 dbar, and the logger's own `calibration` replies round to 8 digits.
@@ -46,6 +48,7 @@ from .rawbin import (
     Decoded,
     Event,
     Header,
+    sample_offsets_ms,
     set_end_bytes,
 )
 
@@ -320,11 +323,11 @@ def decode_l2(image: bytes, nstored: int) -> Decoded:
     first = anchors[0][0] if anchors else nsets
     if first > 0:
         t0 = EPOCH2000_MS + 1000 * max(hdr.start_time, hdr.logger_time)
-        time_ms[:first] = t0 + period * np.arange(first, dtype=np.int64)
+        time_ms[:first] = t0 + sample_offsets_ms(period, first)
         time_flags[:first] |= TFLAG_NO_ANCHOR
     for k, (idx, t_ms, seconds) in enumerate(anchors):
         end = anchors[k + 1][0] if k + 1 < len(anchors) else nsets
-        time_ms[idx:end] = t_ms + period * np.arange(end - idx, dtype=np.int64)
+        time_ms[idx:end] = t_ms + sample_offsets_ms(period, end - idx)
         segment[idx:end] = k
         if seconds < hdr.logger_time:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK

@@ -54,7 +54,7 @@ def served(request, tmp_path, monkeypatch):
     setup_logging(Console(stream=io.StringIO()))
 
 
-def fast_skew(link, reps=3, max_seconds=15.0, clock=None):
+def fast_skew(link, reps=3, max_seconds=15.0, clock=None, **k):
     return {"n": 3, "polls": 9, "skew_vs_host_s": 0.0, "uncertainty_s": 0.003, "spread_s": 0.001,
             "individual_s": [0.0] * 3, "measured_at": "2026-09-26T00:00:00.000+00:00"}
 

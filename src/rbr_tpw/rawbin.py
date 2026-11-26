@@ -121,6 +121,22 @@ TFLAG_RESET_CLOCK = 2  # anchored on a clock that had been reset (anchor earlier
 TFLAG_SKEW_CORRECTED = 4  # set by the NetCDF writer: reset-clock time shifted by the skew measured at offload
 
 
+def sample_offsets_ms(period_ms: int, n: int) -> np.ndarray:
+    """Times of n sample sets after an anchor, ms from it (int64).
+
+    A sub-second period is a rounded label for an exact rate of round(1000 / period) Hz: the L3 reference (3.10.2)
+    says so for Gen3 ("a period of 53 ms ... the effective sampling rate is 19 Hz"), and RBRconcerto SN060275 (fw
+    1.460) set to `period = 167` sampled 5.99985 Hz (memory growth over 590 s; 6 Hz would be 6, 167 ms 5.988;
+    2026-11-26). So set k falls at k * 1000 / rate ms, rounded to the nearest ms. Until 2026-11-26 it was k * period,
+    which runs 2 ms/s late at 167 ms. Periods of 1 s or more, and those that divide 1000 (500, 250, 125), are
+    unchanged."""
+    k = np.arange(n, dtype=np.int64)
+    if 0 < period_ms < 1000:
+        rate = (1000 + period_ms // 2) // period_ms  # the L3 reference's integer conversion: 53 ms -> 19 Hz
+        return (2000 * k + rate) // (2 * rate)  # round(1000 k / rate), half up, exact in integers
+    return period_ms * k
+
+
 def event_name(code: int) -> str:
     """CF-safe name for an event type code; codes above 0xFF are Ruskin's own, not the logger's."""
     if code in EVENT_NAMES:
@@ -271,12 +287,12 @@ def decode(image: bytes, nchan: int) -> Decoded:
     first = anchors[0].sample_index if anchors else nsets
     if first > 0:  # sets before any anchor: fall back to the programmed start
         t0 = EPOCH2000_MS + 1000 * max(hdr.start_time, hdr.logger_time)
-        time_ms[:first] = t0 + period * np.arange(first, dtype=np.int64)
+        time_ms[:first] = t0 + sample_offsets_ms(period, first)
         time_flags[:first] |= TFLAG_NO_ANCHOR
     for k, e in enumerate(anchors):
         idx = e.sample_index
         end = anchors[k + 1].sample_index if k + 1 < len(anchors) else nsets
-        time_ms[idx:end] = e.unix_ms + period * np.arange(end - idx, dtype=np.int64)
+        time_ms[idx:end] = e.unix_ms + sample_offsets_ms(period, end - idx)
         segment[idx:end] = k
         if e.seconds < hdr.logger_time:
             time_flags[idx:end] |= TFLAG_RESET_CLOCK

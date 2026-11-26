@@ -214,7 +214,7 @@ def test_set_clock_recovers_when_the_first_write_lands_ahead(monkeypatch):
     fake = FakeSolo(clock_bias_s=0.025, clock=vc)
     fake.locked = False
     monkeypatch.setattr(cf, "time", vc)
-    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3, **k: {
         "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
     out = cf.set_clock(fake, 0.0, 0.020, log=lambda *a: None)
     assert out["ok"] and abs(out["skew_vs_utc_s"]) < 0.001

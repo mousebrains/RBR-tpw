@@ -9,7 +9,7 @@ from pathlib import Path
 import netCDF4
 import numpy as np
 import pytest
-from fakelogger import FakeDuet, FakeSolo
+from fakelogger import FakeConcerto3, FakeSolo
 from test_easyparse import make_event, make_records
 from test_gen4 import CHANNELS, FakeGen4, build_meta
 from test_power_and_cli import FakeSolo as ConfigFake
@@ -228,10 +228,14 @@ def test_exit_status_0_after_a_good_offload(once, tmp_path):
     assert once({"/dev/cu.A": FakeSolo("/dev/cu.A", n_samples=50)}) == 0 and list(tmp_path.glob("100689_*.nc"))
 
 
-def test_a_configure_the_model_does_not_support_is_not_ready(once, tmp_path):
-    """--configure on a duet (read-only so far): offloaded, not configured, so exit status 2."""
-    assert once({"/dev/cu.D": FakeDuet("/dev/cu.D", n_samples=50)}, "--configure", "--yes", "--no-clock") == 2
-    assert list(tmp_path.glob("081500_*.nc"))
+def test_a_configure_the_model_does_not_support_is_not_ready(once, tmp_path, monkeypatch):
+    """--configure on a model it does not cover (the concerto3 marked so; in fact Gen4): offloaded, not configured,
+    so exit status 2."""
+    from rbr_tpw.drivers import Gen3Driver
+
+    monkeypatch.setattr(Gen3Driver, "configurable", False)
+    assert once({"/dev/cu.D": FakeConcerto3("/dev/cu.D", n_samples=50)}, "--configure", "--yes", "--no-clock") == 2
+    assert list(tmp_path.glob("233442_*.nc"))
 
 
 def test_rebuild_skips_configure_reports_and_goes_on_after_a_bad_record(once, tmp_path):

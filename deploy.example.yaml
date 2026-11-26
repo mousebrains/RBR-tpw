@@ -14,7 +14,9 @@ deploy:                  # used only with --configure; applied after the downloa
   enable: true           # start logging when done
   schedule:
     mode: continuous     # only continuous is supported so far
-    period_ms: 500       # 500 (2 Hz) or a whole number of seconds; or use rate_hz
+    period_ms: 500       # RBRsolo: 500 (2 Hz) or whole seconds. Duet, concerto: also 1000/n ms (250, 167, ...)
+                         # down to the logger's userperiodlimit. Gen3: one of its availablefastperiods. Or rate_hz.
     # rate_hz: 2
+    # twist_activation: true   # RBRconcerto, RBRconcerto3: sample only while twisted on (default: leave as is)
     start: now           # now | ISO-8601 UTC, e.g. 2026-10-01T00:00:00Z
     end: never           # never | ISO-8601 UTC

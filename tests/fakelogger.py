@@ -411,7 +411,199 @@ class FakeSoloWritable(FakeSolo):
         return self._reply("E0102 invalid command")
 
 
-class FakeDuet(FakePort):
+class FakeL2(FakePort):
+    """An RBRduet or RBRconcerto: the L2 command set, a sectioned memory header, and the writes Ruskin 2.26.1 sent
+    them (its serial logs, 5 duet and 10 concerto enables, 2026-09-11..22), answered as the loggers answered:
+    `stop` -> `stop = stopped`; `permit settings` -> `permit = settings`; `settings offsetfromutc = 0.0` ->
+    `settings offsetfromutc = +0.00`; `now = X` (which leaves the offset `unknown`, SN082492 2026-11-26),
+    `starttime = X`, `endtime = X`, `sampling period = N` and `twistactivation state = on` with the command text;
+    `verify` -> `E0402 memory not empty, erase first, verify = stopped`; `enable erasememory = true` -> `E0401
+    estimated memory usage exceeds capacity, enable = logging`, or `enable = gated` on a twist-gated concerto that is
+    twisted off. `memclear` answers `memclear used = 0` and leaves the duet `disabled`; `verify` on an empty memory
+    answers `E0401 estimated memory usage exceeds capacity, verify = logging` (SN082492, 2026-11-26). A write while
+    locked is answered E0102 (assumed).
+
+    The memory follows the writes: `stop` appends a 0x02 event, `memclear` empties it, an enable writes a fresh
+    header (the logger time and period patched into the model's header, CRC recomputed) and a time-sync marker."""
+
+    E2000 = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+    model = "RBRduet"
+    version = "3.220"
+    fwtype = 102
+    memory_size = 528_482_304
+    stored = 3  # readings per sample set
+    period_ms = 500
+    userperiodlimit = 500
+
+    def __init__(self, port: str, serial: int, **kw):
+        super().__init__(port, **kw)
+        self.serial = serial
+        self.lockable = True
+        self.offset_s = 0.0  # written by `now = X`: logger clock minus host clock
+        self.twisted_on = False  # a concerto's twist switch
+        self.state = {"status": "logging", "starttime": "20000101000000", "endtime": "20991231235959",
+                      "mode": "continuous", "period": self.period_ms, "offsetfromutc": "+0.00",
+                      "twist": None, "remaining": "1BA8140"}
+        self._permit: str | None = None
+        self.writes: list[str] = []
+        # A write's reply lost: no reply at all to the first command starting with one of `drop_once_prefixes`
+        # (never received), or the first one starting with one of `lose_reply_once_prefixes` carried out but its
+        # reply lost.
+        self.drop_once_prefixes: set[str] = set()
+        self.lose_reply_once_prefixes: set[str] = set()
+
+    @property
+    def image(self) -> bytes:
+        return self.datasets.get(1, b"")
+
+    @image.setter
+    def image(self, value: bytes):
+        self.datasets[1] = value
+
+    def _s2000(self) -> int:
+        return int((self.now() - self.E2000).total_seconds())
+
+    def now(self) -> dt.datetime:
+        return super().now() + dt.timedelta(seconds=self.offset_s)
+
+    def grow(self, n_samples: int):
+        """The logger keeps logging: `n_samples` more sample sets of signed readings (R in (0.40, 0.46))."""
+        readings = (np.linspace(0.40, 0.45, n_samples)[:, None] + 0.01 * np.arange(self.stored)) * (1 << 30)
+        self.image = self.image + readings.astype("<i4").tobytes()
+
+    def append_event(self, etype: int, seconds: int):
+        self.image = self.image + solo_event(etype, seconds)
+
+    def fresh_image(self, sync_s: int) -> bytes:
+        raise NotImplementedError
+
+    def replies(self):
+        r = self._replies()
+        if self.locked:  # locked: hidden channels left out, `status = on` (SN060275, 2026-09-26)
+            r.update(self.locked_view({k: v for k, v in r.items() if re.fullmatch(r"channel \d+", k)}, r["channels"]))
+            for k in [k for k in r if k.startswith("calibration ") and int(k.split()[1]) > self.shown_channels()]:
+                r.pop(k)  # E0108 like the hidden `channel N`
+        return r
+
+    def shown_channels(self) -> int:
+        return len([k for k in self._replies() if re.fullmatch(r"channel \d+", k)]) - 1
+
+    def sampling_reply(self) -> str:
+        st = self.state
+        return (f"sampling schedule = 1, mode = {st['mode']}, period = {st['period']}, gate = none, "
+                f"userperiodlimit = {self.userperiodlimit}")
+
+    def common_replies(self) -> dict[str, str]:
+        st = self.state
+        used = len(self.image)
+        return {
+            "id": f"id model = {self.model}, version = {self.version}, serial = {self.serial:06d}, "
+                  f"fwtype = {self.fwtype}",
+            "status": f"status = {st['status']}",
+            "starttime": f"starttime = {st['starttime']}",
+            "endtime": f"endtime = {st['endtime']}",
+            "sampling": self.sampling_reply(),
+            "meminfo": f"meminfo used = {used}, remaining = {self.memory_size - used}, size = {self.memory_size}",
+            "memformat": "memformat type = rawbin00",
+        }
+
+    WRITES = ("stop", "permit ", "settings offsetfromutc = ", "now = ", "starttime = ", "endtime = ",
+              "sampling period = ", "sampling mode = ", "twistactivation state = ", "memclear", "verify", "enable",
+              "powerstatus remaining = ")
+
+    def _handle(self, cmd: str):
+        if not cmd.startswith(self.WRITES):
+            return super()._handle(cmd)
+        if self._drops(cmd):
+            return
+        lose = next((x for x in self.lose_reply_once_prefixes if cmd.startswith(x)), None)
+        if lose is None:
+            return self._handle_write(cmd)
+        self.lose_reply_once_prefixes.discard(lose)
+        with self._lock:
+            n = len(self._out)
+        self._handle_write(cmd)
+        with self._lock:
+            del self._out[n:]
+
+    def _handle_write(self, cmd: str):
+        self.commands.append(cmd)
+        st = self.state
+        if cmd == "verify":  # a read
+            if self.image:
+                return self._reply(f"E0402 memory not empty, erase first, verify = {st['status']}")
+            return self._reply("E0401 estimated memory usage exceeds capacity, verify = logging")  # SN082492
+        if self.locked:
+            return self._reply("E0102 invalid command")
+        self.writes.append(cmd)
+        permit, self._permit = self._permit, None  # a permit is for the next command only
+        if cmd.startswith("permit "):
+            self._permit = cmd.split(" ", 1)[1]
+            return self._reply(f"permit = {self._permit}")
+        if cmd == "stop":
+            if st["status"] not in ("logging", "pending", "gated"):
+                return self._reply(f"E0406 stop = {st['status']}")
+            st["status"] = "stopped"
+            self.append_event(0x02, self._s2000())
+            return self._reply("stop = stopped")
+        if cmd.startswith("settings offsetfromutc = "):
+            if permit != "settings":
+                return self._reply("E0110 permission denied")
+            st["offsetfromutc"] = f"{float(cmd.rsplit(' ', 1)[1]):+.2f}"
+            return self._reply(f"settings offsetfromutc = {st['offsetfromutc']}")
+        if cmd.startswith("now = "):
+            t = dt.datetime.strptime(cmd[6:], "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC)
+            self.offset_s = t.timestamp() - time.time() - self.skew_s
+            st["offsetfromutc"] = "unknown"  # as SN082492 on 2026-11-26, even right after an offset write
+            return self._reply(cmd)
+        m = re.fullmatch(r"(starttime|endtime) = (\d{14})", cmd)
+        if m:
+            st[m.group(1)] = m.group(2)
+            return self._reply(cmd)
+        m = re.fullmatch(r"sampling period = (\d+)", cmd)
+        if m:
+            if int(m.group(1)) < self.userperiodlimit:
+                return self._reply("E0108 invalid argument to command")
+            st["period"] = int(m.group(1))
+            return self._reply(cmd)
+        m = re.fullmatch(r"twistactivation state = (on|off)", cmd)
+        if m and st["twist"] is not None:
+            st["twist"] = m.group(1)
+            return self._reply(cmd)
+        if cmd == "memclear":
+            if permit != "memclear":
+                return self._reply("E0110 permission denied")
+            self.image = b""
+            st["status"] = "disabled"  # SN082492 after memclear (it read `stopped` after `stop`)
+            return self._reply("memclear used = 0")
+        m = re.fullmatch(r"enable( erasememory = true(, memformat = RAWBIN00)?)?", cmd)
+        if m:
+            if self.image and not m.group(1):
+                return self._reply("E0402 memory not empty, erase first")
+            self.image = self.fresh_image(self._s2000())
+            if st["starttime"] > f"{self.now():%Y%m%d%H%M%S}":
+                st["status"] = "pending"
+                return self._reply("enable = pending")
+            if st["twist"] == "on" and not self.twisted_on:
+                st["status"] = "gated"
+                return self._reply("enable = gated")
+            st["status"] = "logging"
+            return self._reply("E0401 estimated memory usage exceeds capacity, enable = logging")
+        return self._reply("E0102 invalid command")
+
+    def _drops(self, cmd: str) -> bool:
+        """Whether FakePort's drop rules silence this command (they are applied to writes too)."""
+        prefix = next((x for x in self.drop_once_prefixes if cmd.startswith(x)), None)
+        if (self.drop_every and (len(self.commands) + 1) % self.drop_every == 0) or cmd in self.drop_first or prefix:
+            self.drop_first.discard(cmd)
+            self.drop_once_prefixes.discard(prefix)
+            self.commands.append(cmd)
+            self.dropped.append(cmd)
+            return True
+        return False
+
+
+class FakeDuet(FakeL2):
     """An RBRduet (fwtype 102): temperature, pressure corrected with the hidden compensation thermistor
     (channel 3), rawbin00 memory with a sectioned header. Coefficients from SN081500's `calibration` replies."""
 
@@ -421,35 +613,18 @@ class FakeDuet(FakePort):
     COMP = [("c0", 3.3924840e-003), ("c1", -277.40445e-006), ("c2", 4.7023100e-006), ("c3", -839.29645e-009)]
 
     def __init__(self, port: str, serial: int = 81500, n_samples: int = 2000, **kw):
-        super().__init__(port, **kw)
-        self.serial = serial
-        self.lockable = True
-        self.image = l2_sectioned_image(n_samples, [("temp12", 0, self.TEMP), ("pres21", 0, self.PRES),
-                                                    ("temp05", 9, self.COMP)], serial)
-        self.datasets = {1: self.image}
+        super().__init__(port, serial, **kw)
+        self.image = l2_sectioned_image(n_samples, self.channel_table(), serial)
 
-    def grow(self, n_samples: int):
-        """The duet keeps logging: `n_samples` more sets of 3 signed readings (R in (0.40, 0.46))."""
-        readings = (np.linspace(0.40, 0.45, n_samples)[:, None] + 0.01 * np.arange(3)) * (1 << 30)
-        self.image = self.image + readings.astype("<i4").tobytes()
-        self.datasets[1] = self.image
+    def channel_table(self):
+        return [("temp12", 0, self.TEMP), ("pres21", 0, self.PRES), ("temp05", 9, self.COMP)]
 
-    def replies(self):
-        r = self._replies()
-        if self.locked:  # SN060275 locked: 8 of 9 channels, `status = on`; unlocked: all 9, numeric
-            r.update(self.locked_view({k: v for k, v in r.items() if re.fullmatch(r"channel \d+", k)}, r["channels"]))
-            r.pop("calibration 3")  # E0108 like `channel 3`
-        return r
+    def fresh_image(self, sync_s: int) -> bytes:
+        return l2_sectioned_image(0, self.channel_table(), self.serial, period_ms=self.state["period"], sync_s=sync_s)
 
     def _replies(self):
-        used = len(self.image)
         return {
-            "id": f"id model = RBRduet, version = 3.220, serial = {self.serial:06d}, fwtype = 102",
-            "now": f"now = {self.now():%Y%m%d%H%M%S}",
-            "status": "status = logging",
-            "starttime": "starttime = 20000101000000",
-            "endtime": "endtime = 20991231235959",
-            "sampling": "sampling mode = continuous, period = 500",
+            **self.common_replies(),
             "channels": "channels count = 3, on = 3, latency = 50, readtime = 300, minperiod = 430",
             "channel 1": "channel 1 type = temp12, module = 1, status = 0, latency = 50, readtime = 300, "
                          "equation = tmp, userunits = C",
@@ -462,17 +637,111 @@ class FakeDuet(FakePort):
                                                for k, v in cal)
                for i, (t, cal) in enumerate([("temp12", self.TEMP), ("pres21", self.PRES), ("temp05", self.COMP)],
                                             1)},
-            "meminfo": f"meminfo used = {used}, remaining = {528_482_304 - used}, size = 528482304",
-            "memformat": "memformat type = rawbin00",
             "settings": "settings fetchpoweroffdelay = 8000, sensorpoweralwayson = off, temperature = 15.0000, "
-                        "atmosphere = 10.1325010, pressure = 10.1325, conductivity = 42.9140, density = 1.0260206",
+                        "atmosphere = 10.1325010, pressure = 10.1325, conductivity = 42.9140, density = 1.0260206, "
+                        f"castdetection = on, offsetfromutc = {self.state['offsetfromutc']}",
             "powerstatus": "powerstatus source = usb, int =  3.61, capacity = 6.480",
-            "powerstatus remaining": "powerstatus remaining = 1BA8140",
+            "powerstatus remaining": f"powerstatus remaining = {self.state['remaining']}",
         }
 
 
+REAL_CONCERTO_HEADER_BYTES = 1037  # tests/real_l2/concerto_reset.bin: version 1014, 9 channels, as SN060275
+
+
+def concerto_header(serial: int, logger_s: int, period_ms: int) -> bytes:
+    """The real RBRconcerto deployment header of tests/real_l2/concerto_reset.bin (fw 1.460, 9 channels: cond06,
+    temp09, pres24, five derived, the hidden temp10), with its serial number, logger time at enable and period
+    patched into section 2 (which starts at byte 9) and its CRC recomputed."""
+    from pathlib import Path
+
+    real = (Path(__file__).parent / "real_l2" / "concerto_reset.bin").read_bytes()
+    hdr = bytearray(real[:REAL_CONCERTO_HEADER_BYTES])
+    for rel, v in ((7, serial), (11, logger_s), (23, period_ms)):
+        struct.pack_into("<I", hdr, 9 + rel, v)
+    struct.pack_into(">H", hdr, len(hdr) - 2, crc16_ccitt(bytes(hdr[:-2])))
+    return bytes(hdr)
+
+
+class FakeConcerto(FakeL2):
+    """An RBRconcerto (fwtype 103, fw 1.460), twist-gated, with SN060275's replies (Ruskin's serial log,
+    2026-09-13) and a real concerto header (concerto_header). Stored per sample set: conductivity, temperature,
+    pressure and the hidden temp10; the five derived channels are not stored (status 4)."""
+
+    model = "RBRconcerto"
+    version = "1.460"
+    fwtype = 103
+    memory_size = 132_120_576
+    stored = 4
+    period_ms = 1000
+    userperiodlimit = 167
+
+    def __init__(self, port: str, serial: int = 60275, n_samples: int = 2000, **kw):
+        super().__init__(port, serial, **kw)
+        self.state["twist"] = "on"
+        self.state["status"] = "gated"
+        self.state["remaining"] = None
+        self.image = self.fresh_image(SYNC_S)
+        self.grow(n_samples)
+
+    def fresh_image(self, sync_s: int) -> bytes:
+        body = bytes([0x01, 0xF7]) + struct.pack("<I", sync_s)
+        return concerto_header(self.serial, sync_s, self.state["period"]) + struct.pack(">H", crc16_ccitt(body)) + body
+
+    def sampling_reply(self) -> str:
+        st = self.state
+        gate = "twistactivation" if st["twist"] == "on" else "none"
+        return (f"sampling schedule = 1, mode = {st['mode']}, period = {st['period']}, burstlength = 10, "
+                f"burstinterval = 300000, gate = {gate}, userperiodlimit = {self.userperiodlimit}")
+
+    CHANNELS = [
+        ("cond06", 32, 0, 60, 290, "corr_cond", "mS/cm"), ("temp09", 1, 0, 50, 260, "tmp", "C"),
+        ("pres24", 2, 0, 50, 290, "corr_pres2", "dbar"), ("pres08", 240, 4, 0, 0, "deri_seapres", "dbar"),
+        ("dpth01", 241, 4, 0, 0, "deri_depth", "m"), ("sal_00", 242, 4, 0, 0, "deri_salinity", "PSU"),
+        ("sos_00", 244, 4, 0, 0, "deri_sos", "m/s"), ("scon00", 245, 4, 0, 0, "deri_speccond", "uS/cm"),
+        ("temp10", 6, 9, 50, 260, "tmp", "C")]
+    CALS = [
+        "datetime = 20231026170646, c0 = 29.648888e-003, c1 = 154.56442e+000, x0 = 257.00213e-006, "
+        "x1 = -9.7100980e-006, x2 = 600.00000e-009, x3 = 14.995120e+000, x4 = 10.000000e+000, n0 = 2, n1 = 3",
+        "datetime = 20231023132858, c0 = 3.3587150e-003, c1 = -255.07301e-006, c2 = 2.3641970e-006, "
+        "c3 = -78.563912e-009",
+        "datetime = 20231025163856, c0 = -31.343394e+000, c1 = 2.3460230e+003, c2 = 69.649632e+000, "
+        "c3 = -38.275800e+000, x0 = 10.106700e+000, x1 = 189.41363e-003, x2 = 396.48000e-006, x3 = -88.085144e-009, "
+        "x4 = 202.11552e-006, x5 = 21.231548e+000, n0 = 9",
+        "datetime = 20170719154601, n0 = 3, n1 = value", "datetime = 20170719154601, n0 = 3, n1 = value",
+        "datetime = 20170719154601, n0 = 2, n1 = 3, n2 = 1, n3 = value", "datetime = 20170719154602, n0 = 2, n1 = 4, "
+        "n2 = 6", "datetime = 20170719154602, n0 = 1, n1 = 2",
+        "datetime = 20231023132914, c0 = 3.3863120e-003, c1 = -277.61296e-006, c2 = 5.4398570e-006, "
+        "c3 = -744.36256e-009"]
+
+    def _replies(self):
+        r = {**self.common_replies(),
+             "channels": "channels count = 9, on = 9, latency = 60, readtime = 290, minperiod = 480",
+             "memformat": "memformat type = rawbin00",
+             "settings": "settings fetchpoweroffdelay = 8000, sensorpoweralwayson = off, temperature = 0.0000, "
+                         "atmosphere = 10.1325000, pressure = 10.1325, density = 1.0281000, speccondtempco = 0.0191, "
+                         "salinity = 35.0000, avgsoundspeed = 1550.7440, castdetection = off, inputtimeout = 10000, "
+                         f"offsetfromutc = {self.state['offsetfromutc']}",
+             "powerstatus": "powerstatus source = usb, int = 12.34, ext =  0.00, capacity = 24.000",
+             "twistactivation": f"twistactivation state = {self.state['twist']}, location = off"}
+        for i, (t, mod, status, lat, rt, eq, units) in enumerate(self.CHANNELS, 1):
+            r[f"channel {i}"] = (f"channel {i} type = {t}, module = {mod}, status = {status}, latency = {lat}, "
+                                 f"readtime = {rt}, equation = {eq}, userunits = {units}")
+            r[f"calibration {i}"] = f"calibration {i} type = {t}, {self.CALS[i - 1]}"
+        return r
+
+
 class FakeConcerto3(FakePort):
-    """An RBRconcerto3 (fwtype 104, Gen3 L3), EasyParse (calbin00) memory in datasets 2, 1 and 0."""
+    """An RBRconcerto3 (fwtype 104, Gen3 L3), EasyParse (calbin00) memory in datasets 2, 1 and 0.
+
+    It takes the writes of configure._apply_gen3, answered as SN233442 answered Ruskin (its serial logs,
+    2026-09-11..16) or as the L3 reference rev L shows: `disable` -> `disable status = stopped`; `clock datetime = X,
+    offsetfromutc = 0.0` -> `clock datetime = X, offsetfromutc = +0.00` (`clock datetime = X` alone erases the offset,
+    4.1.1); `deployment endtime = E, starttime = S` -> `deployment starttime = S, endtime = E`; `sampling period = N`
+    with the text (sub-second N only from `availablefastperiods`); `twistactivation enabled = true` -> `twistactivation
+    enabled = true, state = n/a`; `verify` -> `E0402 memory not empty, erase first`; `enable erasememory = true,
+    memformat = CALBIN00` -> `enable status = gated, warning = none`; `permit command = memclear` + `memclear` ->
+    `memclear used = 0`. Writes need the unlock (keyed on the `clock` reply). The memory follows: an enable writes a
+    new deployment header (dataset 2) and empties datasets 0 and 1, memclear empties all three."""
 
     CHANNELS = [("cond19", "corr_cond3", "mS/cm", "conductivity_00", 0), ("temp14", "tmp", "C", "temperature_00", 0),
                 ("pres24", "corr_pres2", "dbar", "pressure_00", 0), ("pres08", "deri_seapres", "dbar",
@@ -480,6 +749,7 @@ class FakeConcerto3(FakePort):
                 ("dpth01", "deri_depth", "m", "depth_00", 0), ("sal_00", "deri_salinity", "PSU", "salinity_00", 0),
                 ("temp22", "tmp", "C", "conductivitycelltemperature_00", 13),
                 ("temp10", "tmp", "C", "pressuretemperature_00", 13)]
+    FAST = [500, 250, 125, 63, 42, 31]
 
     def __init__(self, port: str, serial: int = 233442, n_samples: int = 2000, **kw):
         """Locked, it lists its 6 stored channels with `status = on`, as SN233442 did on 2026-09-26; unlocked (the
@@ -487,10 +757,24 @@ class FakeConcerto3(FakePort):
         super().__init__(port, **kw)
         self.serial = serial
         self.lockable = True
-        t0 = 1_790_000_000_000
+        self.t0 = 1_790_000_000_000
         self.datasets = {2: bytes(range(256)) * 4 + bytes(180),  # 1204 bytes like SN233442's header; not decoded
-                         1: easyparse_image(n_samples, 6, t0),
-                         0: easyparse_event(t0 - 500, 0x18) + easyparse_event(t0 + 1000 * n_samples, 0x19)}
+                         1: easyparse_image(n_samples, 6, self.t0),
+                         0: easyparse_event(self.t0 - 500, 0x18) + easyparse_event(self.t0 + 1000 * n_samples, 0x19)}
+        self.n = n_samples
+        self.offset_s = 0.0
+        self.twisted_on = False
+        self.state = {"status": "logging", "starttime": "20000101000000", "endtime": "20991231235959",
+                      "period": 1000, "twist": "false", "offsetfromutc": "+0.00"}
+        self._permit: str | None = None
+        self.writes: list[str] = []
+
+    def now(self) -> dt.datetime:
+        return super().now() + dt.timedelta(seconds=self.offset_s)
+
+    def grow(self, n_samples: int):
+        self.datasets[1] = self.datasets[1] + easyparse_image(n_samples, 6, self.t0 + 1000 * self.n)
+        self.n += n_samples
 
     def replies(self):
         r = self._replies()
@@ -499,12 +783,20 @@ class FakeConcerto3(FakePort):
         return r
 
     def _replies(self):
+        st = self.state
+        gate = "twistactivation" if st["twist"] == "true" else "none"
+        tstate = "n/a" if st["twist"] != "true" or st["status"] not in ("logging", "gated") else (
+            "running" if st["status"] == "logging" else "paused")
         r = {
             "id": f"id model = RBRconcerto3, version = 1.162, serial = {self.serial}, fwtype = 104",
-            "clock": f"clock datetime = {self.now():%Y%m%d%H%M%S}, offsetfromutc = +0.00",
-            "deployment": "deployment starttime = 20000101000000, endtime = 20991231235959, status = logging",
-            "deployment status": "deployment status = logging",
-            "sampling": "sampling mode = continuous, period = 1000",
+            "clock": f"clock datetime = {self.now():%Y%m%d%H%M%S}, offsetfromutc = {st['offsetfromutc']}",
+            "deployment": f"deployment starttime = {st['starttime']}, endtime = {st['endtime']}, "
+                          f"status = {st['status']}",
+            "deployment status": f"deployment status = {st['status']}",
+            "sampling": f"sampling mode = continuous, period = {st['period']}, burstlength = 10, "
+                        f"burstinterval = 300000, gate = {gate}, userperiodlimit = 31",
+            "sampling availablefastperiods": f"sampling availablefastperiods = {'|'.join(map(str, self.FAST))}",
+            "twistactivation": f"twistactivation enabled = {st['twist']}, state = {tstate}",
             "channels": "channels count = 8, on = 8, settlingtime = 60, readtime = 290, minperiod = 470",
             "memformat": "memformat type = calbin00, newtype = calbin00, availabletypes = rawbin00|calbin00",
             "power": "power source = usb, int = 14.63, ext = 0.01, reg = n/a",
@@ -518,11 +810,83 @@ class FakeConcerto3(FakePort):
                                  f"derived = {'on' if eq.startswith('deri_') else 'off'}, label = {label}")
             r[f"calibration {i}"] = (f"calibration {i} label = {label}, datetime = 20250528165608, "
                                      f"c0 = 30.056130e-003, c1 = 158.07142e+000")
-        for d, blob in self.datasets.items():
+        for d in (0, 1, 2):
+            blob = self.datasets.get(d, b"")
             size = MEMORY_SIZE
             r[f"meminfo dataset {d}"] = (f"meminfo dataset = {d}, used = {len(blob)}, remaining = "
                                          f"{size - len(blob)}, size = {size}")
         return r
+
+    WRITES = ("disable", "clock datetime = ", "clock offsetfromutc = ", "deployment endtime = ",
+              "deployment starttime = ", "sampling period = ", "twistactivation enabled = ", "verify", "enable",
+              "permit command = ", "memclear")
+
+    def _handle(self, cmd: str):
+        if cmd == "clock" and not (self.drop_every or self.drop_first):  # the challenge, with the offset as it is
+            self.commands.append(cmd)
+            self._challenge = self.now().replace(microsecond=0)
+            return self._reply(f"clock datetime = {self._challenge:%Y%m%d%H%M%S}, "
+                               f"offsetfromutc = {self.state['offsetfromutc']}")
+        if not cmd.startswith(self.WRITES):
+            return super()._handle(cmd)
+        self.commands.append(cmd)
+        st = self.state
+        if cmd == "verify":
+            if self.datasets.get(1) or self.datasets.get(0):
+                return self._reply("E0402 memory not empty, erase first")
+            return self._reply("verify status = logging, warning = none")
+        if self.locked:
+            return self._reply("E0102 invalid command")
+        self.writes.append(cmd)
+        permit, self._permit = self._permit, None
+        if cmd.startswith("permit command = "):
+            self._permit = cmd.split("= ", 1)[1]
+            return self._reply(cmd)
+        if cmd == "disable":
+            st["status"] = "stopped"
+            return self._reply("disable status = stopped")
+        m = re.fullmatch(r"clock datetime = (\d{14})(, offsetfromutc = ([-+0-9.]+))?", cmd)
+        if m:
+            t = dt.datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=dt.UTC)
+            self.offset_s = t.timestamp() - time.time() - self.skew_s
+            st["offsetfromutc"] = f"{float(m.group(3)):+.2f}" if m.group(3) else "unknown"
+            return self._reply(f"clock datetime = {m.group(1)}" + (f", offsetfromutc = {st['offsetfromutc']}"
+                                                                    if m.group(3) else ""))
+        m = re.fullmatch(r"clock offsetfromutc = ([-+0-9.]+)", cmd)
+        if m:
+            st["offsetfromutc"] = f"{float(m.group(1)):+.2f}"
+            return self._reply(f"clock offsetfromutc = {st['offsetfromutc']}")
+        m = re.fullmatch(r"deployment endtime = (\d{14}), starttime = (\d{14})", cmd)
+        if m:
+            st["endtime"], st["starttime"] = m.group(1), m.group(2)
+            return self._reply(f"deployment starttime = {st['starttime']}, endtime = {st['endtime']}")
+        m = re.fullmatch(r"sampling period = (\d+)", cmd)
+        if m:
+            n = int(m.group(1))
+            if n < 1000 and n not in self.FAST:
+                return self._reply(f"E0108 invalid argument to command: '{n}'")
+            st["period"] = n
+            return self._reply(cmd)
+        m = re.fullmatch(r"twistactivation enabled = (true|false)", cmd)
+        if m:
+            st["twist"] = m.group(1)
+            return self._reply(f"twistactivation enabled = {st['twist']}, state = n/a")
+        if cmd == "memclear":
+            if permit != "memclear":
+                return self._reply("E0103 protected command, use 'permit command = <command>'")
+            self.datasets = {0: b"", 1: b"", 2: b""}
+            st["status"] = "stopped"
+            return self._reply("memclear used = 0")
+        m = re.fullmatch(r"enable( erasememory = true)?(, memformat = CALBIN00)?", cmd)
+        if m:
+            if (self.datasets.get(1) or self.datasets.get(0)) and not m.group(1):
+                return self._reply("E0402 memory not empty, erase first")
+            stamp = f"{self.now():%Y%m%d%H%M%S}".encode()
+            self.datasets = {2: (stamp * 100)[:1204], 1: b"", 0: b""}  # a new deployment header
+            self.n, self.t0 = 0, int(self.now().timestamp() * 1000)
+            st["status"] = "gated" if st["twist"] == "true" and not self.twisted_on else "logging"
+            return self._reply(f"enable status = {st['status']}, warning = none")
+        return self._reply("E0102 invalid command")
 
 
 # --- real transports: the simulated loggers behind a TCP socket (any OS) or a pseudo-terminal (POSIX), so the

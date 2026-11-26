@@ -152,26 +152,57 @@ def parse_voltage(v: str) -> float:
         return float("nan")
 
 
-def _now(link: Link) -> str:
-    return link.query("now")["now"]
+def _now(link: Link, timeout: float | None = None, retries: int | None = None) -> str:
+    if timeout is None and retries is None:  # Link.query's defaults (and link-like test fakes without them)
+        return link.query("now")["now"]
+    return link.query("now", timeout=3.0 if timeout is None else timeout,
+                      retries=1 if retries is None else retries)["now"]
 
 
-def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clock=None) -> dict:
+POLL_TIMEOUT_S = 0.1  # a paced poll's wait for its reply (`now` answers in 1-25 ms)
+# After a dropped poll: discard a late reply before the next poll. `now` replies take 1-25 ms and a dropped command
+# gets no reply at all, so 0.1 s of quiet is ample; 0.3 s made each drop cost 0.4 s of polling and, at a 2.5 % drop
+# rate, left a 15 s probe with n = 1 now and then (simulated, 2026-11-26).
+DROP_DRAIN_S = 0.1
+
+
+def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clock=None,
+                       pace_s: float | None = None) -> dict:
     """Logger clock minus host clock, resolved to a few ms.
 
     The logger reports whole seconds (`now`, or `clock(link)` for other families), so poll it
     back-to-back until the second increments. The tick lies between the send time of the last old
     reading and the receive time of the first new one; take the midpoint and report half the
     bracket as the uncertainty. Repeat `reps` times.
+
+    `pace_s`, for loggers that now and then give no reply at all (RBRduet fw 3.220, RBRconcerto fw 1.460): wait
+    `pace_s` after each reply before the next poll, give each poll POLL_TIMEOUT_S and no re-send, and never let a
+    bracket span a dropped poll. Unpaced, such a logger dropped 1.5 % of its `now` polls (19 of 1273, four
+    offloads of two concertos, 2026-10-20/24); each drop cost a 3 s re-send, so the probe often ended with n = 0,
+    and one bracket that spanned a re-send was +/-1.68 s wide (SN081500, 2026-10-19). A paced probe (>= 8 ms
+    between polls, 0.1 s timeout, no re-send) lost 0 of 946 polls on the same two concertos. `clock` must then
+    take `timeout` and `retries`.
     """
     clock = clock or _now
     samples = []  # (skew_s, half_width_s)
     prev = None
-    polls = 0
+    polls = drops = 0
     t_end = time.monotonic() + max_seconds
     while len(samples) < reps and time.monotonic() < t_end:
         t_send = time.time_ns()
-        value = clock(link)
+        if pace_s is None:
+            value = clock(link)
+        else:
+            try:
+                value = clock(link, timeout=POLL_TIMEOUT_S, retries=0)
+            except LoggerError:
+                raise
+            except LinkError:  # no reply: no bracket may span it, and a late reply must not answer the next poll
+                polls += 1
+                drops += 1
+                prev = None
+                link._drain(DROP_DRAIN_S)
+                continue
         t_recv = time.time_ns()
         polls += 1
         logger_s = parse_logger_datetime(value).timestamp()
@@ -183,12 +214,16 @@ def measure_clock_skew(link: Link, reps: int = 3, max_seconds: float = 15.0, clo
             prev = None
             continue
         prev = (t_send, t_recv, logger_s)
+        if pace_s:
+            time.sleep(max(0.0, pace_s - getattr(link, "min_gap_s", 0.0)))  # the link may already wait that long
+    paced = {} if pace_s is None else {"paced_s": pace_s, "dropped_polls": drops}
     if not samples:
-        return {"n": 0, "polls": polls}
+        return {"n": 0, "polls": polls, **paced}
     skews = [s for s, _ in samples]
     return {
         "n": len(samples),
         "polls": polls,
+        **paced,
         "skew_vs_host_s": statistics.median(skews),
         "uncertainty_s": max(h for _, h in samples),
         "spread_s": max(skews) - min(skews),

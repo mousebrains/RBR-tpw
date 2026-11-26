@@ -27,7 +27,7 @@ def _skews(monkeypatch, values):
     """measure_clock_skew stand-in answering the given skews (logger minus host, s), one per offload."""
     it = iter(values)
 
-    def measure(link, reps=3, max_seconds=15.0, clock=None):
+    def measure(link, reps=3, max_seconds=15.0, clock=None, **k):
         s = next(it)
         return {"n": 3, "polls": 9, "skew_vs_host_s": s, "uncertainty_s": 0.003, "spread_s": 0.001,
                 "individual_s": [s] * 3, "measured_at": "2026-09-25T00:00:00.000+00:00"}
@@ -301,7 +301,8 @@ def test_settings_change_is_reported(rig, monkeypatch):
     assert "WARNING" in rig.console_text() and "endtime" in rig.console_text()
 
 
-def test_concerto3_full_downloads_grow_one_file(rig, monkeypatch):
+def test_concerto3_downloads_grow_one_file(rig, monkeypatch):
+    """Since 2026-11 the second offload reads only the new bytes (drivers.Gen3Driver.download)."""
     _no_skew(monkeypatch)
     fake = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300)
     run(rig)
@@ -312,7 +313,7 @@ def test_concerto3_full_downloads_grow_one_file(rig, monkeypatch):
     run(rig)
     assert [p.name for p in rig.tmp.glob("233442_*.nc")] == [nc.name]
     r0, r1 = _records(rig, 233442)
-    assert r1["deployment"]["download"] == "full-verified" and r1["deployment"]["stem"] == r0["deployment"]["stem"]
+    assert r1["deployment"]["download"] == "incremental" and r1["deployment"]["stem"] == r0["deployment"]["stem"]
     assert r1["deployment"]["identity_dataset"] == "dataset2"
     with netCDF4.Dataset(nc) as ds:
         assert len(ds["time"]) == 350 and len(ds["offload_time"]) == 2 and list(ds["offload_samples"][:]) == [300, 350]
