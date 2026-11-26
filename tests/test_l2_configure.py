@@ -38,7 +38,14 @@ def connect(monkeypatch):
     return make
 
 
+# The clock set's own precision is tested elsewhere; here a slow CI runner may deliver a write 60-100 ms late (macOS,
+# c7ff901), which would take the set past the 20 ms tolerance and change the attempt count these tests assert.
+LOOSE_CLOCK_S = 0.5
+
+
 def run_configure(link, drv, fake, cfg):
+    if cfg.clock_tolerance_s == DeployConfig.clock_tolerance_s:
+        cfg.clock_tolerance_s = LOOSE_CLOCK_S
     return configure(link, fake.serial, cfg, 0.0, log=lambda *a: None, fwtype=fake.fwtype, driver=drv)
 
 
@@ -230,7 +237,7 @@ def test_a_lost_unlock_is_sent_again(connect):
 def test_paced_probe_survives_dropped_polls(monkeypatch):
     """Unpaced, a dropped `now` costs a 3 s re-send and a bracket can span it (+/-1.68 s on SN081500, 2026-10-19).
     Paced, a drop costs 0.4 s and no bracket spans it."""
-    fake = FakeDuet("/dev/cu.d", n_samples=10, drop_every=40)  # 2.5 %: the concertos dropped 1.5 %
+    fake = FakeDuet("/dev/cu.d", n_samples=10, drop_every=40, drop_first={"now"})  # 2.5 %; the first poll always
     fake.skew_s = 0.25
     monkeypatch.setattr(link_module, "open_serial", lambda port, baudrate: fake)
     link = Link(fake.port)
@@ -289,7 +296,8 @@ def test_cli_configures_a_duet_and_offloads_it_incrementally_afterwards(rig, mon
                 "spread_s": 0.001, "individual_s": [0.0] * 3, "measured_at": ""}
 
     monkeypatch.setattr(cf, "measure_clock_skew", skew)
-    cli.run(rig.settings(deploy=DeployConfig(period_ms=500), assume_yes=True), once=True, port=None)
+    cli.run(rig.settings(deploy=DeployConfig(period_ms=500, clock_tolerance_s=LOOSE_CLOCK_S), assume_yes=True),
+            once=True, port=None)
     text = rig.console_text()
     assert "CONFIGURE FAILED" not in text and "NOT READY" not in text
     assert "memory erased by the enable" in text and "enable erasememory = true" in fake.writes
@@ -318,7 +326,8 @@ def test_cli_a_gated_concerto_is_ready_to_deploy(rig, monkeypatch):  # noqa: F81
                 "spread_s": 0.001, "individual_s": [0.0] * 3, "measured_at": ""}
 
     monkeypatch.setattr(cf, "measure_clock_skew", skew)
-    cli.run(rig.settings(deploy=DeployConfig(period_ms=250), assume_yes=True), once=True, port=None)
+    cli.run(rig.settings(deploy=DeployConfig(period_ms=250, clock_tolerance_s=LOOSE_CLOCK_S), assume_yes=True),
+            once=True, port=None)
     text = rig.console_text()
     assert "CONFIGURE FAILED" not in text and "NOT READY" not in text
     assert "enabled and gated: it samples only while twisted on" in text
@@ -380,7 +389,8 @@ def test_read_only_serials_are_offloaded_and_never_written(rig, monkeypatch):  #
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
     held = rig.add("usbmodemH", cls=FakeSoloWritable, serial=76585, n_samples=50, fwtype=0)
     other = rig.add("usbmodemO", cls=FakeDuet, n_samples=50)
-    s = rig.settings(deploy=DeployConfig(enable=False), assume_yes=True, read_only={76585})
+    s = rig.settings(deploy=DeployConfig(enable=False, clock_tolerance_s=LOOSE_CLOCK_S), assume_yes=True,
+                     read_only={76585})
     monkeypatch.setattr(cf, "IDLE_SAVE_S", 0.0)
     monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3, **k: {
         "n": 3, "polls": 9, "skew_vs_host_s": 0.0, "uncertainty_s": 0.003, "spread_s": 0.001, "individual_s": [0.0] * 3,

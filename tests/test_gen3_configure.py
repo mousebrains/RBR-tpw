@@ -39,7 +39,12 @@ def connect(monkeypatch):
     return make
 
 
+LOOSE_CLOCK_S = 0.5  # as in test_l2_configure: a slow CI runner may deliver the clock write 60-100 ms late
+
+
 def run_configure(link, drv, fake, cfg):
+    if cfg.clock_tolerance_s == DeployConfig.clock_tolerance_s:
+        cfg.clock_tolerance_s = LOOSE_CLOCK_S
     return configure(link, fake.serial, cfg, 0.0, log=lambda *a: None, fwtype=104, driver=drv)
 
 
@@ -178,8 +183,8 @@ def test_cli_configures_a_concerto3_gated_and_ready(rig, monkeypatch):  # noqa: 
     _no_skew(monkeypatch)
     fake = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=200)
     monkeypatch.setattr(cf, "measure_clock_skew", _skew_of(fake))
-    cli.run(rig.settings(deploy=DeployConfig(period_ms=31, twist_activation=True), assume_yes=True), once=True,
-            port=None)
+    cli.run(rig.settings(deploy=DeployConfig(period_ms=31, twist_activation=True, clock_tolerance_s=LOOSE_CLOCK_S),
+                         assume_yes=True), once=True, port=None)
     text = rig.console_text()
     assert "CONFIGURE FAILED" not in text and "NOT READY" not in text
     assert "enabled and gated" in text and fake.state["status"] == "gated" and fake.state["period"] == 31
