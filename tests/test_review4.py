@@ -144,10 +144,15 @@ def test_partial_files_are_kept_until_the_record_is_saved(once, tmp_path, monkey
 
 
 def test_schedule_options_are_checked_before_any_download(once, tmp_path, capsys):
+    """A period no model takes is a usage error (nothing touched). One that some model takes (250 ms on a concerto)
+    is checked again per logger, after its download and before any write."""
+    code, _ = once({"/dev/cu.A": FakeSolo("/dev/cu.A", n_samples=200)}, "--configure", "--yes", "--no-clock",
+                   "--period-ms", "1500")
+    assert code == 2 and "use whole seconds" in capsys.readouterr().err
+    assert not (tmp_path / "raw").exists()
     code, _ = once({"/dev/cu.A": FakeSolo("/dev/cu.A", n_samples=200)}, "--configure", "--yes", "--no-clock",
                    "--period-ms", "250")
-    assert code == 2 and "use 500 ms" in capsys.readouterr().err  # a usage error: nothing was touched
-    assert not (tmp_path / "raw").exists()
+    assert code == 2 and list(tmp_path.glob("100689_*.nc"))  # offloaded, then refused: NOT READY
 
 
 def test_config_and_configure_file_together_are_refused(tmp_path, capsys):
@@ -171,7 +176,7 @@ def test_failed_ntp_is_loud_and_labelled_host(console, monkeypatch):
     fake = ConfigFake(status="logging", clock=vc)
     s = cli.Settings(outdir=Path("."), deploy=DeployConfig(), assume_yes=True, ntp_server="time.example")
     snap = {"status": "logging", "channel_list": [{"index": 1, "type": "temp09"}]}
-    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3, **k: {
         "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
     report = cli._configure_step(fake, s, snap, {"error": "timed out"}, "100689", "saved")
     text = console.getvalue()
@@ -333,7 +338,7 @@ def test_configure_reports_its_clock_reference(monkeypatch):
     vc = VirtualClock()
     monkeypatch.setattr(cf, "time", vc)
     fake = ConfigFake(status="logging", clock=vc)
-    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3, **k: {
         "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001, "spread_s": 0.0, "measured_at": ""})
     report = configure(fake, 100689, DeployConfig(), 0.012, log=lambda *a: None)
     assert report["clock_reference"].startswith("UTC")

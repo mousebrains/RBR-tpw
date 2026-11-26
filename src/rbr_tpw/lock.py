@@ -63,8 +63,20 @@ class Session:
         self.clock_cmd = clock_cmd
 
     def unlock(self):
-        stamp = self.link.query(self.clock_cmd)[CLOCK_COMMANDS[self.clock_cmd]]  # sets the logger's challenge
-        r = self.link.command(f"lock OFF = {unlock_key(self.serial, logger_seconds(stamp))}")
+        """Read the clock (it sets the challenge) and send the key. A lost reply to the key is re-sent once with a
+        fresh challenge: unlocking twice is harmless, and the RBRduet and RBRconcerto drop a command now and then."""
+        for attempt in (1, 2):
+            stamp = self.link.query(self.clock_cmd)[CLOCK_COMMANDS[self.clock_cmd]]  # sets the logger's challenge
+            try:
+                r = self.link.command(f"lock OFF = {unlock_key(self.serial, logger_seconds(stamp))}")
+                break
+            except LoggerError:
+                raise
+            except LinkError as err:
+                if attempt == 2:
+                    raise
+                self.link.note(f"lock OFF: no reply ({err}); unlocking again")
+                self.link._drain(0.3)
         if "off" not in r.lower():
             raise UnlockError(f"unlock failed: {r!r}")
 

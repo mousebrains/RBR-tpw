@@ -66,7 +66,7 @@ def rig(tmp_path, monkeypatch):
 
 def fast_skew(counter):
     """Stand-in for measure_clock_skew that records how many run at once."""
-    def measure(link, reps=3, max_seconds=15.0, clock=None):
+    def measure(link, reps=3, max_seconds=15.0, clock=None, **k):
         with counter["lock"]:
             counter["now"] += 1
             counter["max"] = max(counter["max"], counter["now"])
@@ -289,14 +289,19 @@ def test_bench_mix_solo0_duet_concerto3_in_parallel(rig, monkeypatch):
 
 
 def test_configure_refused_for_other_families(rig, monkeypatch):
+    """A model --configure does not cover (here the concerto3 marked so; in fact Gen4) is offloaded and left alone."""
+    from rbr_tpw.drivers import Gen3Driver
+
+    monkeypatch.setattr(Gen3Driver, "configurable", False)
     monkeypatch.setattr(cli, "measure_clock_skew", fast_skew({"lock": threading.Lock(), "now": 0, "max": 0}))
-    duet = rig.add("usbmodemD", cls=FakeDuet, n_samples=100)
+    c3 = rig.add("usbmodemD", cls=FakeConcerto3, n_samples=100)
     cli.run(rig.settings(deploy=DeployConfig(), assume_yes=True), once=True, port=None)
-    assert "--configure is implemented only for RBRsolo (fwtype 9 and 0)" in rig.console_text()
-    assert not any(c.startswith(("stop", "enable", "memclear", "permit", "now =", "starttime =", "endtime =",
-                                 "sampling mode", "powerstatus remaining =")) for c in duet.commands)
-    assert [c for c in duet.commands if c.startswith("lock")] == [c for c in duet.commands
-                                                                 if c.startswith("lock OFF = ") or c == "lock on"]
+    assert "--configure is implemented for the RBRsolo, RBRduet, RBRconcerto and RBRconcerto3" in rig.console_text()
+    assert not any(c.startswith(("stop", "disable", "enable", "memclear", "permit", "now =", "clock datetime =",
+                                 "deployment starttime", "deployment endtime", "sampling period",
+                                 "twistactivation enabled")) for c in c3.commands)
+    assert [c for c in c3.commands if c.startswith("lock")] == [c for c in c3.commands
+                                                               if c.startswith("lock OFF = ") or c == "lock on"]
 
 
 def test_unsupported_fwtype_is_left_alone(rig):

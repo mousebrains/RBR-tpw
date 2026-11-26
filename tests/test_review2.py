@@ -200,7 +200,7 @@ def test_clock_set_is_on_time_even_when_sleep_overshoots(monkeypatch):
     fake = ConfigFake(clock=vc)
     fake.locked = False
     monkeypatch.setattr(cf, "time", vc)
-    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3: {
+    monkeypatch.setattr(cf, "measure_clock_skew", lambda link, reps=3, **k: {
         "n": 3, "skew_vs_host_s": fake.offset, "uncertainty_s": 0.001})
     out = cf.set_clock(fake, 0.0, 0.020, log=lambda *a: None)
     # sent at the planned instant (3 ms lead), not ~16 ms late as when sleeping to 4 ms before

@@ -171,14 +171,17 @@ class DropsLockReplies(FakeDuet):
 
 
 def test_a_logger_that_drops_lock_replies_ends_up_locked(rig):  # noqa: F811
+    """A lost reply to the key is re-sent once with a fresh challenge (since 2026-11), so the channel table is
+    read unlocked after all; before, the table was read locked. A lost `lock on` is re-sent."""
     fake = rig.add("usbmodem101", cls=DropsLockReplies, n_samples=100, drop_first={"lock on"})
     cli.run(rig.settings(), once=True, port=None)
     assert "OFFLOAD INCOMPLETE" not in rig.console_text()
-    assert fake.locked  # `lock OFF` reply lost -> the tool re-locks anyway; `lock on` reply lost -> re-sent
+    assert fake.locked  # `lock on` reply lost -> re-sent
     assert [c for c in fake.dropped if c.startswith("lock")] == [c for c in fake.dropped]  # exactly those two
     assert fake.commands.count("lock on") >= 2
+    assert sum(1 for c in fake.commands if c.startswith("lock OFF = ")) >= 2
     (rec,) = (rig.tmp / "raw").glob("081500_*.json")
-    assert json.loads(rec.read_text())["snapshot_before"]["channels_read_unlocked"] is False
+    assert json.loads(rec.read_text())["snapshot_before"]["channels_read_unlocked"] is True
     assert list(rig.tmp.glob("081500_*.nc"))
 
 

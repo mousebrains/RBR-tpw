@@ -90,6 +90,11 @@ class Link:
         self.fallback_transcript = fallback_transcript
         self._tfile = None
         self._buf = b""
+        # The least time from the last thing received to the next command sent; set per model (drivers.py). The
+        # RBRduet and RBRconcerto drop a command now and then, and a probe that waited >= 8 ms after each reply lost
+        # none of 946 polls where back-to-back polls lost 19 of 1273 (2026-10-20/24): pacing very likely matters.
+        self.min_gap_s = 0.0
+        self._last_rx = 0.0
         self.note(f"opened {port}, {baudrate} baud")
 
     def start_transcript(self, path: Path):
@@ -122,6 +127,8 @@ class Link:
         self.close()
 
     def _record(self, direction: str, text: str):
+        if direction == "RX":
+            self._last_rx = time.monotonic()
         e = TranscriptEntry(time.time_ns(), direction, text)
         self.transcript.append(e)
         if self._tfile is not None:
@@ -132,6 +139,10 @@ class Link:
         self._record("NOTE", text)
 
     def _send(self, cmd: str):
+        if self.min_gap_s:
+            wait = self._last_rx + self.min_gap_s - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
         self._record("TX", cmd)
         self.ser.write(cmd.encode("ascii") + b"\r")
 

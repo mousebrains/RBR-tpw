@@ -21,9 +21,9 @@ Several loggers can be plugged in at once; each is offloaded in parallel by its 
 |---|---|---|---|---|
 | RBRsolo T, firmware 1.000 | 9 | yes, tested on 18 loggers | yes | yes |
 | RBRsolo T, firmware 1.110 | 0 | yes, tested on 13 loggers | yes (same memory format as fwtype 9, checked against Ruskin on 34 files) | yes, tested on a logger (same sequence as fwtype 9; no energy counter, so no `--fresh-battery`) |
-| RBRduet (L2) | 102 | yes, tested on 3 loggers | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | – |
-| RBRconcerto (L2) | 103 | yes, tested on 2 loggers | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | – |
-| RBRconcerto³ and other Gen3 (L3) | 104 | yes, tested on 2 concerto³s | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | – |
+| RBRduet (L2) | 102 | yes, tested on 3 loggers | yes, incl. pressure corrected with the compensation thermistor; matches Ruskin to ≤1.1e-13 on 7 files | yes, tested on 2 loggers (no `--fresh-battery`) |
+| RBRconcerto (L2) | 103 | yes, tested on 2 loggers | yes, incl. corrected conductivity and pressure; matches Ruskin to ≤1.1e-13 on 10 files | yes, tested on 2 loggers, incl. sub-second periods and twist activation (no `--fresh-battery`) |
+| RBRconcerto³ and other Gen3 (L3) | 104 | yes, tested on 2 concerto³s | yes, EasyParse (`calbin00`) memory; matches Ruskin exactly on 10 files | yes, tested on 2 concerto³s, incl. 32 Hz and twist activation (no `--fresh-battery`) |
 | Gen4 (L3.5) | 120 | from RBR's command reference only; untested | untested | – |
 | Anything else | – | detected and skipped; nothing is changed | – | – |
 
@@ -33,8 +33,8 @@ loggers leave their hidden channels (e.g. the pressure-compensation thermistor, 
 set) out of the list and answer `status = on` instead of the numeric status; the record says whether the table
 was read unlocked (`channels_read_unlocked`). Whatever the decoder does, the raw memory, the settings record and
 the serial transcript are always saved. `rbr-offload DIR --rebuild DIR/raw/<SN>_<time>.json` can then convert a
-download later, e.g. after a decoder is added. `--configure` refuses any logger but the RBRsolo (fwtype 9 and
-0): it erases memory, and the write sequence has only been checked on those models. A Gen4 logger's download
+download later, e.g. after a decoder is added. `--configure` refuses Gen4 loggers: it erases memory, and its
+write sequence has only been checked on the other models. A Gen4 logger's download
 keeps every dataset and schedule, but its NetCDF holds only the latest dataset's first schedule. A warning
 names any other dataset or schedule that holds data.
 
@@ -115,10 +115,14 @@ full read that verifies every byte held; if it matches, the change is reported a
 kept in the record. The saved image keeps the header as first downloaded, so it only ever grows and every
 record's checksum describes a prefix of it. `--full-download` reads the whole memory
 anyway and verifies that it extends the saved image, which is the way to check the incremental path on a
-bench. RBRsolos (fwtypes 0 and 9) read incrementally; on a real fwtype-0 solo a full offload, an incremental one
-(the 136 kB identity check plus 1.7 kB of new data) and a `--full-download` that verified the saved image gave one
-file with an unbroken 500 ms time axis. Duets, concertos, concerto³s and Gen4 loggers are read
-in full each time and checked the same way, until the incremental path has been seen to work on one.
+bench. RBRsolos, duets, concertos and concerto³s read incrementally. Duet and concerto memory headers have their
+own length (715, 939 or 1037 bytes), which the identity check uses. A concerto³ keeps three datasets: its
+1.2 kB deployment header is read whole and must be unchanged; its events are read whole and must extend the saved
+ones; its samples are checked by their first and last block, then only the new bytes are read. On real loggers: a
+fwtype-0 solo (full, incremental, `--full-download`: one file, unbroken 500 ms time axis), and two duets, two
+concertos and two concerto³s, each read incrementally against a deployment on disk. On one duet a
+`--full-download` afterwards returned exactly the incrementally built image. A 134 MB duet takes seconds instead of
+15 minutes. Gen4 loggers are read in full each time and checked the same way.
 
 Plugging the logger into Ruskin between offloads is safe: a stop appends an event and is reported; a clock
 sync is only possible while stopped, is detected as a jump in the skew, and never applies to samples
@@ -228,7 +232,8 @@ rbr-offload DIR --configure deploy.yaml --used-battery 14/50   # a cell with 14 
 ```
 
 `--configure` runs only after that logger's data has been downloaded and saved. It shows the plan and asks
-before changing each logger (`--yes` skips the question). It then:
+before changing each logger (`--yes` skips the question). `--read-only SN,SN,...` names loggers that are offloaded
+but never configured, e.g. loggers held for diagnostics. It then:
 
 1. stops logging,
 2. sets the clock to UTC, aligned to the second and checked afterwards. Without NTP it uses the host clock.
@@ -242,6 +247,27 @@ before changing each logger (`--yes` skips the question). It then:
 5. erases memory,
 6. enables logging,
 7. reads everything back.
+
+The sequence is the one Ruskin sends each model, and only settings that differ are written:
+
+- **RBRsolo:** as above.
+- **RBRduet, RBRconcerto:** the erase and enable are one command (`enable erasememory = true`). With
+  `--no-enable` the erase is `memclear`.
+- **Concerto³ (Gen3):** the L3 commands (`disable`, `clock datetime =`, `deployment`, `enable erasememory =
+  true, memformat = CALBIN00`).
+
+A clock write leaves the logger's UTC offset `unknown` (L3 reference 4.1.1, and seen on a duet), so the offset
+is written as zero after the clock and checked. Duets and concertos drop a command now and then: commands to them
+are paced (10 ms after each reply), and a write whose reply does not come is read back and sent once more only if
+it did not take effect. The clock write is never re-sent; the skew is measured instead.
+
+Sampling periods: 500 ms or whole seconds on an RBRsolo. On a duet or concerto: also 1000/n ms for n Hz (250,
+167, 125, ...), no shorter than the logger's own `userperiodlimit` (500 ms on the duets, 167 ms on the older
+concertos). On a Gen3 logger: one of its `availablefastperiods` (500|250|125|63|42|31 on a concerto³). A
+sub-second period is a rounded label for an exact rate: a concerto set to 167 ms samples at exactly 6 Hz
+(measured), and the L2 decoder times its samples at 1000/6 ms. `--twist-activation on|off` (concerto,
+concerto³) gates sampling on the end cap. A twist-gated logger that is twisted off reads back `gated`, which
+counts as ready to deploy.
 
 If any step fails, or the logger isn't logging (or pending) afterwards, you get a loud alarm saying whether
 memory was erased. If the reply to the erase was lost, it says the memory may have been erased. The final line then reads "NOT READY TO DEPLOY" instead of just "disconnect".
@@ -269,12 +295,13 @@ deploy:                  # used only with --configure
   enable: true
   schedule:
     mode: continuous     # only continuous so far
-    period_ms: 500       # 500 (2 Hz) or whole seconds; or rate_hz
+    period_ms: 500       # 500 (2 Hz) or whole seconds; sub-second on duets, concertos, Gen3; or rate_hz
     start: now           # now | ISO-8601 UTC
     end: never           # never | ISO-8601 UTC
+  # twist_activation: true   # concerto, concerto³: sample only while twisted on
 ```
 
-Other options: `--no-erase`, `--no-enable`, `--no-clock`, `--rate-hz`.
+Other options: `--no-erase`, `--no-enable`, `--no-clock`, `--rate-hz`, `--twist-activation`, `--read-only`.
 
 ## Development
 
@@ -286,9 +313,9 @@ uv run pytest          # decoder checked against Ruskin output; NetCDF checked w
 Tests that need recorded logger data are skipped when it is absent: `tests/data/` and `RBR_TPW_RSK_DIR`, a
 folder of Ruskin `.rsk` files. Neither is in this repository.
 
-The tests run offloads against simulated loggers (`tests/fakelogger.py`): an RBRsolo (fwtype 9 or 0), an RBRduet
-and an RBRconcerto³. Their replies copy what real loggers sent, and their memory uses the real formats with
-real CRCs. They are reached three ways:
+The tests run offloads against simulated loggers (`tests/fakelogger.py`): an RBRsolo (fwtype 9 or 0), an RBRduet,
+an RBRconcerto and an RBRconcerto³. Their replies copy what real loggers sent, including the replies to every
+configure write, and their memory uses the real formats with real CRCs. They are reached three ways:
 
 - in-process, by replacing `rbr_tpw.link.open_serial`, for protocol, decoding, threading and Ctrl-C tests;
 - over a local TCP socket (`socket://127.0.0.1:<port>`, every OS), through real pyserial;

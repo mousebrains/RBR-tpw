@@ -107,7 +107,7 @@ def test_6b_gen3_verified_message_counts_new_bytes(rig, monkeypatch):
     fake = rig.add("usbmodem201101", cls=FakeConcerto3, n_samples=300)
     run(rig)
     fake.datasets[1] = fake.datasets[1] + easyparse_image(50, 6, 1_790_000_000_000 + 300 * 1000)
-    run(rig)
+    run(rig, full_download=True)  # the full read's message (the default has read Gen3 incrementally since 2026-11)
     line = next(ln for ln in rig.console_text().splitlines() if "verified against deployment" in ln)
     assert f": {50 * (8 + 4 * 6)} new bytes" in line
 
@@ -185,23 +185,58 @@ def test_6_an_offload_that_saw_the_reset_event_but_no_new_sample_times_the_new_r
     assert t_utc[n0 + n1] == real + 3_600_000
 
 
-def test_11_duet_is_read_in_full_and_grows_one_file(rig, monkeypatch):
-    """Sectioned headers (715 bytes on the duet) are not read incrementally yet; the file still grows."""
+def test_11_duet_reads_incrementally_past_its_own_header_length(rig, monkeypatch):
+    """Sectioned headers (715 bytes on the duet) read incrementally since 2026-11 (they were read in full from the
+    review until then). The identity check covers the header at its own length, not the solo's 512 bytes."""
     _no_skew(monkeypatch)
     fake = rig.add("usbmodem2101", cls=FakeDuet, n_samples=2000)
     run(rig)
+    old_len = len(fake.image)
     fake.grow(100)
     fake.commands.clear()
     run(rig)
     r0, r1 = _records(rig, "081500")
-    assert r1["deployment"]["download"] == "full-verified" and r1["deployment"]["stem"] == r0["deployment"]["stem"]
-    assert r1["deployment"]["segment"] == {**r1["deployment"]["segment"], "offset": len(fake.image) - 1200,
-                                           "bytes": 1200}
-    assert r1["deployment"]["header_bytes"] == L2Driver.header_length(fake.image) != 512
-    assert _reads(fake)[0] == "read data 1 512 0"  # the full read's header block, not a tail check
+    assert r1["deployment"]["download"] == "incremental" and r1["deployment"]["stem"] == r0["deployment"]["stem"]
+    assert r1["deployment"]["segment"] == {**r1["deployment"]["segment"], "offset": old_len, "bytes": 1200}
+    assert r1["deployment"]["header_bytes"] == L2Driver.header_length(fake.image) == 643 != 512  # the fake's
+    reads = _reads(fake)
+    assert reads[0] == f"read data 1 {old_len} 0"  # the identity check: here the whole held image in one block
+    assert all(int(c.split()[4]) >= old_len for c in reads[1:]) and len(reads) > 1  # then only the new bytes
+    assert (rig.tmp / "raw" / f"{r0['deployment']['stem']}.bin").read_bytes() == fake.image
     (nc,) = rig.tmp.glob("081500_*.nc")
     with netCDF4.Dataset(nc) as ds:
         assert list(ds["offload_samples"][:]) == [2000, 2100] and len(ds["time"]) == 2100
+
+
+def test_11_duet_header_change_past_byte_512_is_caught(rig, monkeypatch):
+    """A change inside the sectioned header but past the solo's 512 bytes (here byte 600, in the channel table) is
+    a header change: the whole image is read and verified before it is accepted, and the change is recorded."""
+    _no_skew(monkeypatch)
+    fake = rig.add("usbmodem2101", cls=FakeDuet, n_samples=300)
+    run(rig)
+    image = bytearray(fake.image)
+    image[600] ^= 0x01
+    fake.image = bytes(image)
+    fake.grow(10)
+    fake.commands.clear()
+    run(rig)
+    r0, r1 = _records(rig, "081500")
+    assert r1["deployment"]["download"] == "full-verified" and r1["deployment"]["header_changed"] == [600]
+    assert r1["deployment"]["stem"] == r0["deployment"]["stem"]
+
+
+def test_11_duet_data_change_just_past_its_header_is_another_deployment(rig, monkeypatch):
+    _no_skew(monkeypatch)
+    fake = rig.add("usbmodem2101", cls=FakeDuet, n_samples=300)
+    run(rig)
+    hl = L2Driver.header_length(fake.image)
+    image = bytearray(fake.image)
+    image[hl + 9] ^= 0x01  # inside the time-sync record that follows the header
+    fake.image = bytes(image)
+    run(rig)
+    r0, r1 = _records(rig, "081500")
+    assert r1["deployment"]["stem"] != r0["deployment"]["stem"] and r1["deployment"]["download"] == "full"
+    assert f"differs from the deployment image at byte {hl + 9}" in rig.console_text()
 
 
 def test_11_decode_l2_set_end_byte():

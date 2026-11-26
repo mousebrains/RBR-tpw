@@ -30,7 +30,7 @@ import yaml
 from serial.tools import list_ports
 
 from . import __version__
-from .configure import FAR_FUTURE, PAST, ConfigError, DeployConfig, configure, validate
+from .configure import FAR_FUTURE, PAST, READY_STATUSES, ConfigError, DeployConfig, configure, rate_period_ms, validate
 from .console import DEVICE, Console, setup_logging
 from .drivers import DecodeUnavailable, DeploymentMismatch, Downloaded, Driver, Held, as_full, driver_for
 from .hostclock import ntp_offset, timing_critical
@@ -38,7 +38,7 @@ from .link import Link, LinkError
 from .ncwrite import skew_jump
 from .power import remaining
 from .rawbin import event_name, scan_events
-from .solo import RUSKIN_LOW_VOLTAGE_V, identify, measure_clock_skew, sha256
+from .solo import RUSKIN_LOW_VOLTAGE_V, STATUS_HIDDEN, identify, measure_clock_skew, sha256
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ class Settings:
     console: Console = field(default_factory=Console)
     session_log: Path | None = None
     full_download: bool = False  # read the whole memory even when the deployment is on disk (and verify it)
+    read_only: set[int] = field(default_factory=set)  # serial numbers never configured (offloaded only)
     stop: threading.Event = field(default_factory=threading.Event)  # Ctrl-C
     configured: set[str] = field(default_factory=set)  # serial numbers configured this session (never twice)
     configure_failed: set[str] = field(default_factory=set)  # serial numbers whose configure failed this session
@@ -394,12 +395,18 @@ def _changes_since(ident: dict, snap: dict, skew: dict, ntp: dict, previous: dic
     if fmt_a != fmt_b:
         out.append(f"memory format {fmt_a} -> {fmt_b}")
 
-    def table(sn):
+    def table(sn, visible_only=False):
+        chans = sn.get("channels_all") or sn.get("channel_list") or []
+        if visible_only:
+            chans = [c for c in chans if not int(c.get("status", 0) or 0) & STATUS_HIDDEN]
         return [(str(c.get("type")), int(c.get("status", 0) or 0), json.dumps(c.get("coefficients", {}), sort_keys=True,
                                                                               default=str))
-                for c in sn.get("channels_all") or sn.get("channel_list") or []]
+                for c in chans]
 
-    if table(psnap) != table(snap):
+    # A table read locked leaves the hidden channels out (lock.py): compared with one read unlocked, only the
+    # channels both show can differ. (SN081500, 2026-11-26: its unlock reply was lost at one offload.)
+    same_view = bool(psnap.get("channels_read_unlocked")) == bool(snap.get("channels_read_unlocked"))
+    if table(psnap, not same_view) != table(snap, not same_view):
         out.append("channel table (types, statuses or calibration coefficients)")
     pstatus = (previous.get("after") or {}).get("status") or psnap.get("status")
     if str(pstatus) != str(snap.get("status")):
@@ -471,9 +478,14 @@ def _configure_state(done: list[str]) -> str:
 def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, erase_note: str,
                     driver: Driver | None = None) -> dict:
     cfg = s.deploy
+    if str(sn).isdigit() and int(sn) in s.read_only:
+        log.warning("SN%s is on the --read-only list: offloaded, not configured; nothing was written to it", sn,
+                    extra={"banner": True})
+        _not_ready[link.port] = "not configured: on the --read-only list; logger unchanged"
+        return {"skipped": "on the --read-only list"}
     if driver is not None and not driver.configurable:
-        log.warning("--configure is implemented only for RBRsolo (fwtype 9 and 0) so far; SN%s (fwtype %s) was "
-                    "offloaded but not changed", sn, driver.fwtype)
+        log.warning("--configure is implemented for the RBRsolo, RBRduet, RBRconcerto and RBRconcerto3 (fwtypes 0, 9, "
+                    "102, 103, 104) so far; SN%s (fwtype %s) was offloaded but not changed", sn, driver.fwtype)
         _not_ready[link.port] = f"not configured: --configure is not supported for fwtype {driver.fwtype}"
         return {"skipped": f"configure not supported for fwtype {driver.fwtype}"}
     plan = []
@@ -489,6 +501,8 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
                     f"({cfg.battery_days_used:g} of {cfg.battery_life_days:g} days used)")
     period = f"{cfg.period_ms} ms" if cfg.period_ms else "period unchanged"
     plan.append(f"schedule {cfg.mode}, {period}, start {cfg.start}, end {cfg.end}")
+    if cfg.twist_activation is not None:
+        plan.append(f"twist activation {'on' if cfg.twist_activation else 'off'}")
     if cfg.erase:
         plan.append(f"ERASE memory ({erase_note})")
     if cfg.enable:
@@ -500,7 +514,7 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     if sn in s.configured:
         log.warning("SN%s was already configured in this session; not configuring it again (it may have been "
                     "unplugged and replugged). Restart rbr-offload to configure it again.", sn)
-        if snap.get("status") not in ("logging", "pending"):
+        if snap.get("status") not in READY_STATUSES:
             _not_ready[link.port] = f"configured earlier in this session, but its status is now '{snap.get('status')}'"
         return {"skipped": "already configured in this session"}
     if s.stop.is_set():
@@ -521,7 +535,7 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
     try:
         # Runs to the end even after Ctrl-C: stopping between erase and enable would leave the logger idle.
         report = configure(link, int(sn), cfg, ntp.get("offset_s"), log=log.info, timing=timing_critical,
-                           fwtype=driver.fwtype if driver is not None else 9)
+                           fwtype=driver.fwtype if driver is not None else 9, driver=driver)
     except (ConfigError, LinkError) as err:
         log.error("CONFIGURE FAILED: %s", err)
         log.debug("configure traceback", exc_info=True)
@@ -538,19 +552,25 @@ def _configure_step(link: Link, s: Settings, snap: dict, ntp: dict, sn: str, era
         return {"error": str(err), "steps_done": done, "status_after": status}
     s.configured.add(sn)
     rb = report["readback"]
-    if cfg.enable and rb["status"] not in ("logging", "pending"):
+    if cfg.enable and rb["status"] not in READY_STATUSES:
         _not_ready[link.port] = f"status is '{rb['status']}' after enable"
-        alarm([f"SN{sn}: STATUS IS '{rb['status']}' AFTER ENABLE, NOT LOGGING OR PENDING. DO NOT DEPLOY."], s)
-    elif not cfg.enable and rb["status"] not in ("logging", "pending"):
+        alarm([f"SN{sn}: STATUS IS '{rb['status']}' AFTER ENABLE, NOT LOGGING, PENDING OR GATED. DO NOT DEPLOY."], s)
+    elif cfg.enable and rb["status"] == "gated":
+        log.info("SN%s: enabled and gated: it samples only while twisted on (twist activation %s)", sn,
+                 (rb.get("twistactivation") or {}).get("state", "?"))
+    elif not cfg.enable and rb["status"] not in READY_STATUSES:
         _not_ready[link.port] = f"not enabled (--no-enable); status '{rb['status']}'"
         log.warning("SN%s: configured but not enabled (--no-enable): status '%s', it is not logging", sn,
                     rb["status"])
     clk = rb["clock"]
     off = ntp.get("offset_s") or 0.0
-    log.info("now: status %s, %s %s ms, start %s, end %s, memory used %s B, battery %.3f V / %.0f J, "
-             "clock %+.1f ms vs %s", rb["status"], rb["sampling"].get("mode"), rb["sampling"].get("period"),
-             rb["starttime"], rb["endtime"], rb["meminfo"]["used"], rb["power"]["battery_voltage_V"],
-             rb["power"]["energy_remaining_J"], 1e3 * (clk["skew_vs_host_s"] - off), "host" if no_ntp else "UTC")
+    energy = rb["power"].get("energy_remaining_J", math.nan)
+    log.info("now: status %s, %s %s ms, start %s, end %s, memory used %s B, battery %.3f V%s, clock %s",
+             rb["status"], rb["sampling"].get("mode"), rb["sampling"].get("period"), rb["starttime"], rb["endtime"],
+             rb["meminfo"]["used"], rb["power"]["battery_voltage_V"],
+             f" / {energy:.0f} J" if math.isfinite(energy) else "",
+             f"{1e3 * (clk['skew_vs_host_s'] - off):+.1f} ms vs {'host' if no_ntp else 'UTC'}" if clk.get("n")
+             else "NOT MEASURED")
 
     rem = _remaining(snap, rb["meminfo"], rb["power"], int(rb["sampling"].get("period", 0) or 0), driver or
                      driver_for(9))
@@ -595,7 +615,9 @@ def offload(port: str, s: Settings) -> Path | None:
             _failed[port] = f"fwtype {ident['fwtype']} is not supported; nothing downloaded"
             return None
         driver.serial = int(sn) if str(sn).isdigit() else None  # None: no unlock; the channel table is read locked
-        log.debug("driver: %s (%s)", type(driver).__name__, driver.family)
+        link.min_gap_s = driver.command_gap_s
+        log.debug("driver: %s (%s), %.0f ms between a reply and the next command", type(driver).__name__,
+                  driver.family, 1e3 * link.min_gap_s)
 
         _stage(port, "NTP query")
         ntp = _ntp(s.ntp_server) if s.ntp_server else {"error": "disabled"}
@@ -606,7 +628,7 @@ def offload(port: str, s: Settings) -> Path | None:
         _stage(port, "measuring clock skew")
         try:
             with timing_critical("clock skew"):
-                skew = measure_clock_skew(link, clock=driver.clock_now)
+                skew = measure_clock_skew(link, clock=driver.clock_now, pace_s=driver.skew_pace_s)
         except LinkError as err:  # a logger that stops answering for a moment: not a reason to skip the download
             link.note(f"clock skew not measured: {err}")
             skew = {"n": 0, "error": str(err)}
@@ -696,7 +718,7 @@ def offload(port: str, s: Settings) -> Path | None:
         try:  # derived numbers: an odd reply here must not cost the record of a saved download
             rem = _remaining(snap, after["meminfo"], after["power"], int(snap["sampling"].get("period", 0) or 0),
                              driver)
-            alarms = _time_checks(sn, "at offload", rem if after["status"] in ("logging", "pending", "gated")
+            alarms = _time_checks(sn, "at offload", rem if after["status"] in READY_STATUSES
                                   else None, after["power"]["battery_voltage_V"], s)
         except Exception as err:
             log.error("remaining sampling time not estimated (%s: %s); the download and its record are saved",
@@ -1028,8 +1050,13 @@ def main(argv=None):
     g.add_argument("--configure", nargs="?", const="", metavar="SETTINGS.yaml",
                    help="after a successful offload, configure and enable the logger, using the 'deploy' "
                         "section of SETTINGS.yaml (or of --config) and the options below")
-    g.add_argument("--period-ms", type=int, help="sampling period, ms (500, or whole seconds)")
+    g.add_argument("--period-ms", type=int,
+                   help="sampling period, ms: 500 or whole seconds on an RBRsolo; on an RBRduet or RBRconcerto also "
+                        "1000/n ms for n Hz (250, 167, ...), down to the logger's own userperiodlimit")
     g.add_argument("--rate-hz", type=float, help="sampling rate, Hz (alternative to --period-ms)")
+    g.add_argument("--twist-activation", choices=("on", "off"),
+                   help="RBRconcerto, RBRconcerto3: sample only while twisted on (on) or always (off); default: "
+                        "leave as it is")
     g.add_argument("--start", help="'now' or ISO-8601 UTC, e.g. 2026-10-01T00:00:00Z")
     g.add_argument("--end", help="'never' or ISO-8601 UTC")
     g.add_argument("--fresh-battery", action="store_true", default=None,
@@ -1041,6 +1068,8 @@ def main(argv=None):
     g.add_argument("--no-enable", dest="enable", action="store_false", default=None, help="configure only")
     g.add_argument("--no-clock", dest="set_clock", action="store_false", default=None, help="leave the clock alone")
     g.add_argument("--yes", action="store_true", help="do not ask before configuring or acknowledging alarms")
+    g.add_argument("--read-only", metavar="SN[,SN...]", default="",
+                   help="serial numbers to offload but never configure (e.g. loggers held for diagnostics)")
     args = ap.parse_args(argv)
 
     if args.config and args.configure:
@@ -1060,7 +1089,9 @@ def main(argv=None):
     overrides = {k: getattr(args, k) for k in ("period_ms", "start", "end", "fresh_battery", "erase", "enable",
                                                "set_clock") if getattr(args, k) is not None}
     if args.rate_hz:
-        overrides["period_ms"] = round(1000 / args.rate_hz)
+        overrides["period_ms"] = rate_period_ms(args.rate_hz)
+    if args.twist_activation:
+        overrides["twist_activation"] = args.twist_activation == "on"
     if args.used_battery and args.fresh_battery:
         ap.error("--used-battery and --fresh-battery are mutually exclusive")
     if args.used_battery:
@@ -1077,11 +1108,15 @@ def main(argv=None):
         try:
             deploy.battery_fraction()
             # period, start and end now, not after a download; the period is checked again per logger
-            validate(deploy, deploy.period_ms or 500)
+            validate(deploy, deploy.period_ms or 500, fwtype=None)
         except ConfigError as err:
             ap.error(str(err))
     elif overrides:
         ap.error("configuration options need --configure")
+    try:
+        read_only = {int(x) for x in args.read_only.replace(" ", "").split(",") if x}
+    except ValueError:
+        ap.error(f"--read-only {args.read_only!r}: expected serial numbers separated by commas, e.g. 076585,100685")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     console = Console()
@@ -1106,11 +1141,13 @@ def main(argv=None):
     setup_logging(console, session_log)
     s = Settings(outdir=args.outdir, ntp_server=None if args.no_ntp else args.ntp_server, deploy=deploy,
                  thresholds=thresholds, assume_yes=args.yes, console=console, session_log=session_log,
-                 full_download=args.full_download)
+                 full_download=args.full_download, read_only=read_only)
     log.debug("rbr-tpw %s; Python %s; pyserial %s; %s %s; argv %s", __version__, platform.python_version(),
               serial.__version__, platform.system(), platform.release(), sys.argv)
-    log.debug("settings: thresholds %s; deploy %s; ntp %s; port %s; once %s; yes %s", vars(thresholds),
-              vars(deploy) if deploy else None, s.ntp_server, args.port, args.once, args.yes)
+    log.debug("settings: thresholds %s; deploy %s; ntp %s; port %s; once %s; yes %s; read-only %s", vars(thresholds),
+              vars(deploy) if deploy else None, s.ntp_server, args.port, args.once, args.yes, sorted(read_only))
+    if read_only:
+        log.info("read-only (offloaded, never configured): %s", ", ".join(f"SN{n:06d}" for n in sorted(read_only)))
     log.info("session log: %s", session_log)
     try:
         run(s, args.once, args.port)

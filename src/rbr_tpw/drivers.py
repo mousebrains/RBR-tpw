@@ -6,15 +6,16 @@ Families by the `id` fwtype, and what each rests on:
   L2    0 and 9 (RBRsolo), 102 (RBRduet), 103 (RBRconcerto). The commands Ruskin 2.26.1 sends these loggers
         (~/Ruskin/logs/ruskin_serial.log*, 2026-09-10..25): `now`, `status`, `starttime`, `endtime`,
         `sampling`, `channels`, `channel N`, `calibration N`, `meminfo`, `powerstatus`, and
-        `read data 1 <size> <offset>` in 68000-byte blocks. Run live on SN100689 (fwtype 9) only.
+        `read data 1 <size> <offset>` in 68000-byte blocks. Run live on every family since the 2026-09-26 bench.
   Gen3  104 (RBRconcerto3 and the other L3 loggers): `clock`, `deployment`, `sampling`, `channels`,
         `channel N`, `calibration N`, `memformat`, `meminfo dataset N`, `power`, `powerinternal`, and
         `readdata size = <s>, offset = <o>, dataset = <d>` for datasets 2 (deployment header), 0 (events)
         and 1 (samples). L3 command reference, and the same commands in Ruskin's logs for SN233442 and
-        SN243188. Not yet run live.
+        SN243188. Run live since 2026-09-26.
   Gen4  120: L3.5 command reference only (gen4.py); no Gen4 logger has been tested.
 
-Only fwtype 9 can be configured (--configure); the others are offloaded read-only.
+--configure covers the RBRsolo (fwtypes 9 and 0), the RBRduet (102), the RBRconcerto (103) and the Gen3 loggers
+(104, the RBRconcerto3): configure.py. Gen4 is offloaded read-only.
 """
 
 from __future__ import annotations
@@ -176,15 +177,17 @@ def write_engineering(time_ms: np.ndarray, values: np.ndarray, error_codes: np.n
 
 class Driver:
     family = "?"
-    configurable = False  # --configure (writes to the logger): RBRsolo fwtype 9 and 0, both run on loggers
+    configurable = False  # --configure (writes to the logger): see configure.CONFIGURABLE
     energy_model = False  # power.py's RBRsolo T model applies
     l3 = False  # Gen3 `readdata` transfers
+    skew_pace_s: float | None = None  # pace the clock-skew polls (solo.measure_clock_skew) on loggers that drop them
+    command_gap_s = 0.0  # Link.min_gap_s: the least time from a reply to the next command
 
     def __init__(self, fwtype: int):
         self.fwtype = fwtype
         self.serial: int | None = None  # set once the logger is identified; lets the L2 snapshot unlock
 
-    def clock_now(self, link: Link) -> str:
+    def clock_now(self, link: Link, timeout: float = 3.0, retries: int = 1) -> str:
         raise NotImplementedError
 
     def snapshot(self, link: Link) -> dict:
@@ -289,11 +292,14 @@ class L2Driver(Driver):
 
     def __init__(self, fwtype: int):
         super().__init__(fwtype)
-        self.configurable = fwtype in (0, 9)
+        self.configurable = fwtype in (0, 9, 102, 103)
         self.energy_model = fwtype in (0, 9)  # RBRsolo T constants; fwtype 0 has no energy counter
+        # duets (fw 3.220) and concertos (fw 1.460) drop a command now and then; no solo has dropped one
+        self.skew_pace_s = 0.010 if fwtype in (102, 103) else None
+        self.command_gap_s = 0.010 if fwtype in (102, 103) else 0.0
 
-    def clock_now(self, link: Link) -> str:
-        return link.query("now")["now"]
+    def clock_now(self, link: Link, timeout: float = 3.0, retries: int = 1) -> str:
+        return link.query("now", timeout=timeout, retries=retries)["now"]
 
     def _power(self, link: Link, pwr: dict | None = None) -> dict:
         """solo.power(), plus what differs by model; `pwr` is a powerstatus already read."""
@@ -355,13 +361,13 @@ class L2Driver(Driver):
         first holds the header and the deployment's first time anchor, which equal data tails cannot vouch for),
         and a header that changed is accepted only after the whole image has been read and verified.
 
-        Only the RBRsolo's 512-byte header reads incrementally. The duet and concerto (sectioned headers) are
-        read in full and checked to extend the saved image, as a concerto3 is, until the incremental path has
-        run on one (their .rsk downloads are append-only: 1 duet and 3 concerto pairs, 2026-09-28)."""
+        Every L2 family reads incrementally: the RBRsolo's header is 512 bytes, the duet's and concerto's
+        sectioned headers have their own length (715, 939 and 1037 bytes seen), which `header_length` reads.
+        Until 2026-11 the sectioned images were read in full and checked to extend the saved one. On hardware
+        every such read extended it: 15 concerto offloads (2026-10-20 to 11-26) and 2 duet offloads (11-26); the
+        one mismatch (a concerto, 11-07) followed a re-enable, which the header check below also catches."""
         total = int(snap["meminfo"]["used"])
         old = held.data.get("dataset1", b"") if held is not None else b""
-        if held is not None and is_sectioned_header(old):
-            return super().download(link, snap, part_dir, sn, progress, held=held, full=full)
         n_old = len(old)
         hl = self.header_length(old) if old else 512
         prev_header = held.header if held is not None and held.header is not None else old[:hl]
@@ -430,12 +436,13 @@ class L2Driver(Driver):
 class Gen3Driver(Driver):
     family = "Gen3"
     l3 = True
+    configurable = True  # configure._apply_gen3
     identity_dataset = "dataset2"  # the deployment header
     identity_bytes = None
     growing = ("dataset1", "dataset0")  # samples and events both grow; the header is rewritten
 
-    def clock_now(self, link: Link) -> str:
-        return link.query("clock")["datetime"]
+    def clock_now(self, link: Link, timeout: float = 3.0, retries: int = 1) -> str:
+        return link.query("clock", timeout=timeout, retries=retries)["datetime"]
 
     def _meminfo(self, link: Link, number: int) -> dict:
         m = _q(link, f"meminfo dataset {number}")
@@ -491,6 +498,75 @@ class Gen3Driver(Driver):
             return 8 + 4 * len(snap["channel_list"])  # EasyParse: int64 ms + float32 per stored channel
         return None
 
+    def part_name(self, sn: str, number: int) -> str:
+        return f"{sn}.dataset{number}.part"
+
+    def download(self, link: Link, snap: dict, part_dir: Path, sn: str, progress=None, held: Held | None = None,
+                 full: bool = False) -> Downloaded:
+        """A new deployment or `full`: every dataset whole (Driver.download, which verifies growth). Otherwise:
+        dataset 2 (the deployment header, ~1.2 kB) is read whole and must equal the held one; dataset 0 (events, a
+        few kB) is read whole and must extend the held one; of dataset 1 (the samples) the first and the last 68 kB
+        block of the held image are read back and compared, then only the bytes past it are read.
+
+        On hardware the concerto3s' full reads extended the held deployment in every dataset 16 times out of 16
+        (2026-10-20 to 11-26), and `readdata` takes any offset (the full reads go 512, 68512, ... after the
+        512-byte head block)."""
+        if held is None or full or not all(k in held.data for k in ("dataset2", "dataset1")):
+            return super().download(link, snap, part_dir, sn, progress, held=held, full=full)
+        m = snap["dataset_meminfo"]
+        read = 0
+
+        def whole(number: int) -> bytes:
+            nonlocal read
+            size = int(m[str(number)]["used"])
+            blob = solo.download(link, size, part_dir / self.part_name(sn, number), None, dataset=number,
+                                 l3=True) if size > 0 else b""
+            read += len(blob)
+            return blob
+
+        hdr = whole(2)
+        if hdr != held.data["dataset2"]:
+            raise DeploymentMismatch("the dataset2 header differs")
+        old0 = held.data.get("dataset0", b"")
+        ev = whole(0)
+        if not ev.startswith(old0):
+            first = next((i for i, (a, b) in enumerate(zip(old0, ev, strict=False)) if a != b),
+                         min(len(old0), len(ev)))
+            raise DeploymentMismatch(f"dataset0 does not extend the deployment image (first difference at byte "
+                                     f"{first})")
+        old1 = held.data["dataset1"]
+        n_old, total = len(old1), int(m["1"]["used"])
+        if total < n_old:
+            raise DeploymentMismatch(f"the logger holds {total} bytes of dataset1, the deployment image {n_old}")
+        tail_check = None
+        if n_old:
+            head_len = min(solo.CHUNK, n_old)
+            head = link.read_data(1, head_len, 0, l3=True)
+            n = min(solo.CHUNK, n_old - head_len)
+            tail = link.read_data(1, n, n_old - n, l3=True) if n else b""
+            if len(head) != head_len or len(tail) != n:
+                raise LinkError(f"short identity read: {len(head)} of {head_len}, {len(tail)} of {n} bytes")
+            read += head_len + n
+            for block, at in ((head, 0), (tail, n_old - n)):
+                if block != old1[at:at + len(block)]:
+                    first = next(i for i in range(len(block)) if block[i] != old1[at + i]) + at
+                    raise DeploymentMismatch(f"dataset1 differs from the deployment image at byte {first}")
+            tail_check = {"head_bytes": head_len, "offset": n_old - n, "bytes": n, "ok": True}
+        segment = b""
+        if total > n_old:
+            def prog(done, tot, rate):
+                if progress:
+                    progress(done, tot, rate)
+
+            segment = solo.download(link, total, part_dir / f"{sn}.{held.stem}.dataset1.{n_old}.part", prog,
+                                    dataset=1, l3=True, start=n_old)
+            read += len(segment)
+        data = {"dataset2": hdr, "dataset0": ev, "dataset1": old1 + segment}
+        segments = {"dataset2": (0, len(hdr)), "dataset0": (len(old0), len(ev) - len(old0)),
+                    "dataset1": (n_old, len(segment))}
+        return Downloaded(data, segments, "incremental", new_bytes=len(segment) + len(ev) - len(old0),
+                          bytes_read=read, tail_check=tail_check)
+
     def write_netcdf(self, data, record, path):
         records = records_of(record)
         record = records[-1]
@@ -544,7 +620,7 @@ class Gen4Driver(Driver):
 
         self.g = gen4
 
-    def clock_now(self, link):
+    def clock_now(self, link, timeout: float = 3.0, retries: int = 1):
         return self.g.clock_now(link)
 
     def snapshot(self, link):
