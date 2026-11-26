@@ -245,11 +245,58 @@ def test_paced_probe_survives_dropped_polls(monkeypatch):
     skew = measure_clock_skew(link, reps=3, clock=driver_for(102).clock_now, pace_s=0.010, max_seconds=30)
     # n = 3 within 30 s (4-7 s locally); no wall-clock bound here: CI runners are slower
     assert skew["n"] == 3 and skew["dropped_polls"] >= 1 and fake.dropped
-    # The tick lies inside every bracket, so the reported half-width must cover the true skew. A bracket spanning a
-    # dropped poll (0.1 s timeout + 0.1 s drain) would be >= 0.2 s wide, a half-width >= 0.1 s; the unpaced probe's was
-    # +/-1.68 s (SN081500). Slow CI runners widen every bracket (macOS: ~30 ms half-width, against ~7 ms locally).
+    # The tick lies inside every bracket, so the reported half-width must cover the true skew. Its size depends on the
+    # machine (~7 ms locally; a stalled poll on a macOS CI runner made one 96 ms), so only the failure mode this guards
+    # against is excluded: the unpaced probe's +/-1.68 s (SN081500). That no bracket spans a drop is tested exactly in
+    # test_no_bracket_spans_a_dropped_poll.
     assert abs(skew["skew_vs_host_s"] - 0.25) <= skew["uncertainty_s"] + 0.002
-    assert skew["uncertainty_s"] < 0.09
+    assert skew["uncertainty_s"] < 0.5
+
+
+def test_no_bracket_spans_a_dropped_poll(monkeypatch):
+    """Scripted polls on a virtual clock: the tick from 100 to 101 s falls next to a dropped poll, so it gives no
+    sample; the next tick, bracketed by two answered polls, does. The skew comes from that one alone."""
+    from rbr_tpw import solo
+    from rbr_tpw.link import LinkError
+
+    class VirtualTime:
+        def __init__(self):
+            self.t = 1000.0
+
+        def time(self):
+            return self.t
+
+        def time_ns(self):
+            return int(self.t * 1e9)
+
+        def monotonic(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    vt = VirtualTime()
+    monkeypatch.setattr(solo, "time", vt)
+    # (logger seconds answered, or None for a dropped poll); each poll takes 10 ms of virtual time
+    script = iter([100, 100, None, 101, 101, 101, 102, 103, 103, 104])
+    stamp = {100: "20260101000000", 101: "20260101000001", 102: "20260101000002", 103: "20260101000003",
+             104: "20260101000004"}
+
+    class Link:
+        def _drain(self, quiet):
+            vt.t += quiet
+
+    def clock(link, timeout=3.0, retries=1):
+        v = next(script)
+        vt.t += 0.010 if v is not None else timeout
+        if v is None:
+            raise LinkError("no reply")
+        return stamp[v]
+
+    skew = measure_clock_skew(Link(), reps=1, clock=clock, pace_s=0.0)
+    assert skew["n"] == 1 and skew["dropped_polls"] == 1
+    # the 100 -> 101 tick spans the drop: no sample. The first sample is the 101 -> 102 tick: polls 6 and 7
+    assert skew["uncertainty_s"] <= 0.0105
 
 
 def test_commands_wait_for_the_gap_after_a_reply(monkeypatch):
